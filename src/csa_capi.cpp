@@ -131,6 +131,23 @@ csa_buffer csa_compress_geo3d(const int32_t* xyz, size_t count) {
     }
 }
 
+csa_buffer csa_compress_geo3d_lossy(const int32_t* xyz, size_t count,
+                                     uint32_t quant_step, uint32_t resync_interval) {
+    try {
+        std::vector<csa::Point3i> pts(count);
+        for (size_t i = 0; i < count; i++) {
+            pts[i].x = xyz[3 * i];
+            pts[i].y = xyz[3 * i + 1];
+            pts[i].z = xyz[3 * i + 2];
+        }
+        return make_buffer(csa::compress_geo3d_lossy(pts, quant_step, resync_interval));
+    } catch (const std::exception& e) {
+        return fail(e.what());
+    } catch (...) {
+        return fail("csa_compress_geo3d_lossy: unknown error");
+    }
+}
+
 csa_buffer csa_decompress_geo3d(const unsigned char* input, size_t input_size, size_t* out_count) {
     try {
         std::vector<csa::u8> in(input, input + input_size);

@@ -47,8 +47,18 @@ std::vector<Point2i> decompress_geo2d(const std::vector<u8>& blob);
 // mode" of its own. quant_step <= 1 is exactly compress_geo2d (lossless).
 std::vector<u8> compress_geo2d_lossy(const std::vector<Point2i>& points, u32 quant_step, u32 resync_interval);
 
-// Axis-wise geometric mode for 3D point sequences.
+// 3D point sequences: tries the xy+z composition and the true 3D
+// similarity joint, keeps whichever encodes smaller.
 std::vector<u8> compress_geo3d(const std::vector<Point3i>& points);
 std::vector<Point3i> decompress_geo3d(const std::vector<u8>& blob);
+
+// Lossy variant, same design as compress_geo2d_lossy. Only tries the true
+// 3D similarity joint (the composition's z-axis Pantograph Lift doesn't
+// have a lossy mode yet -- see DESIGN.md's future work), so it can lose
+// to compress_geo3d on shapes the composition model would have won on;
+// that tradeoff is deliberate, documented, and only matters when
+// quant_step > 1 actually engages lossy mode. quant_step <= 1 is exactly
+// compress_geo3d (lossless, full auto-select).
+std::vector<u8> compress_geo3d_lossy(const std::vector<Point3i>& points, u32 quant_step, u32 resync_interval);
 
 } // namespace csa

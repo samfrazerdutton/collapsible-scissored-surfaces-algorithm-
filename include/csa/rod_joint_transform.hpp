@@ -130,15 +130,29 @@ struct RodJoint3DResult {
 RodJoint3DResult rod_joint_3d_forward(const std::vector<Point3i>& points, u32 xy_lag = 1);
 std::vector<Point3i> rod_joint_3d_inverse(const RodJoint3DResult& r);
 
+// Same lossless/lossy unification as RodJoint2DResult (quant_step == 1 is
+// exactly lossless; resync_interval periodically forces an exact rod,
+// computed to land on the true *absolute point* given wherever the
+// reconstructed position currently is, not the true rod -- see
+// RodJoint2DResult's comment for why that distinction matters).
 struct RodJoint3DSimResult {
     Point3i anchor{0, 0, 0};
     u64 count = 0;
     u32 lag = 1;                      // rod[i] predicted from rod[i-lag]
+    u32 quant_step = 1;                // 1 == lossless
+    u32 resync_interval = 0;           // 0 == no periodic exact resync
     std::vector<std::array<i64, 9>> block_matrix; // per block, row-major 3x3, Q16.16
-    std::vector<i32> residual_x, residual_y, residual_z; // size count-1 each
+    std::vector<i32> residual_x, residual_y, residual_z; // size count-1 each; quantized index when quant_step > 1
 };
 
-RodJoint3DSimResult rod_joint_3d_similarity_forward(const std::vector<Point3i>& points, u32 lag = 1);
+RodJoint3DSimResult rod_joint_3d_similarity_forward(const std::vector<Point3i>& points, u32 lag = 1,
+                                                     u32 quant_step = 1, u32 resync_interval = 0);
 std::vector<Point3i> rod_joint_3d_similarity_inverse(const RodJoint3DSimResult& r);
+
+// Same per-coordinate error bound as rod_joint_2d_error_bound() (the
+// designs are identical, just in 3D).
+inline u32 rod_joint_3d_error_bound(u32 quant_step) {
+    return quant_step <= 1 ? 0 : (quant_step / 2);
+}
 
 } // namespace csa

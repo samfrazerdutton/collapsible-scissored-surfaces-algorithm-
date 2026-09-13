@@ -513,6 +513,75 @@ static void test_rod_joint_2d_lossy() {
     CHECK(exact_match);
 }
 
+// Same properties as test_rod_joint_2d_lossy, checked on the 3D true
+// similarity joint: bounded per-rod error away from resync points, exact
+// reset at resync points, real compression gain, and quant_step<=1 exact.
+static void test_rod_joint_3d_lossy() {
+    std::vector<Point3i> path;
+    double x = 0, y = 0, z = 0, heading = 0;
+    unsigned int seed = 314159;
+    auto rnd = [&]() { seed = seed * 1664525u + 1013904223u; return (double)(seed >> 8) / (double)(1u << 24); };
+    for (int i = 0; i < 3000; i++) {
+        heading += (rnd() - 0.5) * 0.08;
+        double speed = 8.0 + (rnd() - 0.5);
+        x += speed * std::cos(heading);
+        y += speed * std::sin(heading);
+        z += 3.0 + (rnd() - 0.5) * 0.5; // steady climb with noise
+        path.push_back({(i32)std::lround(x), (i32)std::lround(y), (i32)std::lround(z)});
+    }
+
+    u32 quant_step = 20;
+    u32 resync_interval = 64;
+    RodJoint3DSimResult r = rod_joint_3d_similarity_forward(path, /*lag=*/1, quant_step, resync_interval);
+    auto back = rod_joint_3d_similarity_inverse(r);
+    CHECK(back.size() == path.size());
+    u32 bound = rod_joint_3d_error_bound(quant_step);
+
+    bool nonresync_rods_within_bound = true;
+    for (size_t i = 1; i < path.size(); i++) {
+        if ((i % resync_interval) == 0) continue;
+        i32 dx = std::abs((path[i].x - path[i-1].x) - (back[i].x - back[i-1].x));
+        i32 dy = std::abs((path[i].y - path[i-1].y) - (back[i].y - back[i-1].y));
+        i32 dz = std::abs((path[i].z - path[i-1].z) - (back[i].z - back[i-1].z));
+        if ((u32)dx > bound + 1 || (u32)dy > bound + 1 || (u32)dz > bound + 1) nonresync_rods_within_bound = false;
+    }
+    CHECK(nonresync_rods_within_bound);
+
+    bool resync_points_exact = true;
+    i32 max_abs_error = 0;
+    for (size_t i = 0; i < path.size(); i++) {
+        i32 ex = std::abs(path[i].x - back[i].x), ey = std::abs(path[i].y - back[i].y), ez = std::abs(path[i].z - back[i].z);
+        max_abs_error = std::max({max_abs_error, ex, ey, ez});
+        if (i > 0 && (i % resync_interval) == 0 && (ex != 0 || ey != 0 || ez != 0)) resync_points_exact = false;
+    }
+    CHECK(resync_points_exact);
+    CHECK(max_abs_error <= (i32)(bound * resync_interval));
+
+    auto lossless_blob = compress_geo3d(path);
+    auto lossy_blob = compress_geo3d_lossy(path, quant_step, resync_interval);
+    CHECK(lossy_blob.size() < lossless_blob.size());
+
+    auto lossy_decoded = decompress_geo3d(lossy_blob);
+    CHECK(lossy_decoded.size() == path.size());
+    i32 lossy_max_abs_error = 0;
+    for (size_t i = 0; i < path.size(); i++) {
+        lossy_max_abs_error = std::max({lossy_max_abs_error,
+                                         std::abs(path[i].x - lossy_decoded[i].x),
+                                         std::abs(path[i].y - lossy_decoded[i].y),
+                                         std::abs(path[i].z - lossy_decoded[i].z)});
+    }
+    CHECK(lossy_max_abs_error <= (i32)(bound * resync_interval));
+
+    auto exact_blob = compress_geo3d_lossy(path, 1, 0);
+    auto exact_back = decompress_geo3d(exact_blob);
+    CHECK(exact_back.size() == path.size());
+    bool exact_match = true;
+    for (size_t i = 0; i < path.size(); i++)
+        if (exact_back[i].x != path[i].x || exact_back[i].y != path[i].y || exact_back[i].z != path[i].z)
+            exact_match = false;
+    CHECK(exact_match);
+}
+
 static void test_geo_codec() {
     std::vector<Point2i> spiral;
     double x = 50, y = 0, dx = 3, dy = 0;
@@ -635,6 +704,7 @@ int main() {
     test_rod_joint_3d();
     test_rod_joint_3d_similarity();
     test_rod_joint_2d_lossy();
+    test_rod_joint_3d_lossy();
     test_codec();
     test_codec_adaptive_skip();
     test_geo_codec();

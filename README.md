@@ -47,11 +47,12 @@ unmodified C++ source code, not text written for this project -- and
 - **Adaptive order-1 range coder** -- the entropy-coding backend shared by
   every mode (generalized to arbitrary alphabet sizes for the LZ matcher's
   literal/length/distance streams, not just the original 256-byte case).
-- **A real lossy mode** for the 2D Rod-Joint Transform -- quantized
-  prediction residuals with periodic exact resync to bound absolute-
-  position drift, not just lossless. `quant_step <= 1` is provably
-  identical to lossless; larger steps trade a bounded, measured
-  coordinate error for real compression gains (see `DESIGN.md`).
+- **A real lossy mode** for both the 2D and 3D (true similarity joint)
+  Rod-Joint Transforms -- quantized prediction residuals with periodic
+  exact resync to bound absolute-position drift, not just lossless.
+  `quant_step <= 1` is provably identical to lossless; larger steps trade
+  a bounded, measured coordinate error for real compression gains (see
+  `DESIGN.md`).
 - **A stable C ABI** (`include/csa/csa_capi.h`, built as `csa.dll` /
   `libcsa.so` / `libcsa.dylib`) with no C++ types crossing the boundary,
   plus a **Python `ctypes` binding** (`bindings/python/csa.py`) on top of
@@ -61,7 +62,7 @@ unmodified C++ source code, not text written for this project -- and
   GPU-resident across the whole multi-level pass (one upload, a handful of
   downloads, no per-level round trips), tested against the CPU path
   bit-for-bit.
-- **1306 round-trip correctness checks** (`tests/test_main.cpp` +
+- **1334 round-trip correctness checks** (`tests/test_main.cpp` +
   `tests/test_capi.cpp`, the latter linking the real shared library to
   catch actual symbol-export problems), including a dedicated check that
   the GPU path actually succeeds (not just that the overall call
@@ -106,6 +107,7 @@ python bench/use_cases.py
 
 # Lossy geometric mode: quantized residuals, bounded error, real ratio gain
 build/scissorc.exe compress-geo2d-lossy track.xy track_lossy.csa --quant 20 --resync 64
+build/scissorc.exe compress-geo3d-lossy track.xyz track_lossy.csa --quant 20 --resync 64
 
 # Python bindings (ctypes, on top of the C ABI in include/csa/csa_capi.h)
 python bindings/python/test_bindings.py
@@ -131,13 +133,13 @@ python -c "import sys; sys.path.insert(0, 'bindings/python'); import csa; print(
 | JSON telemetry events | 5,000 IoT/analytics events | **beats gzip** (72.4KB vs 73.2KB) |
 | sensor CSV export | 20,000 rows, smooth+noisy columns | close to gzip (168.3KB vs 164.4KB) |
 
-**A real, non-synthetic corpus** (18MB of unmodified C++ source code -- see `REAL_CORPUS_BENCHMARK.md`):
+**A real, non-synthetic corpus** (18MB of unmodified C++ source code, vs. real market compressors -- see `REAL_CORPUS_BENCHMARK.md`):
 
-| level | size | vs. gzip -9 / bz2 -9 / lzma -9 | compress time |
+| level | size | notable comparisons | compress time |
 |---|---:|---|---:|
-| `--level fast` | 2.04MB | **beats gzip (3.10MB) and bz2 (2.40MB)** | 1.5s (lzma: 4.3s) |
-| `--level balanced` | 1.95MB | beats gzip and bz2 | 5.1s |
-| `--level high` | 1.91MB | within 13% of lzma (1.68MB) | 30.6s |
+| `--level fast` | 2.04MB | **beats gzip (3.10MB), bz2 (2.40MB), zstd -3 (2.93MB)** | 1.6s |
+| `--level balanced` | 1.95MB | **beats brotli -11 (2.09MB)**, still ahead of gzip/bz2/zstd -3 | 5.3s |
+| `--level high` | 1.91MB | within 13% of lzma -9 (1.68MB) -- but **zstd -19 beats it on size *and* speed** (1.71MB in 5.2s vs 31.5s) | 31.5s |
 
 ## Honesty, not hype
 
@@ -163,15 +165,22 @@ python -c "import sys; sys.path.insert(0, 'bindings/python'); import csa; print(
   compressors on arbitrary text in general.
 - The harshest, most credible test in this repo is `REAL_CORPUS_BENCHMARK.md`:
   18MB of real, unmodified C++ source code, not text written or generated
-  for this project. There, `--level fast` beats both gzip and bz2 on size
-  while compressing *faster than lzma*; `--level high` closes to within
-  13% of lzma's ratio at real cost in time (~30s vs lzma's ~4s). Neither
-  level beats lzma outright on this corpus -- real source code has exactly
-  the kind of structure LZMA's optimal parsing and bz2's Burrows-Wheeler
-  Transform are built to exploit, and this codec's lazy-matching LZ +
-  order-1 entropy model currently isn't (see `DESIGN.md`'s future work for
-  exactly what closing that gap would require: optimal parsing, a BWT
-  mode). The first version of this matcher took ~30s to compress that
+  for this project, benchmarked against gzip/bz2/lzma *and* zstd and
+  brotli -- the compressors "the market" actually means today, not just
+  the textbook trio. `--level fast` beats gzip, bz2, *and* zstd's default
+  level; `--level balanced` beats brotli's max level too. But the more
+  important, more humbling number: **zstd -19 beats CSA `--level high` on
+  both size *and* speed at once** (1.71MB in 5.2s vs 1.91MB in 31.5s) --
+  not just a better ratio, a better ratio *and* 6x faster. That's the
+  honest measure of the gap to a real modern production compressor: the
+  whole speed/ratio curve, not one axis. Real source code has exactly the
+  kind of structure LZMA/zstd's optimal-ish parsing and bz2's
+  Burrows-Wheeler Transform are built to exploit, and this codec's
+  lazy-matching LZ + order-1 entropy model currently isn't (see
+  `DESIGN.md`'s future work for exactly what closing that gap would
+  require: optimal parsing, a BWT mode, and the kind of performance
+  engineering zstd has had years of). The first version of this matcher
+  took ~30s to compress that
   same 18MB at only 0.6 MB/s regardless of level -- a real performance bug
   (an unbounded lazy-lookahead search on highly repetitive text), found by
   profiling and fixed, not glossed over.

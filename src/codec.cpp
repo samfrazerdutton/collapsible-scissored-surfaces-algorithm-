@@ -195,6 +195,8 @@ void serialize_geo3d_sim(const RodJoint3DSimResult& r, std::vector<u8>& out) {
     put_i32(out, r.anchor.y);
     put_i32(out, r.anchor.z);
     put_u32(out, r.lag);
+    put_u32(out, r.quant_step);
+    put_u32(out, r.resync_interval);
 
     std::vector<u8> flat;
     for (const auto& m : r.block_matrix)
@@ -215,6 +217,8 @@ RodJoint3DSimResult deserialize_geo3d_sim(const u8* data, size_t size, size_t& p
     r.anchor.y = get_i32(data, size, pos);
     r.anchor.z = get_i32(data, size, pos);
     r.lag = get_u32(data, size, pos);
+    r.quant_step = get_u32(data, size, pos);
+    r.resync_interval = get_u32(data, size, pos);
 
     u64 raw_len = get_u64(data, size, pos);
     u64 coded_len = get_u64(data, size, pos);
@@ -410,6 +414,24 @@ std::vector<u8> compress_geo3d(const std::vector<Point3i>& points) {
     }
 
     return (sim_best.size() < comp_best.size()) ? sim_best : comp_best;
+}
+
+// Lossy geo3d only tries the true 3D similarity joint, not the xy+z
+// composition -- the composition's z-axis goes through the Pantograph
+// Lift, which doesn't have a lossy mode yet (see DESIGN.md's future
+// work), so it can't participate in a fair lossy comparison here.
+std::vector<u8> compress_geo3d_lossy(const std::vector<Point3i>& points, u32 quant_step, u32 resync_interval) {
+    if (quant_step <= 1) return compress_geo3d(points); // no lossy effect; use the full lossless auto-select
+    std::vector<u8> best;
+    for (u32 lag : kRodJointCandidateLags) {
+        RodJoint3DSimResult sim = rod_joint_3d_similarity_forward(points, lag, quant_step, resync_interval);
+        std::vector<u8> out;
+        write_magic_mode(out, Mode::Geo3D);
+        out.push_back((u8)Geo3DSubMode::Similarity3D);
+        serialize_geo3d_sim(sim, out);
+        if (best.empty() || out.size() < best.size()) best = std::move(out);
+    }
+    return best;
 }
 
 std::vector<Point3i> decompress_geo3d(const std::vector<u8>& blob) {

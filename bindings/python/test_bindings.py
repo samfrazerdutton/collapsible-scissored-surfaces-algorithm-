@@ -74,6 +74,36 @@ def test_geo2d_lossy():
     print(f"  lossy: {len(lossless)} -> {len(lossy)} bytes, max coordinate error = {max_err}")
 
 
+def test_geo3d_lossy():
+    points = []
+    x, y, z, heading = 0.0, 0.0, 0.0, 0.0
+    seed = 314159
+    def rnd():
+        nonlocal seed
+        seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
+        return (seed % 10000) / 10000.0
+    for _ in range(2000):
+        heading += (rnd() - 0.5) * 0.08
+        speed = 8.0 + (rnd() - 0.5)
+        x += speed * math.cos(heading)
+        y += speed * math.sin(heading)
+        z += 3.0 + (rnd() - 0.5) * 0.5
+        points.append((round(x), round(y), round(z)))
+
+    lossless = csa.compress_geo3d(points)
+    back = csa.decompress_geo3d(lossless)
+    check(back == points, "geo3d exact round-trip")
+
+    lossy = csa.compress_geo3d_lossy(points, quant_step=20, resync_interval=64)
+    check(len(lossy) < len(lossless), f"3d lossy smaller than lossless ({len(lossy)} < {len(lossless)})")
+
+    lossy_back = csa.decompress_geo3d(lossy)
+    check(len(lossy_back) == len(points), "3d lossy round-trip length matches")
+    max_err = max(max(abs(a[0] - b[0]), abs(a[1] - b[1]), abs(a[2] - b[2])) for a, b in zip(points, lossy_back))
+    check(max_err <= 20 * 64, f"3d lossy error bounded (max_err={max_err})")
+    print(f"  3d lossy: {len(lossless)} -> {len(lossy)} bytes, max coordinate error = {max_err}")
+
+
 def test_error_handling():
     try:
         csa.decompress(b"\x01\x02\x03\x04\x05")
@@ -86,6 +116,7 @@ def main():
     test_general()
     test_geo2d()
     test_geo2d_lossy()
+    test_geo3d_lossy()
     test_error_handling()
     print(f"cuda_available() = {csa.cuda_available()}")
     print(f"{checks} checks, {failures} failures")

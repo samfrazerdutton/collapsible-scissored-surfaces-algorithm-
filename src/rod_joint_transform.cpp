@@ -288,12 +288,15 @@ std::vector<Point3i> rod_joint_3d_inverse(const RodJoint3DResult& r) {
     return points;
 }
 
-RodJoint3DSimResult rod_joint_3d_similarity_forward(const std::vector<Point3i>& points, u32 lag) {
+RodJoint3DSimResult rod_joint_3d_similarity_forward(const std::vector<Point3i>& points, u32 lag,
+                                                     u32 quant_step, u32 resync_interval) {
     RodJoint3DSimResult r;
     r.count = points.size();
     if (points.empty()) return r;
     r.anchor = points[0];
     r.lag = lag;
+    r.quant_step = (quant_step == 0) ? 1 : quant_step;
+    r.resync_interval = resync_interval;
     size_t m = points.size();
     if (m < 2) return r;
 
@@ -311,6 +314,12 @@ RodJoint3DSimResult rod_joint_3d_similarity_forward(const std::vector<Point3i>& 
     r.residual_y.resize(nrods);
     r.residual_z.resize(nrods);
 
+    // Reconstructed (possibly lossy) rod history, used for prediction --
+    // see RodJoint2DResult's forward comment for why. quant_step == 1
+    // makes this provably identical to ex/ey/ez.
+    std::vector<i32> rec_ex(nrods), rec_ey(nrods), rec_ez(nrods);
+    i64 rec_px = points[0].x, rec_py = points[0].y, rec_pz = points[0].z;
+
     for (size_t blk = 0; blk < nblocks; blk++) {
         size_t start = blk * kRodJoint3DBlockSize;
         size_t end = std::min(nrods, start + kRodJoint3DBlockSize);
@@ -318,14 +327,35 @@ RodJoint3DSimResult rod_joint_3d_similarity_forward(const std::vector<Point3i>& 
         r.block_matrix[blk] = M;
 
         for (size_t i = start; i < end; i++) {
-            i32 prev_x = (i >= lag) ? ex[i - lag] : 0;
-            i32 prev_y = (i >= lag) ? ey[i - lag] : 0;
-            i32 prev_z = (i >= lag) ? ez[i - lag] : 0;
+            i32 prev_x = (i >= lag) ? rec_ex[i - lag] : 0;
+            i32 prev_y = (i >= lag) ? rec_ey[i - lag] : 0;
+            i32 prev_z = (i >= lag) ? rec_ez[i - lag] : 0;
             i32 px, py, pz;
             mat3_mul_round(M, prev_x, prev_y, prev_z, px, py, pz);
-            r.residual_x[i] = ex[i] - px;
-            r.residual_y[i] = ey[i] - py;
-            r.residual_z[i] = ez[i] - pz;
+
+            bool is_resync = (r.resync_interval > 0) && (((i + 1) % r.resync_interval) == 0);
+            u32 q_here = is_resync ? 1 : r.quant_step;
+
+            i64 target_dx = is_resync ? ((i64)points[i + 1].x - rec_px) : (i64)ex[i];
+            i64 target_dy = is_resync ? ((i64)points[i + 1].y - rec_py) : (i64)ey[i];
+            i64 target_dz = is_resync ? ((i64)points[i + 1].z - rec_pz) : (i64)ez[i];
+            i64 raw_dx = target_dx - px;
+            i64 raw_dy = target_dy - py;
+            i64 raw_dz = target_dz - pz;
+
+            i64 qx = quant_round_div(raw_dx, (i64)q_here);
+            i64 qy = quant_round_div(raw_dy, (i64)q_here);
+            i64 qz = quant_round_div(raw_dz, (i64)q_here);
+            r.residual_x[i] = (i32)qx;
+            r.residual_y[i] = (i32)qy;
+            r.residual_z[i] = (i32)qz;
+
+            rec_ex[i] = (i32)(px + qx * (i64)q_here);
+            rec_ey[i] = (i32)(py + qy * (i64)q_here);
+            rec_ez[i] = (i32)(pz + qz * (i64)q_here);
+            rec_px += rec_ex[i];
+            rec_py += rec_ey[i];
+            rec_pz += rec_ez[i];
         }
     }
     return r;
@@ -340,21 +370,30 @@ std::vector<Point3i> rod_joint_3d_similarity_inverse(const RodJoint3DSimResult& 
 
     size_t nrods = (size_t)r.count - 1;
     u32 lag = r.lag;
-    std::vector<i32> ex(nrods), ey(nrods), ez(nrods);
+    u32 quant_step = (r.quant_step == 0) ? 1 : r.quant_step;
+    std::vector<i32> rec_ex(nrods), rec_ey(nrods), rec_ez(nrods);
     for (size_t i = 0; i < nrods; i++) {
         size_t blk = i / kRodJoint3DBlockSize;
         const std::array<i64, 9>& M = r.block_matrix[blk];
-        i32 prev_x = (i >= lag) ? ex[i - lag] : 0;
-        i32 prev_y = (i >= lag) ? ey[i - lag] : 0;
-        i32 prev_z = (i >= lag) ? ez[i - lag] : 0;
+        i32 prev_x = (i >= lag) ? rec_ex[i - lag] : 0;
+        i32 prev_y = (i >= lag) ? rec_ey[i - lag] : 0;
+        i32 prev_z = (i >= lag) ? rec_ez[i - lag] : 0;
         i32 px, py, pz;
         mat3_mul_round(M, prev_x, prev_y, prev_z, px, py, pz);
-        ex[i] = px + r.residual_x[i];
-        ey[i] = py + r.residual_y[i];
-        ez[i] = pz + r.residual_z[i];
-        points[i + 1].x = points[i].x + ex[i];
-        points[i + 1].y = points[i].y + ey[i];
-        points[i + 1].z = points[i].z + ez[i];
+
+        bool is_resync = (r.resync_interval > 0) && (((i + 1) % r.resync_interval) == 0);
+        u32 q_here = is_resync ? 1 : quant_step;
+
+        i64 qx = r.residual_x[i];
+        i64 qy = r.residual_y[i];
+        i64 qz = r.residual_z[i];
+        rec_ex[i] = (i32)(px + qx * (i64)q_here);
+        rec_ey[i] = (i32)(py + qy * (i64)q_here);
+        rec_ez[i] = (i32)(pz + qz * (i64)q_here);
+
+        points[i + 1].x = points[i].x + rec_ex[i];
+        points[i + 1].y = points[i].y + rec_ey[i];
+        points[i + 1].z = points[i].z + rec_ez[i];
     }
     return points;
 }

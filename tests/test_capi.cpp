@@ -115,6 +115,47 @@ static void test_geo2d_lossy() {
     csa_free_buffer(decoded);
 }
 
+static void test_geo3d_lossy() {
+    std::vector<int32_t> xyz;
+    double x = 0, y = 0, z = 0, heading = 0;
+    unsigned int seed = 314159;
+    auto next_rand = [&]() { seed = seed * 1664525u + 1013904223u; return (double)(seed >> 8) / (double)(1u << 24); };
+    for (int i = 0; i < 2000; i++) {
+        heading += (next_rand() - 0.5) * 0.08;
+        double speed = 8.0 + (next_rand() - 0.5);
+        x += speed * std::cos(heading);
+        y += speed * std::sin(heading);
+        z += 3.0 + (next_rand() - 0.5) * 0.5;
+        xyz.push_back((int32_t)(x + 0.5));
+        xyz.push_back((int32_t)(y + 0.5));
+        xyz.push_back((int32_t)(z + 0.5));
+    }
+    size_t count = xyz.size() / 3;
+
+    csa_buffer lossless = csa_compress_geo3d(xyz.data(), count);
+    csa_buffer lossy = csa_compress_geo3d_lossy(xyz.data(), count, /*quant_step=*/20, /*resync_interval=*/64);
+    CHECK(lossy.size > 0);
+    CHECK(lossy.size < lossless.size);
+
+    size_t out_count = 0;
+    csa_buffer decoded = csa_decompress_geo3d(lossy.data, lossy.size, &out_count);
+    CHECK(out_count == count);
+    if (decoded.data) {
+        const int32_t* out_xyz = (const int32_t*)decoded.data;
+        int32_t max_err = 0;
+        for (size_t i = 0; i < xyz.size(); i++) {
+            int32_t d = out_xyz[i] - xyz[i];
+            if (d < 0) d = -d;
+            if (d > max_err) max_err = d;
+        }
+        CHECK(max_err <= 20 * 64);
+    }
+
+    csa_free_buffer(lossless);
+    csa_free_buffer(lossy);
+    csa_free_buffer(decoded);
+}
+
 static void test_error_reporting() {
     unsigned char garbage[] = {1, 2, 3, 4, 5};
     csa_buffer result = csa_decompress(garbage, sizeof(garbage));
@@ -129,6 +170,7 @@ int main() {
     test_general();
     test_geo2d();
     test_geo2d_lossy();
+    test_geo3d_lossy();
     test_error_reporting();
     std::printf("cuda available (via C ABI): %s\n", csa_cuda_available() ? "yes" : "no");
     std::printf("%d checks, %d failures\n", g_checks, g_failures);

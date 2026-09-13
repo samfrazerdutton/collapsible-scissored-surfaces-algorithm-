@@ -185,6 +185,33 @@ int cmd_compress_geo3d(const std::string& in, const std::string& out, i64 scale)
     return 0;
 }
 
+int cmd_compress_geo3d_lossy(const std::string& in, const std::string& out, i64 scale,
+                              u32 quant_step, u32 resync_interval) {
+    auto pts = read_points3d(in, scale);
+    auto blob = compress_geo3d_lossy(pts, quant_step, resync_interval);
+    std::vector<u8> file;
+    write_geo_header(file, 3, scale);
+    file.insert(file.end(), blob.begin(), blob.end());
+    write_file(out, file);
+
+    // Same honesty-over-convenience measured-error reporting as
+    // cmd_compress_geo2d_lossy.
+    auto decoded = decompress_geo3d(blob);
+    double max_err = 0.0;
+    for (size_t i = 0; i < pts.size() && i < decoded.size(); i++) {
+        max_err = std::max({max_err, std::abs((double)(pts[i].x - decoded[i].x)) / (double)scale,
+                             std::abs((double)(pts[i].y - decoded[i].y)) / (double)scale,
+                             std::abs((double)(pts[i].z - decoded[i].z)) / (double)scale});
+    }
+
+    size_t raw_estimate = pts.size() * 3 * sizeof(double);
+    std::cout << "compress-geo3d-lossy: " << pts.size() << " points, raw~=" << raw_estimate
+              << " bytes -> " << file.size() << " bytes, quant_step=" << quant_step
+              << " resync_interval=" << resync_interval
+              << ", measured max coordinate error=" << max_err << " (in original units)\n";
+    return 0;
+}
+
 int cmd_decompress_geo3d(const std::string& in, const std::string& out) {
     auto file = read_file(in);
     if (file.size() < 13 || file[0] != (u8)kGeoMagic[0] || file[4] != 3)
@@ -295,6 +322,7 @@ void usage() {
         "  scissorc compress-geo2d-lossy <in.xy> <out> --quant N --resync N [--scale N]\n"
         "  scissorc compress-geo3d <in.xyz> <out> [--scale N]\n"
         "  scissorc decompress-geo3d <in> <out.xyz>\n"
+        "  scissorc compress-geo3d-lossy <in.xyz> <out> --quant N --resync N [--scale N]\n"
         "  scissorc info <file>\n"
         "  scissorc bench-transform <n> [--gpu] [--repeat N]\n";
 }
@@ -338,6 +366,16 @@ int main(int argc, char** argv) {
             return cmd_compress_geo3d(argv[2], argv[3], scale);
         } else if (cmd == "decompress-geo3d" && argc >= 4) {
             return cmd_decompress_geo3d(argv[2], argv[3]);
+        } else if (cmd == "compress-geo3d-lossy" && argc >= 4) {
+            i64 scale = 1000;
+            u32 quant_step = 1, resync_interval = 0;
+            for (int i = 4; i + 1 < argc; i += 2) {
+                std::string a = argv[i];
+                if (a == "--scale") scale = std::stoll(argv[i + 1]);
+                else if (a == "--quant") quant_step = (u32)std::stoul(argv[i + 1]);
+                else if (a == "--resync") resync_interval = (u32)std::stoul(argv[i + 1]);
+            }
+            return cmd_compress_geo3d_lossy(argv[2], argv[3], scale, quant_step, resync_interval);
         } else if (cmd == "info" && argc >= 3) {
             return cmd_info(argv[2]);
         } else if (cmd == "bench-lz" && argc >= 3) {

@@ -147,7 +147,7 @@ would make entropy coding itself GPU-parallel, but it is also considerably
 easier to get subtly wrong. Given the choice between a flashier entropy
 coder and one that is provably bit-exact under test, correctness won:
 the range coder here is simple enough to reason about completely, and all
-1306 round-trip checks (see `tests/test_main.cpp`) pass, including the
+1315 round-trip checks (see `tests/test_main.cpp`) pass, including the
 CUDA path. Interleaved-stream rANS for GPU-parallel entropy decode is a
 natural next step (see Future Work).
 
@@ -301,6 +301,28 @@ stays "small".
 this from the CLI, reporting the real *measured* max coordinate error
 (by actually decoding and comparing), not just the theoretical bound.
 
+The same design is generalized to 3D on the true similarity joint
+(`rod_joint_3d_similarity_forward`/`_inverse`, `compress_geo3d_lossy`):
+prediction still uses the reconstructed rod history, quantization and
+error bound (`rod_joint_3d_error_bound()`) are identical in form, and
+resync still targets the true absolute *point* given wherever
+reconstruction currently sits, not the true rod. It deliberately only
+tries the similarity-joint model, not the xy+z composition -- the
+composition's z-axis Pantograph Lift has no lossy mode, so
+`compress_geo3d_lossy` can occasionally lose to `compress_geo3d` on
+shapes the composition would have won (a helix with a very constant
+climb rate, say); that's a known, documented tradeoff, not a bug, and it
+only matters once `quant_step > 1` actually engages lossy mode.
+`test_rod_joint_3d_lossy` in `tests/test_main.cpp` checks the same
+properties as the 2D test (bounded per-rod error away from resync
+points, exact reset at resync points, bounded absolute drift, a real
+compression win over lossless, and exact lossless behavior at
+`quant_step <= 1`) on a synthetic curving-and-climbing path.
+`scissorc compress-geo3d-lossy <in.xyz> <out> --quant N --resync N`
+exposes it from the CLI the same way, and it's wired through the C ABI
+(`csa_compress_geo3d_lossy`) and Python bindings
+(`csa.compress_geo3d_lossy`) alongside the 2D lossy path.
+
 ### C ABI and language bindings (`include/csa/csa_capi.h`, `libcsa`)
 
 `src/csa_capi.cpp` wraps the core `compress`/`decompress`/`compress_geo2d`/
@@ -431,12 +453,10 @@ either way. Headline findings from that file:
   there comes from the Burrows-Wheeler Transform rearranging the data
   into long runs of similar bytes before entropy coding, not from its LZ
   stage.
-- **Lossy mode is 2D-only** (`rod_joint_2d_forward`/`compress_geo2d_lossy`).
-  Extending the same closed-loop-quantization-plus-resync design to the 3D
-  similarity joint (`rod_joint_3d_similarity_forward`) is a natural next
-  step for lossy point-cloud/LiDAR-frame compression specifically, and
-  should be a fairly mechanical port of the same fix now that the 2D
-  version's drift-correction bug has been found and fixed.
+- **Lossy mode's 3D path only tries the similarity joint, not the xy+z
+  composition** (see the lossy-mode section above) -- extending the
+  composition's z-axis Pantograph Lift to support quantization too would
+  close that gap, at the cost of another lossy code path to maintain.
 - **Rust/C#/Go bindings** on top of the same C ABI (`csa_capi.h`) that the
   Python bindings already use -- the hard prerequisite (a stable, no-C++-
   types-crossing-the-boundary interface) now exists; generating each

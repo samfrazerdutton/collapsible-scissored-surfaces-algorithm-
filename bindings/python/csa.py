@@ -11,7 +11,8 @@ via ctypes on top of the stable C ABI in include/csa/csa_capi.h.
     lossy_blob = csa.compress_geo2d_lossy(points, quant_step=20, resync_interval=64)
     # decompress_geo2d works on lossy blobs too -- the quantization
     # parameters ride in the blob itself, there is no separate "lossy mode"
-    # decode function.
+    # decode function. compress_geo3d_lossy/decompress_geo3d are the 3D
+    # equivalent.
 
 By default this looks for the built shared library next to this repo's
 build/ directory (../../build/csa.dll, libcsa.so, or libcsa.dylib relative
@@ -27,7 +28,7 @@ import struct
 __all__ = [
     "CsaError", "compress", "decompress",
     "compress_geo2d", "compress_geo2d_lossy", "decompress_geo2d",
-    "compress_geo3d", "decompress_geo3d",
+    "compress_geo3d", "compress_geo3d_lossy", "decompress_geo3d",
     "cuda_available",
 ]
 
@@ -89,6 +90,10 @@ _lib.csa_decompress_geo2d.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.P
 _lib.csa_decompress_geo2d.restype = _CsaBuffer
 _lib.csa_compress_geo3d.argtypes = [ctypes.POINTER(ctypes.c_int32), ctypes.c_size_t]
 _lib.csa_compress_geo3d.restype = _CsaBuffer
+_lib.csa_compress_geo3d_lossy.argtypes = [
+    ctypes.POINTER(ctypes.c_int32), ctypes.c_size_t, ctypes.c_uint32, ctypes.c_uint32,
+]
+_lib.csa_compress_geo3d_lossy.restype = _CsaBuffer
 _lib.csa_decompress_geo3d.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
 _lib.csa_decompress_geo3d.restype = _CsaBuffer
 _lib.csa_free_buffer.argtypes = [_CsaBuffer]
@@ -179,6 +184,14 @@ def compress_geo3d(points) -> bytes:
     """points: an iterable of (x, y, z) integer-ish coordinate triples."""
     arr, n = _points3d_to_array(points)
     buf = _lib.csa_compress_geo3d(arr, n)
+    return _check_and_extract(buf)
+
+
+def compress_geo3d_lossy(points, quant_step: int, resync_interval: int = 0) -> bytes:
+    """Same design as compress_geo2d_lossy, on the true 3D similarity joint.
+    quant_step <= 1 is lossless (identical to compress_geo3d)."""
+    arr, n = _points3d_to_array(points)
+    buf = _lib.csa_compress_geo3d_lossy(arr, n, quant_step, resync_interval)
     return _check_and_extract(buf)
 
 
