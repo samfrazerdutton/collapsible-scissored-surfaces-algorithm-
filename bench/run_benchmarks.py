@@ -181,17 +181,23 @@ def main():
 
     lines.append("## Honest takeaways\n")
     lines.append(
-        "- The Rod-Joint Transform is built for one thing: point sequences whose "
-        "consecutive edge vectors are related by a near-constant rotation+scale. "
-        "`spiral.xy` is a pure logarithmic spiral (rotation+scale, no drift) and "
-        "`helix.xyz` composes that same 2D joint on the (x,y) plane with a plain "
-        "affine fit on z -- both are exactly what the joint models, which is why "
-        "they beat general-purpose compressors by a wide margin (helix even beats "
-        "lzma by ~4x). `toroidal.xyz` is the honest counterexample: its (x,y) "
-        "magnitude itself oscillates (a wobbling radius, not a pure rotation), which "
-        "a single calibrated rotation+scale constant -- even recalibrated every "
-        "128 rods -- cannot track, so lzma's dictionary matching wins there. That's "
-        "a real, current limitation of the model, not a benchmark artifact.\n"
+        "- Geo3D now tries two models per file and keeps whichever encodes "
+        "smaller (tagged with one sub-mode byte, still exactly reversible either "
+        "way): the xy-rotation + z-affine composition, and a true 3D similarity "
+        "joint (one calibrated 3x3 rotation+scale matrix predicting each 3D rod "
+        "from the previous one, fit via Horn's closed-form quaternion method). On "
+        "`helix.xyz` the true 3D joint actually wins outright -- its bottom row "
+        "collapses to (0,0,1) when a rod's z-component is constant (a helix's "
+        "climb), so it reproduces the composition's best case and then some, "
+        "pushing helix to beating lzma by ~12x.\n"
+    )
+    lines.append(
+        "- `toroidal.xyz` is the honest counterexample, and neither model fixes "
+        "it: its (x,y) magnitude itself oscillates (a wobbling radius) roughly "
+        "every 3 samples, far faster than any calibration block (128 rods) can "
+        "track, so lzma's dictionary matching still wins there. That's a real, "
+        "current limitation of a small-per-block-parameter model, not a "
+        "benchmark artifact -- see DESIGN.md.\n"
     )
     lines.append(
         "- `random_walk.xy` is the deliberate adversarial case: consecutive rods have "
@@ -206,13 +212,13 @@ def main():
         "compressors.\n"
     )
     lines.append(
-        "- GPU timing includes every host<->device transfer in the level-by-level "
-        "loop. Whether it wins depends entirely on input size: small inputs are "
-        "dominated by kernel-launch and PCIe overhead across ~log2(N) levels, exactly "
-        "the same PCIe-bound pattern this repo owner's other GPU-resident projects "
-        "(LiDAR pipeline, GPU-resident CKKS) already measured and documented -- see the "
-        "table above for where the crossover actually falls on this machine, rather "
-        "than assuming GPU always wins.\n"
+        "- These files are all under ~400KB, where GPU compress() is dominated by a "
+        "one-time GPU wake/context-creation cost this laptop GPU pays after idling "
+        "(see the table above) plus per-level kernel-launch overhead -- both real, "
+        "not artifacts. See `GPU_BENCHMARKS.md` for the dedicated CPU-vs-GPU "
+        "transform-only crossover measurement across sizes from 100K to 256M "
+        "elements, which isolates the transform from entropy coding and shows the "
+        "actual trend as input size grows, rather than assuming GPU always wins.\n"
     )
 
     out_path = os.path.join(ROOT, "BENCHMARKS.md")

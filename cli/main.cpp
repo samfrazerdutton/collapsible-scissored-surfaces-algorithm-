@@ -16,6 +16,7 @@
 // 3 decimal digits of precision).
 #include "csa/codec.hpp"
 #include "csa/pantograph_lift_cuda.hpp"
+#include <chrono>
 #include <cmath>
 #include <fstream>
 #include <iomanip>
@@ -165,6 +166,34 @@ int cmd_info(const std::string& path) {
     return 0;
 }
 
+// Isolates the Pantograph Lift forward transform itself (CPU or GPU) from
+// the CPU-sequential entropy coding stage that always follows it in
+// compress(), so CPU-vs-GPU timing reflects the actual thing the CUDA
+// kernel accelerates rather than being diluted by a stage neither path
+// speeds up.
+int cmd_bench_transform(size_t n, bool gpu) {
+    std::vector<i32> data(n);
+    for (size_t i = 0; i < n; i++) {
+        data[i] = (i32)(1000.0 * std::sin((double)i * 0.001) + (double)(i % 7));
+    }
+
+    auto t0 = std::chrono::steady_clock::now();
+    LiftResult lr;
+    bool used_gpu = false;
+    if (gpu) {
+        used_gpu = pantograph_lift_forward_cuda(data, lr);
+        if (!used_gpu) lr = pantograph_lift_forward(data);
+    } else {
+        lr = pantograph_lift_forward(data);
+    }
+    auto t1 = std::chrono::steady_clock::now();
+    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+    std::cout << "bench-transform: n=" << n << " gpu_requested=" << (gpu ? "yes" : "no")
+              << " gpu_used=" << (used_gpu ? "yes" : "no") << " time_ms=" << ms << "\n";
+    return 0;
+}
+
 void usage() {
     std::cerr <<
         "usage:\n"
@@ -174,7 +203,8 @@ void usage() {
         "  scissorc decompress-geo2d <in> <out.xy>\n"
         "  scissorc compress-geo3d <in.xyz> <out> [--scale N]\n"
         "  scissorc decompress-geo3d <in> <out.xyz>\n"
-        "  scissorc info <file>\n";
+        "  scissorc info <file>\n"
+        "  scissorc bench-transform <n> [--gpu]\n";
 }
 
 } // namespace
@@ -202,6 +232,10 @@ int main(int argc, char** argv) {
             return cmd_decompress_geo3d(argv[2], argv[3]);
         } else if (cmd == "info" && argc >= 3) {
             return cmd_info(argv[2]);
+        } else if (cmd == "bench-transform" && argc >= 3) {
+            size_t n = (size_t)std::stoull(argv[2]);
+            bool gpu = (argc >= 4 && std::string(argv[3]) == "--gpu");
+            return cmd_bench_transform(n, gpu);
         }
     } catch (const std::exception& e) {
         std::cerr << "error: " << e.what() << "\n";

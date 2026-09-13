@@ -1,3 +1,24 @@
+// GPU-resident Pantograph Lift forward transform.
+//
+// The first version of this file did a small round trip to the host
+// every level (copy calibration sums back, compute ratio/offset on the
+// CPU, copy them back to the device) purely to do ~12 FLOPs of division
+// and rounding per block. That's the same PCIe/launch-overhead-bound
+// mistake this repo's design docs call out honestly elsewhere: with
+// ~20-30 levels for a realistic input, that's dozens of small blocking
+// transfers before any real work happens on the next level.
+//
+// This version keeps everything device-resident from the first upload to
+// the last download: calibration sums, the tiny ratio/offset arithmetic
+// (now its own kernel instead of round-tripping to the host), and the
+// transform itself all run back-to-back in the same CUDA stream with no
+// host synchronization in between -- the driver orders same-stream work
+// automatically. Per-level results are written directly into pre-sized
+// slices of three buffers (residuals, ratios, offsets) allocated once for
+// the whole forward pass, so there is exactly one H2D transfer (the input)
+// and a handful of D2H transfers (the three result buffers, once each) for
+// the entire multi-level decomposition, regardless of how many levels it
+// has.
 #include "csa/pantograph_lift_cuda.hpp"
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -8,7 +29,7 @@ namespace csa {
 namespace {
 
 #define CUDA_OK(call) do { cudaError_t _e = (call); if (_e != cudaSuccess) { \
-    std::fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(_e)); \
+    std::fprintf(stderr, "CUDA error at %s:%d: %s (%s)\n", __FILE__, __LINE__, cudaGetErrorName(_e), cudaGetErrorString(_e)); \
     goto cuda_fail; } } while (0)
 
 constexpr int kFixedShiftDev = 16;
@@ -35,8 +56,7 @@ __global__ void calibrate_blocks_kernel(const int* cur, unsigned long long half,
 
     unsigned long long i = (unsigned long long)blockIdx.x * kBlockSizeDev + threadIdx.x;
     double a = 0.0, b = 0.0;
-    bool valid = i < half;
-    if (valid) {
+    if (i < half) {
         a = (double)cur[2 * i];
         b = (double)cur[2 * i + 1];
     }
@@ -62,6 +82,33 @@ __global__ void calibrate_blocks_kernel(const int* cur, unsigned long long half,
         sum_ab[blockIdx.x] = sh_ab[0];
         sum_aa[blockIdx.x] = sh_aa[0];
     }
+}
+
+// Turns each block's four sums into its ratio+offset, entirely on-device
+// -- one thread per block, a dozen FLOPs each. This used to be a host
+// round trip; it's now just another kernel in the same stream.
+__global__ void compute_block_params_kernel(const double* sum_a, const double* sum_b,
+                                             const double* sum_ab, const double* sum_aa,
+                                             unsigned long long half,
+                                             long long* ratios_out, int* offsets_out) {
+    unsigned long long nblocks = (half + kBlockSizeDev - 1) / kBlockSizeDev;
+    unsigned long long blk = blockIdx.x * (unsigned long long)blockDim.x + threadIdx.x;
+    if (blk >= nblocks) return;
+
+    unsigned long long start = blk * (unsigned long long)kBlockSizeDev;
+    unsigned long long end = (start + kBlockSizeDev < half) ? start + kBlockSizeDev : half;
+    double n = (double)(end - start);
+
+    double mean_a = sum_a[blk] / n, mean_b = sum_b[blk] / n;
+    double denom = sum_aa[blk] - n * mean_a * mean_a;
+    double ratio = (fabs(denom) > 1e-6) ? (sum_ab[blk] - n * mean_a * mean_b) / denom : 0.0;
+    ratio = fmax(-8.0, fmin(8.0, ratio));
+    if (!isfinite(ratio)) ratio = 0.0;
+    double offset_d = mean_b - ratio * mean_a;
+    if (!isfinite(offset_d)) offset_d = 0.0;
+
+    ratios_out[blk] = (long long)llround(ratio * (double)(1LL << kFixedShiftDev));
+    offsets_out[blk] = (int)llround(offset_d);
 }
 
 __global__ void transform_kernel(const int* cur, unsigned long long half,
@@ -90,8 +137,11 @@ size_t next_pow2(size_t n) {
     return p;
 }
 
-size_t num_blocks_for(size_t half) {
-    return (half + kPantographBlockSize - 1) / kPantographBlockSize;
+int launch_blocks_for(size_t n, int threads) {
+    size_t b = (n + threads - 1) / threads;
+    if (b < 1) b = 1;
+    if (b > 65535u * 64u) b = 65535u * 64u; // generous cap, well under grid.x limits
+    return (int)b;
 }
 
 } // namespace
@@ -113,100 +163,91 @@ bool pantograph_lift_forward_cuda(const std::vector<i32>& input, LiftResult& out
     for (size_t i = 0; i < input.size(); i++) host_padded[i] = input[i];
     for (size_t i = input.size(); i < padded_len; i++) host_padded[i] = input.back();
 
-    int* cur_d = nullptr;
+    // Precompute the whole level structure up front: pair counts, block
+    // counts, and this level's offset into the flat residual/param
+    // buffers. Purely host-side bookkeeping, deterministic from
+    // padded_len, mirroring the same derivation codec.cpp uses on decode.
+    size_t num_levels = 0;
+    for (size_t n = padded_len; n > 1; n /= 2) num_levels++;
+
+    std::vector<size_t> level_pairs(num_levels), level_blocks(num_levels);
+    std::vector<size_t> level_resid_off(num_levels), level_param_off(num_levels);
+    size_t total_residuals = 0, total_blocks = 0, max_blocks_any_level = 0;
+    {
+        size_t half = padded_len / 2;
+        for (size_t lvl = 0; lvl < num_levels; lvl++) {
+            size_t nb = (half + kPantographBlockSize - 1) / kPantographBlockSize;
+            level_pairs[lvl] = half;
+            level_blocks[lvl] = nb;
+            level_resid_off[lvl] = total_residuals;
+            level_param_off[lvl] = total_blocks;
+            total_residuals += half;
+            total_blocks += nb;
+            if (nb > max_blocks_any_level) max_blocks_any_level = nb;
+            half /= 2;
+        }
+    }
+
+    int* bufA_d = nullptr;
+    int* bufB_d = nullptr;
     double* sum_a_d = nullptr;
     double* sum_b_d = nullptr;
     double* sum_ab_d = nullptr;
     double* sum_aa_d = nullptr;
     long long* ratios_d = nullptr;
     int* offsets_d = nullptr;
-    int* next_low_d = nullptr;
     int* residual_d = nullptr;
-    size_t max_blocks_allocated = 0;
+    i32* residual_pinned = nullptr;
+    long long* ratios_pinned = nullptr;
+    i32* offsets_pinned = nullptr;
     bool ok = false;
 
-    CUDA_OK(cudaMalloc(&cur_d, padded_len * sizeof(int)));
-    CUDA_OK(cudaMemcpy(cur_d, host_padded.data(), padded_len * sizeof(int), cudaMemcpyHostToDevice));
+    // A single-element input has num_levels == 0, making several of these
+    // sizes 0; cudaMalloc(0) is not reliably well-defined across CUDA
+    // versions, so always allocate at least one element (the corresponding
+    // cudaMemcpy calls below use the real, possibly-0, sizes, which *is*
+    // well-defined and simply copies nothing).
+    auto alloc_n = [](size_t n) { return n > 0 ? n : (size_t)1; };
+
+    CUDA_OK(cudaMalloc(&bufA_d, padded_len * sizeof(int)));
+    CUDA_OK(cudaMalloc(&bufB_d, padded_len * sizeof(int)));
+    CUDA_OK(cudaMemcpy(bufA_d, host_padded.data(), padded_len * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_OK(cudaMalloc(&sum_a_d, alloc_n(max_blocks_any_level) * sizeof(double)));
+    CUDA_OK(cudaMalloc(&sum_b_d, alloc_n(max_blocks_any_level) * sizeof(double)));
+    CUDA_OK(cudaMalloc(&sum_ab_d, alloc_n(max_blocks_any_level) * sizeof(double)));
+    CUDA_OK(cudaMalloc(&sum_aa_d, alloc_n(max_blocks_any_level) * sizeof(double)));
+    CUDA_OK(cudaMalloc(&ratios_d, alloc_n(total_blocks) * sizeof(long long)));
+    CUDA_OK(cudaMalloc(&offsets_d, alloc_n(total_blocks) * sizeof(int)));
+    CUDA_OK(cudaMalloc(&residual_d, alloc_n(total_residuals) * sizeof(int)));
 
     {
-        size_t cur_size = padded_len;
-        while (cur_size > 1) {
-            size_t half = cur_size / 2;
-            size_t nblocks = num_blocks_for(half);
-
-            if (nblocks > max_blocks_allocated) {
-                if (sum_a_d) cudaFree(sum_a_d);
-                if (sum_b_d) cudaFree(sum_b_d);
-                if (sum_ab_d) cudaFree(sum_ab_d);
-                if (sum_aa_d) cudaFree(sum_aa_d);
-                if (ratios_d) cudaFree(ratios_d);
-                if (offsets_d) cudaFree(offsets_d);
-                CUDA_OK(cudaMalloc(&sum_a_d, nblocks * sizeof(double)));
-                CUDA_OK(cudaMalloc(&sum_b_d, nblocks * sizeof(double)));
-                CUDA_OK(cudaMalloc(&sum_ab_d, nblocks * sizeof(double)));
-                CUDA_OK(cudaMalloc(&sum_aa_d, nblocks * sizeof(double)));
-                CUDA_OK(cudaMalloc(&ratios_d, nblocks * sizeof(long long)));
-                CUDA_OK(cudaMalloc(&offsets_d, nblocks * sizeof(int)));
-                max_blocks_allocated = nblocks;
-            }
+        int* cur_d = bufA_d;
+        int* next_d = bufB_d;
+        for (size_t lvl = 0; lvl < num_levels; lvl++) {
+            size_t half = level_pairs[lvl];
+            size_t nblocks = level_blocks[lvl];
+            long long* ratios_here = ratios_d + level_param_off[lvl];
+            int* offsets_here = offsets_d + level_param_off[lvl];
+            int* residual_here = residual_d + level_resid_off[lvl];
 
             calibrate_blocks_kernel<<<(unsigned int)nblocks, kBlockSizeDev>>>(
                 cur_d, half, sum_a_d, sum_b_d, sum_ab_d, sum_aa_d);
             CUDA_OK(cudaGetLastError());
 
-            std::vector<double> sum_a(nblocks), sum_b(nblocks), sum_ab(nblocks), sum_aa(nblocks);
-            CUDA_OK(cudaMemcpy(sum_a.data(), sum_a_d, nblocks * sizeof(double), cudaMemcpyDeviceToHost));
-            CUDA_OK(cudaMemcpy(sum_b.data(), sum_b_d, nblocks * sizeof(double), cudaMemcpyDeviceToHost));
-            CUDA_OK(cudaMemcpy(sum_ab.data(), sum_ab_d, nblocks * sizeof(double), cudaMemcpyDeviceToHost));
-            CUDA_OK(cudaMemcpy(sum_aa.data(), sum_aa_d, nblocks * sizeof(double), cudaMemcpyDeviceToHost));
-
-            std::vector<i64> ratios(nblocks);
-            std::vector<i32> offsets(nblocks);
-            for (size_t blk = 0; blk < nblocks; blk++) {
-                size_t start = blk * kPantographBlockSize;
-                size_t end = (start + kPantographBlockSize < half) ? start + kPantographBlockSize : half;
-                double n = (double)(end - start);
-                double mean_a = sum_a[blk] / n, mean_b = sum_b[blk] / n;
-                double denom = sum_aa[blk] - n * mean_a * mean_a;
-                double ratio = (std::abs(denom) > 1e-6) ? (sum_ab[blk] - n * mean_a * mean_b) / denom : 0.0;
-                if (ratio > 8.0) ratio = 8.0;
-                if (ratio < -8.0) ratio = -8.0;
-                if (!std::isfinite(ratio)) ratio = 0.0;
-                double offset_d = mean_b - ratio * mean_a;
-                if (!std::isfinite(offset_d)) offset_d = 0.0;
-                ratios[blk] = (i64)llround(ratio * (double)(1LL << kFixedShiftDev));
-                offsets[blk] = (i32)llround(offset_d);
-            }
-
-            std::vector<long long> ratios_ll(ratios.begin(), ratios.end());
-            CUDA_OK(cudaMemcpy(ratios_d, ratios_ll.data(), nblocks * sizeof(long long), cudaMemcpyHostToDevice));
-            CUDA_OK(cudaMemcpy(offsets_d, offsets.data(), nblocks * sizeof(int), cudaMemcpyHostToDevice));
-
-            CUDA_OK(cudaMalloc(&next_low_d, half * sizeof(int)));
-            CUDA_OK(cudaMalloc(&residual_d, half * sizeof(int)));
+            int param_threads = 256;
+            int param_blocks = launch_blocks_for(nblocks, param_threads);
+            compute_block_params_kernel<<<param_blocks, param_threads>>>(
+                sum_a_d, sum_b_d, sum_ab_d, sum_aa_d, half, ratios_here, offsets_here);
+            CUDA_OK(cudaGetLastError());
 
             int threads = 256;
-            int blocks = (int)((half + threads - 1) / threads);
-            if (blocks < 1) blocks = 1;
-            if (blocks > 4096) blocks = 4096;
-            transform_kernel<<<blocks, threads>>>(cur_d, half, ratios_d, offsets_d, next_low_d, residual_d);
+            int blocks = launch_blocks_for(half, threads);
+            transform_kernel<<<blocks, threads>>>(cur_d, half, ratios_here, offsets_here, next_d, residual_here);
             CUDA_OK(cudaGetLastError());
-            CUDA_OK(cudaDeviceSynchronize());
 
-            std::vector<i32> residual_host(half);
-            CUDA_OK(cudaMemcpy(residual_host.data(), residual_d, half * sizeof(int), cudaMemcpyDeviceToHost));
-
-            out.residuals.push_back(std::move(residual_host));
-            out.block_ratios.push_back(std::move(ratios));
-            out.block_offsets.push_back(std::move(offsets));
-
-            CUDA_OK(cudaFree(cur_d));
-            cur_d = next_low_d;
-            next_low_d = nullptr;
-            CUDA_OK(cudaFree(residual_d));
-            residual_d = nullptr;
-
-            cur_size = half;
+            int* tmp = cur_d;
+            cur_d = next_d;
+            next_d = tmp;
         }
 
         i32 base_value = 0;
@@ -214,17 +255,43 @@ bool pantograph_lift_forward_cuda(const std::vector<i32>& input, LiftResult& out
         out.base.push_back(base_value);
     }
 
+    // Pinned (page-locked) host staging buffers make the final bulk
+    // transfers meaningfully faster than the pageable std::vector storage
+    // the old per-level code copied into directly.
+    CUDA_OK(cudaMallocHost(&residual_pinned, alloc_n(total_residuals) * sizeof(i32)));
+    CUDA_OK(cudaMallocHost(&ratios_pinned, alloc_n(total_blocks) * sizeof(long long)));
+    CUDA_OK(cudaMallocHost(&offsets_pinned, alloc_n(total_blocks) * sizeof(i32)));
+    CUDA_OK(cudaMemcpy(residual_pinned, residual_d, total_residuals * sizeof(i32), cudaMemcpyDeviceToHost));
+    CUDA_OK(cudaMemcpy(ratios_pinned, ratios_d, total_blocks * sizeof(long long), cudaMemcpyDeviceToHost));
+    CUDA_OK(cudaMemcpy(offsets_pinned, offsets_d, total_blocks * sizeof(i32), cudaMemcpyDeviceToHost));
+
+    out.residuals.resize(num_levels);
+    out.block_ratios.resize(num_levels);
+    out.block_offsets.resize(num_levels);
+    for (size_t lvl = 0; lvl < num_levels; lvl++) {
+        out.residuals[lvl].assign(residual_pinned + level_resid_off[lvl],
+                                   residual_pinned + level_resid_off[lvl] + level_pairs[lvl]);
+        out.block_offsets[lvl].assign(offsets_pinned + level_param_off[lvl],
+                                       offsets_pinned + level_param_off[lvl] + level_blocks[lvl]);
+        out.block_ratios[lvl].resize(level_blocks[lvl]);
+        for (size_t b = 0; b < level_blocks[lvl]; b++)
+            out.block_ratios[lvl][b] = (i64)ratios_pinned[level_param_off[lvl] + b];
+    }
+
     ok = true;
 
 cuda_fail:
-    if (cur_d) cudaFree(cur_d);
+    if (residual_pinned) cudaFreeHost(residual_pinned);
+    if (ratios_pinned) cudaFreeHost(ratios_pinned);
+    if (offsets_pinned) cudaFreeHost(offsets_pinned);
+    if (bufA_d) cudaFree(bufA_d);
+    if (bufB_d) cudaFree(bufB_d);
     if (sum_a_d) cudaFree(sum_a_d);
     if (sum_b_d) cudaFree(sum_b_d);
     if (sum_ab_d) cudaFree(sum_ab_d);
     if (sum_aa_d) cudaFree(sum_aa_d);
     if (ratios_d) cudaFree(ratios_d);
     if (offsets_d) cudaFree(offsets_d);
-    if (next_low_d) cudaFree(next_low_d);
     if (residual_d) cudaFree(residual_d);
     return ok;
 }

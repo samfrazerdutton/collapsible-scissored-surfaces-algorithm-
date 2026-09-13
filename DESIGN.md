@@ -75,15 +75,49 @@ compression-domain analogue of the paper's helical/toroidal deployment
 claim. `c` is recalibrated every `kRodJointBlockSize` (128) rods, same
 rationale as above.
 
-3D point sequences compose two already-correct pieces rather than
-introducing a new one: the (x, y) plane goes through the 2D Rod-Joint
-transform (this captures genuine turning motion jointly -- a rotating
-trajectory's x and y are individually just two out-of-phase sine waves,
-each hard to predict alone, but together are exactly what a rotation
-constant models), and z goes through the Pantograph Lift by itself
-(captures smooth/linear vertical motion, e.g. a helix's constant climb
-rate). See `BENCHMARKS.md` for what this composition wins and where it
-still falls short (toroidal paths, whose xy-radius itself oscillates).
+3D point sequences have two candidate models, and `compress_geo3d` tries
+both and keeps whichever encodes smaller (tagged with one sub-mode byte,
+still exactly reversible either way):
+
+- **Composition**: the (x, y) plane goes through the 2D Rod-Joint
+  transform (this captures genuine turning motion jointly -- a rotating
+  trajectory's x and y are individually just two out-of-phase sine waves,
+  each hard to predict alone, but together are exactly what a rotation
+  constant models), and z goes through the Pantograph Lift by itself
+  (captures smooth/linear vertical motion, e.g. a helix's constant climb
+  rate).
+- **True 3D similarity joint**: a single calibrated 3x3 matrix (rotation +
+  uniform scale) predicts each 3D rod from the previous one,
+  `rod[i] ~= M * rod[i-1]`. `M` is fit per block via Horn's closed-form
+  absolute-orientation method (see below) rather than the axis-split
+  composition, so it can track paths that genuinely tumble (no fixed "up"
+  axis) -- and, as a bonus, it turns out to *subsume* the composition's
+  best case too: its bottom row collapses to `(0,0,1)` whenever a rod's
+  z-component is constant (a helix's climb), reproducing that case and
+  then improving on it (see `BENCHMARKS.md`: the true 3D joint wins
+  outright on `helix.xyz`, pushing it to ~12x smaller than lzma).
+
+**Calibrating the 3D similarity joint without a general eigensolver.**
+Horn's method (1987) finds the optimal rotation between two sets of
+corresponding vectors as the dominant eigenvector of a symmetric 4x4
+"profile" matrix `N` built from the 3x3 cross-covariance of the vector
+pairs. Rather than implement a general eigensolver, `calibrate_3d_block`
+(in `src/rod_joint_transform.cpp`) uses **shifted power iteration**: `N`
+has trace 0 (so its eigenvalues aren't all one sign), so it's shifted by
+its Frobenius norm before iterating (`N' = N + ||N||_F * I`), which
+guarantees the eigenvalue Horn's method wants -- the most positive one --
+becomes the largest in magnitude too, so ~40 iterations of `v <- N'v /
+|N'v|` converge to the right eigenvector. The optimal uniform scale then
+follows in closed form (Umeyama's formula) given that rotation. As with
+every other calibration in this codebase, a bad or non-converged fit only
+costs compression ratio -- the residual is still `actual - predicted`,
+computed identically on encode and decode, so correctness never depends
+on it.
+
+See `BENCHMARKS.md` for what these models win and where they still fall
+short (toroidal paths, whose xy-radius itself oscillates roughly every 3
+samples -- far faster than any per-block calibration, even the true 3D
+joint's, can track).
 
 ### 3. Entropy backend: adaptive order-1 range coder (`include/csa/range_coder.hpp`)
 
@@ -119,51 +153,96 @@ residual encoding.
 
 The Pantograph Lift's per-level transform is embarrassingly parallel: given
 the previous level's array, every pair's predict/residual/update is
-independent of every other pair. The CUDA path:
+independent of every other pair. The CUDA path is **GPU-resident for the
+entire multi-level forward pass**: everything from the first upload to the
+last download runs in one CUDA stream with no host synchronization in
+between, and there is exactly one H2D transfer (the padded input) and a
+handful of D2H transfers (the flat residual/ratio/offset buffers, each
+copied once for the whole pass, plus the final scalar base value) —
+regardless of how many decomposition levels the input has.
 
-1. One kernel per level does a block-per-calibration-block shared-memory
-   reduction (`calibrate_blocks_kernel`) to compute the four sums needed
-   for each block's affine fit -- no atomics needed, since each CUDA
-   thread block owns a disjoint data range.
-2. The (tiny) per-block ratio/offset arithmetic runs on the host --
-   there are only `padded_len / kPantographBlockSize` values per level,
-   not one per sample, so this is negligible CPU time.
-3. A second kernel (`transform_kernel`) applies predict+residual+update
-   to every pair in parallel, reading the small per-block parameter
-   arrays.
-4. The `s`-array (low-pass) stays device-resident across levels; only the
-   residual array (needed by the CPU-side entropy coder) and the tiny
-   per-level parameter arrays come back to the host each level.
+1. `calibrate_blocks_kernel`: one CUDA thread block per calibration block,
+   shared-memory tree reduction, no atomics (each thread block owns a
+   disjoint data range).
+2. `compute_block_params_kernel`: turns each block's four sums into its
+   ratio+offset **on the device** — one thread per block, a dozen FLOPs
+   each. (The first version of this code did this arithmetic on the host,
+   which meant a small blocking round trip every level purely to do
+   ~12 FLOPs of division and rounding; see the comment at the top of
+   `pantograph_lift_cuda.cu` for why that was the wrong tradeoff.)
+3. `transform_kernel`: applies predict+residual+update to every pair in
+   parallel, reading the block parameters `compute_block_params_kernel`
+   already wrote, and writes directly into a pre-sized slice of one
+   whole-pass residual buffer (no per-level allocation).
+4. Two fixed-size device buffers ping-pong as the "current level" array
+   across levels; nothing is malloc'd or freed inside the level loop.
+   Pinned (page-locked) host staging buffers make the handful of final
+   bulk transfers faster than the pageable `std::vector` storage an
+   earlier version copied into directly.
 
-This deliberately mirrors the GPU-resident philosophy from this repo
-owner's other CUDA projects (a GPU-resident CKKS homomorphic-encryption
-library, and a GPU-resident LiDAR preprocessing pipeline): keep the
-working array on-device across the whole pipeline stage, and be honest
-about where PCIe/kernel-launch overhead dominates rather than assuming the
-GPU path always wins. See `BENCHMARKS.md` for the measured CPU-vs-GPU
-crossover on this machine (RTX 2060) -- at the input sizes tested here, it
-does not win, exactly the same PCIe-bound pattern those other projects
-already documented. It should start winning once a single compress() call
-processes tens of megabytes, where the fixed per-level launch/copy
-overhead amortizes over far more parallel work; that crossover point has
-not yet been measured here and is future work.
+This mirrors the GPU-resident philosophy from this repo owner's other CUDA
+projects (a GPU-resident CKKS homomorphic-encryption library, and a
+GPU-resident LiDAR preprocessing pipeline): keep the working data
+on-device across the whole pipeline stage, minimize host round trips, and
+measure honestly rather than assume the GPU path wins.
+
+**Measured, not assumed**: see `GPU_BENCHMARKS.md` for the dedicated
+transform-only CPU-vs-GPU crossover measurement on this machine (an RTX
+2060 Max-Q laptop GPU), isolating the forward transform from the
+CPU-sequential entropy coding stage that follows it and runs identically
+either way. Headline findings from that file:
+
+- This laptop GPU idles down to a low-power state between uses, and the
+  first CUDA call after idling pays a real, fixed wake/context-creation
+  cost (~1.2s on this machine) independent of input size — a genuine
+  reason a single ad-hoc `--gpu` call on one small file can look far
+  slower than the CPU path.
+- Once warm, GPU vs. CPU transform time converges steadily as input size
+  grows: from ~0.01x (128x slower) at 100K elements to ~0.8-0.98x (roughly
+  parity, varying run to run) at 256M elements, the largest size that
+  reliably fits this card's 6GB VRAM. The CPU path was still faster at
+  every size actually tested here — an honest negative result, reported
+  because it's what was measured, not because it's the fun answer. A GPU
+  with more VRAM (to test past ~256M elements) or higher memory bandwidth
+  could plausibly cross over; that is future work, not a claim made here.
+- A one-off probe past the practical VRAM ceiling (400M elements) hit a
+  genuine CUDA resource error, and the `pantograph_lift_forward_cuda` →
+  automatic CPU fallback path handled it transparently — the
+  graceful-degradation design being exercised by a real failure, not just
+  a theoretical code path.
 
 ## Honest limitations / future work
 
 - **Toroidal-style paths** (where the rod magnitude itself oscillates, not
   just its direction) aren't well modeled by a single rotation+scale
-  joint, even recalibrated. A genuine fix needs either a richer per-block
-  model (e.g. a second harmonic term) or accepting that this shape class
-  is out of scope for a "small parameter set" model.
-- **True 3D similarity joints** (a calibrated quaternion / 3x3
-  rotation+scale predicting one 3D rod from the previous one) would
-  likely beat the current xy-plane + z-axis composition for paths that
-  genuinely tumble in 3D (not just climb steadily), and is a natural
-  next step.
+  joint, even recalibrated -- not even by the true 3D similarity joint,
+  since the oscillation period here (~3 samples) is far shorter than any
+  reasonable calibration block. A genuine fix needs either a richer
+  per-block model (e.g. a second harmonic term) or accepting that this
+  shape class is out of scope for a "small parameter set" model.
 - **Interleaved-stream rANS** would let the entropy-coding stage itself
   run in parallel on GPU (unlike the current sequential adaptive range
   coder), closing the loop on an end-to-end GPU-resident codec.
-- **Large-input GPU crossover** has not been measured -- `BENCHMARKS.md`
-  only covers inputs up to ~300KB, where per-level PCIe/launch overhead
-  dominates. Confirming (or refuting) a crossover at multi-megabyte sizes
-  is the natural next benchmarking step.
+- **A CPU-vs-GPU crossover past this GPU's ~256M-element practical VRAM
+  ceiling** hasn't been measured (see `GPU_BENCHMARKS.md`) -- testing on a
+  GPU with more VRAM, or reducing per-buffer memory (e.g. processing in
+  chunks instead of one padded_len-sized allocation), would extend the
+  measurement further.
+
+## Build gotcha: adding a new `__global__` kernel
+
+If you add a new `__global__` CUDA kernel and its launch fails at runtime
+with `cudaErrorSymbolNotFound` ("named symbol not found") despite building
+without errors, this is a known CMake+Ninja+CUDA incremental-build issue
+with relocatable device code (`CUDA_SEPARABLE_COMPILATION ON`): the
+per-executable device-link object (`cmake_device_link.obj`) isn't always
+regenerated correctly when only the static library's `.cu` file changed.
+`rm -rf build && ` reconfigure `+` rebuild from scratch fixes it. This bit
+the first version of the GPU-resident rewrite below (adding
+`compute_block_params_kernel` triggered exactly this), and the test suite
+did not catch it initially because `pantograph_lift_forward_cuda` returning
+`false` transparently falls back to the CPU path -- masking the failure as
+a passing round-trip test. `tests/test_main.cpp`'s `test_codec()` now
+calls `pantograph_lift_forward_cuda` directly and asserts it returns
+`true` when a CUDA device is available, specifically to catch this class
+of silent-fallback bug in the future.

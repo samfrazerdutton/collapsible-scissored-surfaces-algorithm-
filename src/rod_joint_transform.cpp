@@ -44,6 +44,104 @@ void calibrate_block(const std::vector<i32>& ex, const std::vector<i32>& ey,
     out_im = clampd(ci, -8.0, 8.0);
 }
 
+// 3x3 (row-major, Q16.16 fixed point) matrix-vector multiply, rounded to
+// nearest integer.
+inline void mat3_mul_round(const std::array<i64, 9>& m, i32 x, i32 y, i32 z,
+                            i32& ox, i32& oy, i32& oz) {
+    ox = (i32)(fixed_mul_round(x, m[0]) + fixed_mul_round(y, m[1]) + fixed_mul_round(z, m[2]));
+    oy = (i32)(fixed_mul_round(x, m[3]) + fixed_mul_round(y, m[4]) + fixed_mul_round(z, m[5]));
+    oz = (i32)(fixed_mul_round(x, m[6]) + fixed_mul_round(y, m[7]) + fixed_mul_round(z, m[8]));
+}
+
+// Horn's closed-form absolute-orientation method, specialized to fit a
+// single similarity (rotation + uniform scale) predicting rod[i] from
+// rod[i-1] over i in [start, end). Rather than a general eigensolver, the
+// optimal rotation quaternion is found as the dominant eigenvector of the
+// symmetric 4x4 "profile" matrix N via shifted power iteration: N has
+// trace 0 (so its eigenvalues aren't all one sign), so it is shifted by
+// its Frobenius norm before iterating, which guarantees the eigenvalue we
+// want (the most positive one) becomes the largest in magnitude too.
+// Calibration quality only affects compression ratio -- forward/inverse
+// use whatever matrix comes out, exactly, so this never affects
+// correctness even in a degenerate/non-converged case.
+std::array<i64, 9> calibrate_3d_block(const std::vector<i32>& ex, const std::vector<i32>& ey,
+                                       const std::vector<i32>& ez, size_t start, size_t end) {
+    double H[3][3] = {{0}};
+    for (size_t i = std::max(start, size_t(1)); i < end; i++) {
+        double p[3] = {(double)ex[i - 1], (double)ey[i - 1], (double)ez[i - 1]};
+        double c[3] = {(double)ex[i], (double)ey[i], (double)ez[i]};
+        for (int a = 0; a < 3; a++)
+            for (int b = 0; b < 3; b++)
+                H[a][b] += p[a] * c[b];
+    }
+
+    double Sxx = H[0][0], Sxy = H[0][1], Sxz = H[0][2];
+    double Syx = H[1][0], Syy = H[1][1], Syz = H[1][2];
+    double Szx = H[2][0], Szy = H[2][1], Szz = H[2][2];
+
+    double N[4][4] = {
+        {Sxx + Syy + Szz, Syz - Szy,        Szx - Sxz,        Sxy - Syx},
+        {Syz - Szy,       Sxx - Syy - Szz,  Sxy + Syx,        Szx + Sxz},
+        {Szx - Sxz,       Sxy + Syx,       -Sxx + Syy - Szz,  Syz + Szy},
+        {Sxy - Syx,       Szx + Sxz,        Syz + Szy,       -Sxx - Syy + Szz},
+    };
+
+    double frob = 0.0;
+    for (int a = 0; a < 4; a++)
+        for (int b = 0; b < 4; b++)
+            frob += N[a][b] * N[a][b];
+    frob = std::sqrt(frob);
+    for (int a = 0; a < 4; a++) N[a][a] += frob; // shift: guarantees a non-negative spectrum
+
+    double v[4] = {1.0, 1.0, 1.0, 1.0};
+    for (int iter = 0; iter < 40; iter++) {
+        double nv[4] = {0, 0, 0, 0};
+        for (int a = 0; a < 4; a++)
+            for (int b = 0; b < 4; b++)
+                nv[a] += N[a][b] * v[b];
+        double norm = std::sqrt(nv[0] * nv[0] + nv[1] * nv[1] + nv[2] * nv[2] + nv[3] * nv[3]);
+        if (norm < 1e-12) { v[0] = 1; v[1] = v[2] = v[3] = 0; break; }
+        for (int a = 0; a < 4; a++) v[a] = nv[a] / norm;
+    }
+
+    double q0 = v[0], q1 = v[1], q2 = v[2], q3 = v[3];
+    double qn = std::sqrt(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3);
+    std::array<i64, 9> m{};
+    if (qn < 1e-12) {
+        // Degenerate (e.g. an all-zero block): identity, scale 0 -> pure
+        // "predict nothing", still perfectly correctable via the residual.
+        m = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+        return m;
+    }
+    q0 /= qn; q1 /= qn; q2 /= qn; q3 /= qn;
+
+    double R[3][3] = {
+        {q0*q0+q1*q1-q2*q2-q3*q3, 2*(q1*q2-q0*q3),         2*(q1*q3+q0*q2)},
+        {2*(q1*q2+q0*q3),         q0*q0-q1*q1+q2*q2-q3*q3, 2*(q2*q3-q0*q1)},
+        {2*(q1*q3-q0*q2),         2*(q2*q3+q0*q1),         q0*q0-q1*q1-q2*q2+q3*q3},
+    };
+
+    // Optimal uniform scale given R (Umeyama): s = sum(cur . R*prev) / sum(|prev|^2).
+    double num = 0.0, den = 0.0;
+    for (size_t i = std::max(start, size_t(1)); i < end; i++) {
+        double p[3] = {(double)ex[i - 1], (double)ey[i - 1], (double)ez[i - 1]};
+        double c[3] = {(double)ex[i], (double)ey[i], (double)ez[i]};
+        double rp[3];
+        for (int a = 0; a < 3; a++) rp[a] = R[a][0]*p[0] + R[a][1]*p[1] + R[a][2]*p[2];
+        num += c[0]*rp[0] + c[1]*rp[1] + c[2]*rp[2];
+        den += p[0]*p[0] + p[1]*p[1] + p[2]*p[2];
+    }
+    double s = (den > 1e-9) ? (num / den) : 0.0;
+    if (s > 8.0) s = 8.0;
+    if (s < -8.0) s = -8.0;
+    if (!std::isfinite(s)) s = 0.0;
+
+    for (int a = 0; a < 3; a++)
+        for (int b = 0; b < 3; b++)
+            m[a * 3 + b] = clampd(s * R[a][b], -8.0, 8.0);
+    return m;
+}
+
 } // namespace
 
 RodJoint2DResult rod_joint_2d_forward(const std::vector<Point2i>& points) {
@@ -132,6 +230,75 @@ std::vector<Point3i> rod_joint_3d_inverse(const RodJoint3DResult& r) {
     std::vector<Point3i> points(xy.size());
     for (size_t i = 0; i < xy.size(); i++) {
         points[i] = {xy[i].x, xy[i].y, zs[i]};
+    }
+    return points;
+}
+
+RodJoint3DSimResult rod_joint_3d_similarity_forward(const std::vector<Point3i>& points) {
+    RodJoint3DSimResult r;
+    r.count = points.size();
+    if (points.empty()) return r;
+    r.anchor = points[0];
+    size_t m = points.size();
+    if (m < 2) return r;
+
+    std::vector<i32> ex(m - 1), ey(m - 1), ez(m - 1);
+    for (size_t i = 1; i < m; i++) {
+        ex[i - 1] = points[i].x - points[i - 1].x;
+        ey[i - 1] = points[i].y - points[i - 1].y;
+        ez[i - 1] = points[i].z - points[i - 1].z;
+    }
+
+    size_t nrods = m - 1;
+    size_t nblocks = (nrods + kRodJoint3DBlockSize - 1) / kRodJoint3DBlockSize;
+    r.block_matrix.resize(nblocks);
+    r.residual_x.resize(nrods);
+    r.residual_y.resize(nrods);
+    r.residual_z.resize(nrods);
+
+    i32 prev_x = 0, prev_y = 0, prev_z = 0;
+    for (size_t blk = 0; blk < nblocks; blk++) {
+        size_t start = blk * kRodJoint3DBlockSize;
+        size_t end = std::min(nrods, start + kRodJoint3DBlockSize);
+        std::array<i64, 9> M = calibrate_3d_block(ex, ey, ez, start, end);
+        r.block_matrix[blk] = M;
+
+        for (size_t i = start; i < end; i++) {
+            i32 px, py, pz;
+            mat3_mul_round(M, prev_x, prev_y, prev_z, px, py, pz);
+            r.residual_x[i] = ex[i] - px;
+            r.residual_y[i] = ey[i] - py;
+            r.residual_z[i] = ez[i] - pz;
+            prev_x = ex[i];
+            prev_y = ey[i];
+            prev_z = ez[i];
+        }
+    }
+    return r;
+}
+
+std::vector<Point3i> rod_joint_3d_similarity_inverse(const RodJoint3DSimResult& r) {
+    std::vector<Point3i> points;
+    if (r.count == 0) return points;
+    points.resize((size_t)r.count);
+    points[0] = r.anchor;
+    if (r.count < 2) return points;
+
+    i32 prev_x = 0, prev_y = 0, prev_z = 0;
+    for (size_t i = 0; i < r.count - 1; i++) {
+        size_t blk = i / kRodJoint3DBlockSize;
+        const std::array<i64, 9>& M = r.block_matrix[blk];
+        i32 px, py, pz;
+        mat3_mul_round(M, prev_x, prev_y, prev_z, px, py, pz);
+        i32 ex = px + r.residual_x[i];
+        i32 ey = py + r.residual_y[i];
+        i32 ez = pz + r.residual_z[i];
+        points[i + 1].x = points[i].x + ex;
+        points[i + 1].y = points[i].y + ey;
+        points[i + 1].z = points[i].z + ez;
+        prev_x = ex;
+        prev_y = ey;
+        prev_z = ez;
     }
     return points;
 }

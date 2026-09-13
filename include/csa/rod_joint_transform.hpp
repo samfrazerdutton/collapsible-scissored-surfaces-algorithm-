@@ -20,19 +20,41 @@
 // radius), so periodic recalibration trades a still-tiny parameter count
 // for real local adaptivity.
 //
-// 3D point sequences compose the two pieces above rather than using a full
-// 3D similarity joint: the (x, y) plane goes through the same rotation+
-// scale Rod-Joint predictor as the 2D case (this captures genuine turning
-// motion jointly — a rotating trajectory's x and y are individually just
-// two out-of-phase sine waves, each hard for a simple predictor, but
-// together they are exactly what the complex-ratio joint models), and z
-// goes through the Pantograph Lift on its own (captures smooth/linear
-// vertical motion, e.g. a helix's constant climb rate). A full 3D
-// similarity joint (rotation+scale via a calibrated quaternion, for
-// genuinely 3D-tumbling paths) is noted as future work in DESIGN.md.
+// 3D point sequences have two candidate models, and the codec (see
+// codec.cpp's compress_geo3d) tries both and keeps whichever encodes
+// smaller, tagging the choice with one header byte:
+//
+//   (a) Composition: the (x, y) plane goes through the same rotation+
+//       scale Rod-Joint predictor as the 2D case (this captures genuine
+//       turning motion jointly — a rotating trajectory's x and y are
+//       individually just two out-of-phase sine waves, each hard for a
+//       simple predictor, but together they are exactly what the
+//       complex-ratio joint models), and z goes through the Pantograph
+//       Lift on its own (captures smooth/linear vertical motion, e.g. a
+//       helix's constant climb rate). Wins when the path's radius in the
+//       xy-plane is genuinely constant (a helix).
+//
+//   (b) True 3D similarity joint: a single calibrated 3x3 matrix
+//       (rotation + uniform scale) predicts each 3D rod from the
+//       previous one, rod[i] ~= M * rod[i-1]. M is fit per block via
+//       Horn's closed-form absolute-orientation method: build the 3x3
+//       cross-covariance of consecutive rods, form the corresponding
+//       4x4 symmetric "profile" matrix, and take its dominant eigenvector
+//       (the optimal rotation quaternion) via shifted power iteration —
+//       a handful of 4x4 matrix-vector products, no general eigensolver
+//       needed. Optimal scale then follows in closed form. This is the
+//       genuinely-3D generalization of the 2D joint above, and can track
+//       paths whose rotation axis isn't fixed to z (e.g. a path that
+//       tumbles), including some of what defeats the xy+z composition.
+//
+// Both are recalibrated per block (kRodJointBlockSize / kRodJoint3DBlockSize
+// rods) for the same reason as the 2D case, and both are exactly
+// reversible regardless of calibration quality — the residual is always
+// `actual - predicted`, so a bad fit only costs compression ratio.
 #pragma once
 #include "csa/common.hpp"
 #include "csa/pantograph_lift.hpp"
+#include <array>
 #include <vector>
 
 namespace csa {
@@ -40,7 +62,8 @@ namespace csa {
 struct Point2i { i32 x, y; };
 struct Point3i { i32 x, y, z; };
 
-constexpr size_t kRodJointBlockSize = 128; // rods per calibration block
+constexpr size_t kRodJointBlockSize = 128;   // rods per calibration block (2D)
+constexpr size_t kRodJoint3DBlockSize = 128; // rods per calibration block (3D similarity)
 
 struct RodJoint2DResult {
     Point2i anchor{0, 0};
@@ -61,5 +84,15 @@ struct RodJoint3DResult {
 
 RodJoint3DResult rod_joint_3d_forward(const std::vector<Point3i>& points);
 std::vector<Point3i> rod_joint_3d_inverse(const RodJoint3DResult& r);
+
+struct RodJoint3DSimResult {
+    Point3i anchor{0, 0, 0};
+    u64 count = 0;
+    std::vector<std::array<i64, 9>> block_matrix; // per block, row-major 3x3, Q16.16
+    std::vector<i32> residual_x, residual_y, residual_z; // size count-1 each
+};
+
+RodJoint3DSimResult rod_joint_3d_similarity_forward(const std::vector<Point3i>& points);
+std::vector<Point3i> rod_joint_3d_similarity_inverse(const RodJoint3DSimResult& r);
 
 } // namespace csa
