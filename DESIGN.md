@@ -147,9 +147,63 @@ would make entropy coding itself GPU-parallel, but it is also considerably
 easier to get subtly wrong. Given the choice between a flashier entropy
 coder and one that is provably bit-exact under test, correctness won:
 the range coder here is simple enough to reason about completely, and all
-644 round-trip checks (see `tests/test_main.cpp`) pass, including the CUDA
-path. Interleaved-stream rANS for GPU-parallel entropy decode is a natural
-next step (see Future Work).
+1293 round-trip checks (see `tests/test_main.cpp`) pass, including the
+CUDA path. Interleaved-stream rANS for GPU-parallel entropy decode is a
+natural next step (see Future Work).
+
+### 4. LZ dictionary matcher (`include/csa/lz_matcher.hpp`, `include/csa/lz_codec.hpp`)
+
+The two transforms above are *predictive*: good when a sample or rod
+relates to an earlier one by a small calibrated rule. Ordinary text and
+structured files have a different kind of redundancy instead -- the same
+substring recurring far apart (a word, a log-line template, a repeated
+JSON key) -- which no predictive transform can exploit but a dictionary
+matcher is built for. This is what lets `Mode::GeneralLZ` compete with
+gzip/bz2/lzma on that kind of data, rather than leaving it entirely to
+Pantograph Lift (which was never going to beat them there, and honestly
+didn't -- see `BENCHMARKS.md`'s git history for the numbers before this
+was added).
+
+**Matching** (`lz_matcher.cpp`): an unbounded-window hash-chain matcher --
+a position's 4-byte hash indexes a chain of every earlier position with
+the same hash (classic zlib-style hash chains), walked up to a bounded
+depth (1024) to find the longest match. "Unbounded window" means a match
+can reference any earlier position in the whole buffer, not a fixed
+32KB-ish window like gzip -- a real, structural advantage specifically on
+data with very long-range repetition (see `text_repetitive.bin` in
+`BENCHMARKS.md`, which collapses smaller than gzip, bz2, *and* lzma).
+Matching is **lazy** (one-step lookahead, the same technique zlib's higher
+compression levels use): before committing to a match found at position
+`i`, the matcher checks whether position `i+1` has a strictly longer one;
+if so, `i` is emitted as a literal and the better match at `i+1` wins
+instead. This alone improved the realistic-text results in `USE_CASES.md`
+enough to flip several from losing against gzip to beating it. Every
+position an accepted match covers is still inserted into the hash chains
+(not just skipped over), so a later match can reference into the middle
+of an earlier one -- important for highly repetitive data.
+
+**Entropy coding** (`lz_codec.cpp`): literal bytes and the "a match starts
+here" flag share one order-1 adaptive model over a 257-symbol alphabet
+(reusing the same `RangeEncoder`/`RangeDecoder` as everything else, just
+with a newly-generalized `FenwickFreqN`/`Order1ModelN` that support an
+arbitrary alphabet size instead of the original hard-coded 256). Match
+length and distance are each split into a magnitude class ("bucket",
+`bucket = floor(log2(v+1))`, entropy-coded via its own small adaptive
+model) and the bits distinguishing values within that bucket (packed raw
+via `bitpacker.hpp`'s `BitWriter`/`BitReader`, since those bits are ~
+uniform by construction and entropy coding them would gain nothing) --
+the same length/distance coding strategy DEFLATE and LZMA-style codecs
+use, adapted to this project's range coder instead of Huffman coding.
+
+**Honest limits**: this is a real, working LZ77-style compressor, not a
+toy -- but it is not LZMA. There is no optimal parsing (the lazy
+lookahead is one step, not a full cost-based search over parse choices),
+no context-mixed high-order entropy modeling, and no BWT (which is a
+large part of why bz2 wins on ordinary prose). See `USE_CASES.md` for
+where this actually lands against gzip/bz2/lzma on realistic (not
+maximally repetitive) text, log, and structured-data files -- it beats
+gzip on most of them, and is within reach of bz2/lzma without matching
+them outright.
 
 ## Container format
 
@@ -160,10 +214,13 @@ One shared bitstream, `include/csa/codec.hpp`:
   incompressible random data), so CSA never inflates input by more than a
   small fixed overhead.
 - `Mode::General` -- Pantograph Lift over a byte stream.
+- `Mode::GeneralLZ` -- the LZ dictionary matcher over a byte stream.
 - `Mode::Geo2D` / `Mode::Geo3D` -- Rod-Joint Transform over point streams.
 
-All four modes share the same range coder and the same varint/zigzag
-residual encoding.
+`compress()` tries `Raw`/`General`/`GeneralLZ` for any byte-stream input
+and keeps whichever encodes smallest, so callers never need to know in
+advance whether their data is more "smooth/predictive" or more
+"repeated-substring" in nature.
 
 ## GPU acceleration (`cuda/pantograph_lift_cuda.cu`)
 
@@ -260,6 +317,16 @@ either way. Headline findings from that file:
   GPU with more VRAM, or reducing per-buffer memory (e.g. processing in
   chunks instead of one padded_len-sized allocation), would extend the
   measurement further.
+- **Optimal (cost-based) LZ parsing** would likely close more of the
+  remaining gap to bz2/lzma on realistic text (see `USE_CASES.md`): the
+  current matcher's lookahead is one step (lazy matching), not a full
+  search over parse choices weighted by their actual entropy-coded cost,
+  which is what LZMA-class compressors do.
+- **A BWT-based mode** would be the more direct way to challenge bz2
+  specifically on ordinary prose, since a large part of bz2's advantage
+  there comes from the Burrows-Wheeler Transform rearranging the data
+  into long runs of similar bytes before entropy coding, not from its LZ
+  stage.
 
 ## Build gotcha: adding a new `__global__` kernel
 

@@ -4,6 +4,7 @@
 // residual streams produced by the Pantograph Lift / Rod-Joint transforms.
 #pragma once
 #include "csa/common.hpp"
+#include <algorithm>
 #include <array>
 #include <memory>
 
@@ -97,6 +98,101 @@ public:
     FenwickFreq& context(int prev_byte) { return ctx_[(u8)prev_byte]; }
 private:
     std::vector<FenwickFreq> ctx_;
+};
+
+// Same idea as FenwickFreq, generalized to a runtime-chosen alphabet size
+// (not just 256) -- used by the LZ codec (lz_codec.hpp) for its
+// literal+match-flag alphabet (257 symbols) and its length/distance
+// bucket alphabets (a few dozen symbols each). The "find" binary-lifting
+// search generalizes to a non-power-of-two symbol count by starting the
+// search width at the largest power of two <= n instead of requiring n
+// itself to be one; this is the standard Fenwick-tree generalization, not
+// an approximation.
+class FenwickFreqN {
+public:
+    explicit FenwickFreqN(int num_symbols, u32 increment = 32, u32 max_total = 1u << 15)
+        : n_(num_symbols), increment_(increment), max_total_(max_total), tree_(num_symbols, 0) {
+        reset();
+    }
+
+    void reset() {
+        std::fill(tree_.begin(), tree_.end(), 0);
+        total_ = 0;
+        for (int s = 0; s < n_; s++) add(s, 1);
+        total_ = (u32)n_;
+    }
+
+    u32 total() const { return total_; }
+
+    u32 cumfreq(int sym) const {
+        u32 sum = 0;
+        for (int i = sym; i > 0; i -= i & (-i)) sum += (u32)tree_[i - 1];
+        return sum;
+    }
+
+    u32 freq_of(int sym) const { return cumfreq(sym + 1) - cumfreq(sym); }
+
+    int find(u32 target, u32& lo, u32& f) const {
+        int idx = 0;
+        u32 rem = target;
+        int pw = 1;
+        while (pw * 2 <= n_) pw *= 2; // largest power of two <= n_
+        for (; pw > 0; pw >>= 1) {
+            int next = idx + pw;
+            if (next <= n_ && (u32)tree_[next - 1] <= rem) {
+                idx = next;
+                rem -= (u32)tree_[next - 1];
+            }
+        }
+        int sym = idx;
+        lo = target - rem;
+        f = freq_of(sym);
+        return sym;
+    }
+
+    void update(int sym) {
+        add(sym, (i32)increment_);
+        total_ += increment_;
+        if (total_ > max_total_) rescale();
+    }
+
+private:
+    void add(int sym, i32 delta) {
+        for (int i = sym + 1; i <= n_; i += i & (-i)) tree_[i - 1] += delta;
+    }
+
+    void rescale() {
+        std::vector<u32> freqs(n_);
+        for (int s = 0; s < n_; s++) {
+            u32 f = freq_of(s);
+            freqs[s] = (f > 1) ? (f >> 1) : 1;
+        }
+        std::fill(tree_.begin(), tree_.end(), 0);
+        total_ = 0;
+        for (int s = 0; s < n_; s++) {
+            add(s, (i32)freqs[s]);
+            total_ += freqs[s];
+        }
+    }
+
+    int n_;
+    u32 increment_, max_total_;
+    std::vector<i32> tree_;
+    u32 total_ = 0;
+};
+
+// Order-1 model over an N-symbol alphabet, one FenwickFreqN per
+// preceding-byte context (256 contexts -- context is always the previous
+// literal byte value, regardless of the wider output alphabet).
+class Order1ModelN {
+public:
+    explicit Order1ModelN(int num_symbols) {
+        ctx_.reserve(256);
+        for (int i = 0; i < 256; i++) ctx_.emplace_back(num_symbols);
+    }
+    FenwickFreqN& context(int prev_byte) { return ctx_[(u8)prev_byte]; }
+private:
+    std::vector<FenwickFreqN> ctx_;
 };
 
 // ---- Range coder core (32-bit, byte renormalization). ----

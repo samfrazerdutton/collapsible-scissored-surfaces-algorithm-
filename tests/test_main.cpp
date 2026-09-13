@@ -2,6 +2,8 @@
 // round-trip correctness for every layer: range coder, Pantograph Lift,
 // Rod-Joint transform (2D/3D), and the full container codec.
 #include "csa/codec.hpp"
+#include "csa/lz_codec.hpp"
+#include "csa/lz_matcher.hpp"
 #include "csa/pantograph_lift.hpp"
 #include "csa/pantograph_lift_cuda.hpp"
 #include "csa/range_coder.hpp"
@@ -59,6 +61,69 @@ static void test_range_coder() {
     std::vector<u8> constant(10000, 42);
     auto coded = range_encode_bytes(constant);
     CHECK(coded.size() < constant.size() / 10);
+}
+
+static void test_lz_matcher() {
+    std::mt19937 rng(77);
+
+    std::vector<std::vector<u8>> cases;
+    cases.push_back({});
+    cases.push_back({1});
+    cases.push_back({1, 2, 3});
+    cases.push_back(std::vector<u8>(500, 7)); // maximally repetitive
+    cases.push_back(random_bytes(2000, rng)); // no exploitable structure
+    {
+        // Overlapping-match case: distance < length forces a byte-by-byte
+        // overlap copy on reconstruction, not a plain memcpy.
+        std::vector<u8> v;
+        for (int i = 0; i < 300; i++) v.push_back((u8)('a' + (i % 3)));
+        cases.push_back(v);
+    }
+    {
+        std::string s;
+        for (int i = 0; i < 300; i++) s += "the quick brown fox jumps over the lazy dog. ";
+        cases.push_back(std::vector<u8>(s.begin(), s.end()));
+    }
+
+    for (auto& input : cases) {
+        auto tokens = lz_parse(input);
+        auto back = lz_tokens_reconstruct(tokens);
+        CHECK(back == input);
+    }
+
+    // The maximally repetitive case should collapse to very few tokens
+    // (one literal to seed the dictionary, then one giant match), proving
+    // the matcher isn't just emitting literals.
+    auto rep_tokens = lz_parse(std::vector<u8>(500, 7));
+    CHECK(rep_tokens.size() < 5);
+}
+
+static void test_lz_codec() {
+    std::mt19937 rng(88);
+
+    std::vector<std::vector<u8>> cases;
+    cases.push_back({});
+    cases.push_back({42});
+    cases.push_back(std::vector<u8>(1000, 9));
+    cases.push_back(random_bytes(3000, rng));
+
+    std::string text;
+    for (int i = 0; i < 500; i++) text += "the quick brown fox jumps over the lazy dog. ";
+    cases.push_back(std::vector<u8>(text.begin(), text.end()));
+
+    for (auto& input : cases) {
+        auto blob = lz_encode(input);
+        size_t pos = 0;
+        auto back = lz_decode(blob.data(), blob.size(), pos);
+        CHECK(back == input);
+        CHECK(pos == blob.size()); // decode must consume exactly its own blob
+    }
+
+    // Highly repetitive text should compress to a tiny fraction of its
+    // size -- this is the entire point of adding a dictionary matcher.
+    auto text_bytes = std::vector<u8>(text.begin(), text.end());
+    auto text_blob = lz_encode(text_bytes);
+    CHECK(text_blob.size() < text_bytes.size() / 20);
 }
 
 static std::vector<i32> smooth_ramp(size_t n) {
@@ -260,9 +325,11 @@ static void test_codec() {
     auto blob = compress(text_bytes);
     auto back = decompress(blob);
     CHECK(back == text_bytes);
-    // Pantograph Lift is not an LZ-style dictionary coder, so don't expect
-    // gzip-tier ratios on text -- just noticeably smaller than raw.
-    CHECK(blob.size() < text_bytes.size() * 7 / 10);
+    // compress() now also tries the LZ dictionary-matcher candidate, which
+    // should win handily on this maximally repetitive text and auto-select
+    // itself -- a much stronger bar than the old Pantograph-Lift-only
+    // "noticeably smaller than raw" expectation.
+    CHECK(blob.size() < text_bytes.size() / 10);
 
     // Incompressible random data: RAW fallback must keep overhead tiny.
     auto rnd = random_bytes(4096, rng);
@@ -446,6 +513,8 @@ static void test_geo3d_lag_search_toroidal() {
 
 int main() {
     test_range_coder();
+    test_lz_matcher();
+    test_lz_codec();
     test_pantograph_lift();
     test_rod_joint_2d();
     test_rod_joint_3d();

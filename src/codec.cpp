@@ -1,4 +1,5 @@
 #include "csa/codec.hpp"
+#include "csa/lz_codec.hpp"
 #include "csa/pantograph_lift.hpp"
 #include "csa/pantograph_lift_cuda.hpp"
 #include "csa/range_coder.hpp"
@@ -266,7 +267,16 @@ std::vector<u8> compress(const std::vector<u8>& input, bool use_gpu) {
     write_magic_mode(general_blob, Mode::General);
     serialize_lift(lr, general_blob);
 
-    return (general_blob.size() < raw_blob.size()) ? general_blob : raw_blob;
+    // GENERAL-LZ candidate.
+    std::vector<u8> lz_blob;
+    write_magic_mode(lz_blob, Mode::GeneralLZ);
+    std::vector<u8> lz_payload = lz_encode(input);
+    lz_blob.insert(lz_blob.end(), lz_payload.begin(), lz_payload.end());
+
+    const std::vector<u8>* best = &raw_blob;
+    if (general_blob.size() < best->size()) best = &general_blob;
+    if (lz_blob.size() < best->size()) best = &lz_blob;
+    return *best;
 }
 
 std::vector<u8> decompress(const std::vector<u8>& blob) {
@@ -283,6 +293,9 @@ std::vector<u8> decompress(const std::vector<u8>& blob) {
         std::vector<u8> out(vals.size());
         for (size_t i = 0; i < vals.size(); i++) out[i] = (u8)vals[i];
         return out;
+    }
+    if (mode == Mode::GeneralLZ) {
+        return lz_decode(blob.data(), blob.size(), pos);
     }
     throw std::runtime_error("csa: decompress() called on a geometric-mode stream; use decompress_geo2d/3d");
 }

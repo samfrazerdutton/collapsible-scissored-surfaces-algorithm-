@@ -9,11 +9,14 @@ and doubly-curved surfaces from a *small set of design parameters*
 That's a description of a reversible predictive transform. This repo
 implements it as one: a compact representation plus a handful of
 calibrated parameters that regenerate the full data exactly, built by a
-local rule applied repeatedly across scale. See `DESIGN.md` for the full
-technical mapping, `BENCHMARKS.md` for real, regenerable compression-ratio
-measurements, and `GPU_BENCHMARKS.md` for a dedicated CPU-vs-GPU crossover
-measurement from 100K to 256M elements (nothing in either file is
-hand-typed).
+local rule applied repeatedly across scale -- plus a real LZ77-style
+dictionary matcher for the kind of redundancy (repeated substrings, not
+predictable samples) that a predictive transform can't touch. See
+`DESIGN.md` for the full technical mapping, `BENCHMARKS.md` for real,
+regenerable compression-ratio measurements, `USE_CASES.md` for how it does
+on realistic (not maximally repetitive) text/log/telemetry files, and
+`GPU_BENCHMARKS.md` for a dedicated CPU-vs-GPU crossover measurement from
+100K to 256M elements (nothing in any of those files is hand-typed).
 
 ## What's actually here
 
@@ -28,19 +31,27 @@ hand-typed).
   sequences try two models per file automatically (a 2D rotation joint on
   (x,y) + affine fit on z, and a true 3D similarity joint fit via Horn's
   closed-form quaternion method) and keep whichever encodes smaller.
+- **LZ dictionary matcher** -- a real, working LZ77-style compressor
+  (unbounded-window hash-chain matching with lazy/one-step-lookahead
+  parsing, the same technique zlib's higher levels use) for the
+  repeated-substring redundancy in text/log/structured files that no
+  predictive transform can exploit. `compress()` tries this alongside
+  Pantograph Lift and raw storage and keeps whichever encodes smallest.
 - **Adaptive order-1 range coder** -- the entropy-coding backend shared by
-  both transforms.
+  every mode (generalized to arbitrary alphabet sizes for the LZ matcher's
+  literal/length/distance streams, not just the original 256-byte case).
 - **CUDA kernel** for the Pantograph Lift's forward transform (genuinely
   parallel: every pair within a decomposition level is independent),
   GPU-resident across the whole multi-level pass (one upload, a handful of
   downloads, no per-level round trips), tested against the CPU path
   bit-for-bit.
-- **1271 round-trip correctness checks** (`tests/test_main.cpp`), including
+- **1293 round-trip correctness checks** (`tests/test_main.cpp`), including
   a dedicated check that the GPU path actually succeeds (not just that the
   overall call round-trips via CPU fallback), all passing.
 - **A benchmark suite** (`bench/`) comparing against gzip/bz2/lzma on both
-  synthetic and domain-realistic data (a simulated single-ring LiDAR scan
-  among them), with honest wins *and* honest losses reported.
+  synthetic shape classes and domain-realistic data (a simulated single-ring
+  LiDAR scan, synthetic server logs, JSON telemetry, sensor CSV exports),
+  with honest wins *and* honest losses reported.
 
 ## Quick start
 
@@ -66,9 +77,14 @@ python bench/run_benchmarks.py
 
 # Measure the CPU-vs-GPU transform crossover on your own machine
 python bench/gpu_crossover.py
+
+# Realistic (not maximally repetitive) use-case datasets and results
+python bench/use_cases.py
 ```
 
-## Headline results (see `BENCHMARKS.md` for the full, regenerated table)
+## Headline results
+
+**Geometric shape classes** (see `BENCHMARKS.md` for the full table):
 
 | dataset | shape class | vs. best of gzip/bz2/lzma |
 |---|---|---|
@@ -76,6 +92,14 @@ python bench/gpu_crossover.py
 | `helix.xyz` | helical point cloud | **95% smaller**; beats lzma by ~12x (true 3D similarity joint) |
 | `gps_track.xy` | noisy real-world-style path | beats lzma by ~1.3x |
 | `toroidal.xyz` | doubly-curved (wobbling radius) | **32% smaller; beats lzma** -- see below for how |
+
+**Realistic use cases** (see `USE_CASES.md` for the full picture, including bz2/lzma comparisons):
+
+| dataset | scenario | vs. gzip -9 |
+|---|---|---|
+| server access log | 5,000 synthetic nginx-format lines | **beats gzip** (55.5KB vs 56.9KB) |
+| JSON telemetry events | 5,000 IoT/analytics events | **beats gzip** (70.6KB vs 73.2KB) |
+| sensor CSV export | 20,000 rows, smooth+noisy columns | close to gzip (166.9KB vs 164.4KB) |
 
 ## Honesty, not hype
 
@@ -92,10 +116,17 @@ python bench/gpu_crossover.py
   speech/audio codecs use for periodic signals. Lag 3 aligns almost
   exactly with this shape's oscillation period, turning a 15%-smaller
   loss into a 32%-smaller win. See `DESIGN.md` for the mechanism.
-- The general-purpose Pantograph Lift mode does not beat gzip/bz2/lzma on
-  ordinary text and isn't meant to -- it's a from-scratch reversible
-  transform, not a reimplementation of Lempel-Ziv, and the geometric mode
-  is the actual point of this repo.
+- General mode tries three candidates per file now -- raw storage,
+  Pantograph Lift, and a real LZ77-style dictionary matcher -- and keeps
+  whichever encodes smallest. On `text_repetitive.bin` (a single sentence
+  repeated thousands of times) the LZ matcher's *unbounded* window beats
+  gzip, bz2, *and* lzma outright; that's a real structural edge on very
+  long-range repetition specifically, not a claim that CSA beats mature LZ
+  compressors on arbitrary text in general. `USE_CASES.md` tests
+  realistic, non-trivially-repetitive text/log/JSON/CSV instead: CSA beats
+  gzip on most of them and is within reach of (without matching) bz2/lzma,
+  which use more sophisticated parsing and entropy modeling (see
+  `DESIGN.md`'s future work for exactly what's missing).
 - GPU timing is reported honestly, at two different fidelities. Launching
   a fresh process per measurement (which pays its own allocation, and a
   real ~1.2s wake/context-creation cost if this laptop GPU had idled since
@@ -124,7 +155,9 @@ cli/              scissorc command-line tool
 tests/            self-contained round-trip test suite (no external deps)
 bench/            dataset generator + benchmark runner (writes BENCHMARKS.md)
                   + GPU crossover benchmark (writes GPU_BENCHMARKS.md)
+                  + realistic use-case scenarios (writes USE_CASES.md)
 DESIGN.md          full technical design and honest limitations/future work
 BENCHMARKS.md      regenerated by bench/run_benchmarks.py -- not hand-edited
 GPU_BENCHMARKS.md  regenerated by bench/gpu_crossover.py -- not hand-edited
+USE_CASES.md       regenerated by bench/use_cases.py -- not hand-edited
 ```

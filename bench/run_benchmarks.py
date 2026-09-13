@@ -213,10 +213,19 @@ def main():
         "should happen, and worth showing rather than hiding.\n"
     )
     lines.append(
-        "- The Pantograph Lift (general mode) is a byte-stream transform; it competes "
-        "with gzip/bz2/lzma on ordinary files but is not tuned to beat them on text -- "
-        "its point is the geometric-mode story above, not replacing mature general "
-        "compressors.\n"
+        "- General mode now tries three candidates per file -- raw storage, the "
+        "Pantograph Lift (predictive, good on smooth/self-similar numeric data), and "
+        "an LZ77-style dictionary matcher with adaptive range coding (repeated-"
+        "substring redundancy, good on text/structured files) -- and keeps whichever "
+        "encodes smallest. `text_repetitive.bin` is a single sentence repeated "
+        "thousands of times, and the LZ matcher's *unbounded* window (it can "
+        "reference any earlier position in the whole file, not a fixed 32KB-ish "
+        "window like gzip) collapses it to almost nothing -- smaller than gzip, bz2, "
+        "*and* lzma here. That's a real, structural advantage on this specific shape "
+        "of redundancy, not a general claim that CSA beats mature LZ compressors on "
+        "arbitrary text -- see `USE_CASES.md` for less trivially-repetitive, more "
+        "realistic text/log/structured-data scenarios and how the three candidates "
+        "actually compare there.\n"
     )
     lines.append(
         "- These files are all under ~400KB, where GPU compress() is dominated by a "

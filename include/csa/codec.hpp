@@ -9,13 +9,18 @@
 
 namespace csa {
 
-enum class Mode : u8 { Raw = 0, General = 1, Geo2D = 2, Geo3D = 3 };
+enum class Mode : u8 { Raw = 0, General = 1, Geo2D = 2, Geo3D = 3, GeneralLZ = 4 };
 
-// General-purpose byte-stream compression (Pantograph Lift + range coding),
-// with automatic raw-storage fallback if that would be smaller. When
-// use_gpu is true and a CUDA device is available, the forward transform
-// runs on the GPU (level-parallel); otherwise it transparently falls back
-// to the CPU implementation. The bitstream is identical either way.
+// General-purpose byte-stream compression. Three candidates are always
+// tried -- raw storage, the Pantograph Lift (predictive, good on smooth/
+// self-similar numeric data), and an LZ77-style dictionary matcher with
+// adaptive range coding (repeated-substring redundancy, good on text and
+// structured files) -- and whichever encodes smallest wins, so callers
+// never need to guess which model suits their data. When use_gpu is true
+// and a CUDA device is available, the Pantograph Lift candidate's forward
+// transform runs on the GPU (level-parallel); otherwise it transparently
+// falls back to the CPU implementation. The bitstream is identical either
+// way.
 std::vector<u8> compress(const std::vector<u8>& input, bool use_gpu = false);
 std::vector<u8> decompress(const std::vector<u8>& blob);
 
