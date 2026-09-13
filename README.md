@@ -27,12 +27,14 @@ unmodified C++ source code, not text written for this project -- and
 - **Rod-Joint Transform** -- the literal geometric analogue for point
   sequences (GPS tracks, spirals, helices, LiDAR scans): each edge vector
   is predicted from an earlier one (not always the immediately preceding
-  one -- a small set of candidate lags is searched and whichever encodes
-  smallest wins, letting quasi-periodic paths align with their own
-  oscillation period) via a calibrated rotation+scale constant. 3D point
-  sequences try two models per file automatically (a 2D rotation joint on
-  (x,y) + affine fit on z, and a true 3D similarity joint fit via Horn's
-  closed-form quaternion method) and keep whichever encodes smaller.
+  one -- a small set of candidate lags is searched **per calibration
+  block**, not once for the whole file, so a path whose oscillation period
+  itself drifts partway through is tracked correctly -- 71% less residual
+  than the best single whole-file lag on a period-drifting test shape) via
+  a calibrated rotation+scale constant. 3D point sequences try two models
+  per file automatically (a 2D rotation joint on (x,y) + affine fit on z,
+  and a true 3D similarity joint fit via Horn's closed-form quaternion
+  method) and keep whichever encodes smaller.
 - **LZ dictionary matcher** -- a real, working LZ77-style compressor
   (unbounded-window hash-chain matching with lazy/one-step-lookahead
   parsing, the same technique zlib's higher levels use) for the
@@ -68,7 +70,7 @@ unmodified C++ source code, not text written for this project -- and
   `compress()` keeps one per thread automatically. Measured, not assumed:
   ~3.5x faster sustained per-call time at 50K elements, ~1.7x at 2M (see
   `DESIGN.md`).
-- **1346 round-trip correctness checks** (`tests/test_main.cpp` +
+- **1349 round-trip correctness checks** (`tests/test_main.cpp` +
   `tests/test_capi.cpp`, the latter linking the real shared library to
   catch actual symbol-export problems), including a dedicated check that
   the GPU path actually succeeds (not just that the overall call
@@ -150,9 +152,9 @@ cd bindings/rust && cargo test
 
 | level | size | notable comparisons | compress time |
 |---|---:|---|---:|
-| `--level fast` | 2.04MB | **beats gzip (3.10MB), bz2 (2.40MB), zstd -3 (2.93MB)** | 1.6s |
-| `--level balanced` | 1.95MB | **beats brotli -11 (2.09MB)**, still ahead of gzip/bz2/zstd -3 | 5.3s |
-| `--level high` | 1.91MB | within 13% of lzma -9 (1.68MB) -- but **zstd -19 beats it on size *and* speed** (1.71MB in 5.2s vs 31.5s) | 31.5s |
+| `--level fast` | 2.04MB | **beats gzip (3.10MB), bz2 (2.40MB), zstd -3 (2.93MB)** | 1.4s |
+| `--level balanced` | 1.95MB | **beats brotli -11 (2.09MB)**, still ahead of gzip/bz2/zstd -3 | 5.2s |
+| `--level high` | 1.91MB | within 13% of lzma -9 (1.68MB) -- but **zstd -19 beats it on size *and* speed** (1.71MB in 5.2s vs 30.2s) | 30.2s |
 
 ## Honesty, not hype
 
@@ -162,13 +164,16 @@ cd bindings/rust && cargo test
   a general-purpose point-cloud compressor and doesn't try to be.
 - `toroidal.xyz` used to be reported as an honest loss against lzma: its
   radius oscillates roughly every 3 rods, far faster than any calibration
-  block predicting from the immediately preceding rod could track. The
-  actual fix wasn't a fancier per-block fit -- both Geo3D models now
-  search a small set of candidate lags (predict rod `i` from rod `i-lag`
-  for lag in {1..32}) and keep whichever encodes smallest, the same idea
-  speech/audio codecs use for periodic signals. Lag 3 aligns almost
-  exactly with this shape's oscillation period, turning a 15%-smaller
-  loss into a 32%-smaller win. See `DESIGN.md` for the mechanism.
+  block predicting from the immediately preceding rod could track. Both
+  Geo3D models now search a small set of candidate lags (predict rod `i`
+  from rod `i-lag` for lag in {1..32}) **independently per calibration
+  block**, not once for the whole file -- the same idea speech/audio codecs
+  use for periodic signals, generalized so a path whose period itself
+  drifts partway through still gets tracked (71% less residual than the
+  best single whole-file lag on a test shape built to prove it). Lag 3
+  aligns almost exactly with `toroidal.xyz`'s oscillation period, turning a
+  15%-smaller loss into a 32%-smaller win. See `DESIGN.md` for the
+  mechanism.
 - General mode tries three candidates per file now -- raw storage,
   Pantograph Lift, and a real LZ77-style dictionary matcher -- and keeps
   whichever encodes smallest. On `text_repetitive.bin` (a single sentence
@@ -183,7 +188,7 @@ cd bindings/rust && cargo test
   the textbook trio. `--level fast` beats gzip, bz2, *and* zstd's default
   level; `--level balanced` beats brotli's max level too. But the more
   important, more humbling number: **zstd -19 beats CSA `--level high` on
-  both size *and* speed at once** (1.71MB in 5.2s vs 1.91MB in 31.5s) --
+  both size *and* speed at once** (1.71MB in 5.2s vs 1.91MB in 30.2s) --
   not just a better ratio, a better ratio *and* 6x faster. That's the
   honest measure of the gap to a real modern production compressor: the
   whole speed/ratio curve, not one axis. Real source code has exactly the

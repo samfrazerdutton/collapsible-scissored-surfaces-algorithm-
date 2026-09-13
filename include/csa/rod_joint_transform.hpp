@@ -99,19 +99,39 @@ constexpr size_t kRodJointNumCandidateLags = sizeof(kRodJointCandidateLags) / si
 // to zero there -- the same role a keyframe plays in a video codec.
 // resync_interval == 0 means "never" (fine for lossless use, or for short
 // sequences where drift never gets large enough to matter).
+// `lag` used to be one value for the whole sequence, found by an outer
+// per-file search over kRodJointCandidateLags (codec.cpp tried each lag as
+// a whole separate forward() call and kept whichever encoded smallest).
+// That works well when one oscillation period describes the entire path,
+// but a path whose period itself drifts partway through (e.g. a toroidal
+// scan whose pitch changes, or two concatenated shapes with different
+// periods) can't be served by any single global lag. `block_lag` makes
+// the choice per calibration block instead: each block searches
+// kRodJointCandidateLags independently (by least-squares residual energy,
+// the same criterion the ratio calibration itself already optimizes) and
+// keeps whichever lag it predicts best with. A uniform whole-file lag is
+// just the special case where every block happens to pick the same
+// candidate, so this can only match or beat the old design, never lose to
+// it, and it does the search in one pass instead of re-running the whole
+// transform once per candidate.
 struct RodJoint2DResult {
     Point2i anchor{0, 0};
     u64 count = 0;                    // number of points
-    u32 lag = 1;                      // rod[i] predicted from rod[i-lag]
     u32 quant_step = 1;                // 1 == lossless
     u32 resync_interval = 0;           // 0 == no periodic exact resync
+    std::vector<u32> block_lag;       // per block: rod[i] predicted from rod[i-block_lag[blk]]
     std::vector<i64> block_ratio_re;  // per block, Q16.16 fixed-point joint constant
     std::vector<i64> block_ratio_im;  // c = ratio_re + i*ratio_im
     std::vector<i32> residual_x;      // size count-1 (empty if count <= 1); quantized index when quant_step > 1
     std::vector<i32> residual_y;
 };
 
-RodJoint2DResult rod_joint_2d_forward(const std::vector<Point2i>& points, u32 lag = 1,
+// `force_lag == 0` (the default) searches kRodJointCandidateLags
+// independently per calibration block. A nonzero value instead forces
+// that one lag uniformly across every block, skipping the search --
+// mainly useful for tests/benchmarks that want to measure "what if lag
+// search were disabled" against the auto-search result.
+RodJoint2DResult rod_joint_2d_forward(const std::vector<Point2i>& points, u32 force_lag = 0,
                                        u32 quant_step = 1, u32 resync_interval = 0);
 std::vector<Point2i> rod_joint_2d_inverse(const RodJoint2DResult& r);
 
@@ -127,25 +147,29 @@ struct RodJoint3DResult {
     LiftResult lift_z;
 };
 
-RodJoint3DResult rod_joint_3d_forward(const std::vector<Point3i>& points, u32 xy_lag = 1);
+RodJoint3DResult rod_joint_3d_forward(const std::vector<Point3i>& points, u32 xy_force_lag = 0);
 std::vector<Point3i> rod_joint_3d_inverse(const RodJoint3DResult& r);
 
 // Same lossless/lossy unification as RodJoint2DResult (quant_step == 1 is
 // exactly lossless; resync_interval periodically forces an exact rod,
 // computed to land on the true *absolute point* given wherever the
 // reconstructed position currently is, not the true rod -- see
-// RodJoint2DResult's comment for why that distinction matters).
+// RodJoint2DResult's comment for why that distinction matters). Lag is
+// per-block for the same reason as RodJoint2DResult's `block_lag` --
+// see that struct's comment.
 struct RodJoint3DSimResult {
     Point3i anchor{0, 0, 0};
     u64 count = 0;
-    u32 lag = 1;                      // rod[i] predicted from rod[i-lag]
     u32 quant_step = 1;                // 1 == lossless
     u32 resync_interval = 0;           // 0 == no periodic exact resync
+    std::vector<u32> block_lag;       // per block: rod[i] predicted from rod[i-block_lag[blk]]
     std::vector<std::array<i64, 9>> block_matrix; // per block, row-major 3x3, Q16.16
     std::vector<i32> residual_x, residual_y, residual_z; // size count-1 each; quantized index when quant_step > 1
 };
 
-RodJoint3DSimResult rod_joint_3d_similarity_forward(const std::vector<Point3i>& points, u32 lag = 1,
+// force_lag == 0 (default) searches kRodJointCandidateLags per block; a
+// nonzero value forces that lag uniformly (see rod_joint_2d_forward).
+RodJoint3DSimResult rod_joint_3d_similarity_forward(const std::vector<Point3i>& points, u32 force_lag = 0,
                                                      u32 quant_step = 1, u32 resync_interval = 0);
 std::vector<Point3i> rod_joint_3d_similarity_inverse(const RodJoint3DSimResult& r);
 

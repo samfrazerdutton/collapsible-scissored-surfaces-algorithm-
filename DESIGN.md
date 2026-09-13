@@ -120,20 +120,47 @@ than any calibration block (even recalibrated every 128 rods) predicting
 from the *immediately preceding* rod could ever track, no matter how good
 the rotation+scale fit is. The fix isn't a richer per-block model; it's
 recognizing that "predict from `rod[i-1]`" was an unnecessary assumption.
-Both `rod_joint_2d_forward` and `rod_joint_3d_similarity_forward` take a
-`lag` parameter: rod `i` is predicted from rod `i-lag` (the calibration
-math is unchanged, just re-indexed). `compress_geo2d`/`compress_geo3d`
-(in `codec.cpp`) search `kRodJointCandidateLags` = {1, 2, 3, 4, 5, 6, 7, 8,
-10, 12, 16, 20, 24, 32} and keep whichever lag actually encodes smallest —
-each candidate is a full, cheap encode (a few thousand points takes
-milliseconds), so comparing true output size beats guessing from a
-residual-magnitude proxy. This is the same idea as long-term/pitch
-prediction in speech and audio codecs, applied to rod sequences instead
-of waveform samples. For `toroidal.xyz`, lag 3 aligns almost exactly with
-the oscillation period and turns a 15%-smaller loss against lzma into a
-32%-smaller win (see `BENCHMARKS.md`); every other shape ticked up
-slightly too, since lag=1 usually isn't *exactly* optimal even when it's
-close.
+`RodJoint2DResult`/`RodJoint3DSimResult` carry a `block_lag` vector (one
+entry per calibration block) rather than a single file-wide value: rod `i`
+in block `blk` is predicted from rod `i - block_lag[blk]` (the calibration
+math is unchanged, just re-indexed). Each block searches
+`kRodJointCandidateLags` = {1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 16, 20, 24, 32}
+independently and keeps whichever lag gives the lowest prediction SSE for
+*that block* -- this is a strict generalization of "one lag for the whole
+file" (a uniform choice is just the degenerate case where every block
+happens to agree), so it can track not only a fast, *constant* oscillation
+period but one that **drifts partway through the sequence** -- two
+concatenated shapes with different periods, or a scan whose pitch changes
+-- which no single whole-file lag ever could. A dedicated test
+(`test_rod_joint_lag_search_period_drift`) builds exactly that case (a
+toroidal-style path whose period changes at the midpoint) and measures a
+**71% reduction in total residual magnitude** versus the best possible
+single forced lag for the whole file.
+
+Per-block search picks its lag from *raw residual SSE on the true rods*,
+which is cheap (no quantization, no entropy coding needed to score a
+candidate) but is only a *proxy* for the real objective -- actual
+entropy-coded bytes after quantization -- and a proxy can occasionally
+diverge from the real thing, particularly once lossy quantization is
+involved (an SSE-optimal lag can produce a residual distribution that
+happens to compress worse after quantization than a slightly-less-SSE-
+optimal one). This was a real regression caught during development: an
+early version made per-block auto search the *only* strategy, and a
+lossy-mode round-trip test that had been passing regressed to a
+meaningfully larger blob. The fix keeps both strategies and compares
+**actual serialized bytes**: `compress_geo2d`/`compress_geo3d` (and their
+lossy variants, in `codec.cpp`) try the per-block auto search *and* the
+best single whole-file-uniform forced lag (the older design, one full
+encode per `kRodJointCandidateLags` candidate), and keep whichever
+genuinely serializes smaller. This guarantees the new per-block search can
+only ever match or beat the old whole-file design, never quietly regress
+it -- the same "compare real measured output, don't trust a proxy" ethos
+this project applies everywhere else. For `toroidal.xyz`, this still turns
+a 15%-smaller loss against lzma into a 32%-smaller win (see
+`BENCHMARKS.md`); every other shape ticked up slightly too, since lag=1
+usually isn't *exactly* optimal even when it's close. This is the same
+idea as long-term/pitch prediction in speech and audio codecs, applied to
+rod sequences instead of waveform samples.
 
 ### 3. Entropy backend: adaptive order-1 range coder (`include/csa/range_coder.hpp`)
 
@@ -147,7 +174,7 @@ would make entropy coding itself GPU-parallel, but it is also considerably
 easier to get subtly wrong. Given the choice between a flashier entropy
 coder and one that is provably bit-exact under test, correctness won:
 the range coder here is simple enough to reason about completely, and all
-1327 round-trip checks (see `tests/test_main.cpp`) pass, including the
+1330 round-trip checks (see `tests/test_main.cpp`) pass, including the
 CUDA path. Interleaved-stream rANS for GPU-parallel entropy decode is a
 natural next step (see Future Work).
 
@@ -498,11 +525,6 @@ smaller call's result).
 
 ## Honest limitations / future work
 
-- **Per-block lag search** (rather than one global lag per file) would
-  help paths whose oscillation period itself drifts over the sequence --
-  currently `compress_geo2d`/`compress_geo3d` pick one lag for the whole
-  file. This is the natural next step if a real-world dataset shows a
-  period that changes partway through.
 - **Interleaved-stream rANS** would let the entropy-coding stage itself
   run in parallel on GPU (unlike the current sequential adaptive range
   coder), closing the loop on an end-to-end GPU-resident codec.

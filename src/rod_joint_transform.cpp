@@ -52,6 +52,57 @@ void calibrate_block(const std::vector<i32>& ex, const std::vector<i32>& ey,
     out_im = clampd(ci, -8.0, 8.0);
 }
 
+// Sum of squared true-rod prediction error a given (lag, cr, ci) achieves
+// over [start, end) -- the score per-block lag search minimizes. Rods
+// with i < lag (globally) have no predecessor and predict 0 (matching
+// the actual encode loop's `prev = 0` case), so their own squared
+// magnitude counts as error too; this keeps the score comparable across
+// candidate lags that skip different numbers of rods at the very start
+// of the sequence (only ever nonempty for the first block, since every
+// later block's start already exceeds every candidate lag).
+double block_predict_sse_2d(const std::vector<i32>& ex, const std::vector<i32>& ey,
+                             size_t start, size_t end, u32 lag, i64 cr, i64 ci) {
+    double sse = 0.0;
+    for (size_t i = start; i < std::min(end, (size_t)lag); i++)
+        sse += (double)ex[i] * ex[i] + (double)ey[i] * ey[i];
+    for (size_t i = std::max(start, (size_t)lag); i < end; i++) {
+        i32 pred_re, pred_im;
+        complex_mul_round(cr, ci, ex[i - lag], ey[i - lag], pred_re, pred_im);
+        double dx = (double)ex[i] - pred_re, dy = (double)ey[i] - pred_im;
+        sse += dx * dx + dy * dy;
+    }
+    return sse;
+}
+
+// Picks the best lag for one calibration block: force_lag != 0 skips the
+// search and uses that lag uniformly (see rod_joint_2d_forward's doc
+// comment); force_lag == 0 tries every candidate and keeps whichever
+// achieves the lowest prediction SSE.
+u32 pick_block_lag_2d(const std::vector<i32>& ex, const std::vector<i32>& ey,
+                       size_t start, size_t end, u32 force_lag, i64& out_re, i64& out_im) {
+    if (force_lag != 0) {
+        calibrate_block(ex, ey, start, end, force_lag, out_re, out_im);
+        return force_lag;
+    }
+    u32 best_lag = kRodJointCandidateLags[0];
+    double best_sse = -1.0;
+    i64 best_re = 0, best_im = 0;
+    for (u32 lag : kRodJointCandidateLags) {
+        i64 cr, ci;
+        calibrate_block(ex, ey, start, end, lag, cr, ci);
+        double sse = block_predict_sse_2d(ex, ey, start, end, lag, cr, ci);
+        if (best_sse < 0.0 || sse < best_sse) {
+            best_sse = sse;
+            best_lag = lag;
+            best_re = cr;
+            best_im = ci;
+        }
+    }
+    out_re = best_re;
+    out_im = best_im;
+    return best_lag;
+}
+
 // 3x3 (row-major, Q16.16 fixed point) matrix-vector multiply, rounded to
 // nearest integer.
 inline void mat3_mul_round(const std::array<i64, 9>& m, i32 x, i32 y, i32 z,
@@ -150,15 +201,52 @@ std::array<i64, 9> calibrate_3d_block(const std::vector<i32>& ex, const std::vec
     return m;
 }
 
+// 3D counterpart of block_predict_sse_2d.
+double block_predict_sse_3d(const std::vector<i32>& ex, const std::vector<i32>& ey, const std::vector<i32>& ez,
+                             size_t start, size_t end, u32 lag, const std::array<i64, 9>& M) {
+    double sse = 0.0;
+    for (size_t i = start; i < std::min(end, (size_t)lag); i++)
+        sse += (double)ex[i] * ex[i] + (double)ey[i] * ey[i] + (double)ez[i] * ez[i];
+    for (size_t i = std::max(start, (size_t)lag); i < end; i++) {
+        i32 px, py, pz;
+        mat3_mul_round(M, ex[i - lag], ey[i - lag], ez[i - lag], px, py, pz);
+        double dx = (double)ex[i] - px, dy = (double)ey[i] - py, dz = (double)ez[i] - pz;
+        sse += dx * dx + dy * dy + dz * dz;
+    }
+    return sse;
+}
+
+// 3D counterpart of pick_block_lag_2d.
+u32 pick_block_lag_3d(const std::vector<i32>& ex, const std::vector<i32>& ey, const std::vector<i32>& ez,
+                       size_t start, size_t end, u32 force_lag, std::array<i64, 9>& out_M) {
+    if (force_lag != 0) {
+        out_M = calibrate_3d_block(ex, ey, ez, start, end, force_lag);
+        return force_lag;
+    }
+    u32 best_lag = kRodJointCandidateLags[0];
+    double best_sse = -1.0;
+    std::array<i64, 9> best_M{};
+    for (u32 lag : kRodJointCandidateLags) {
+        std::array<i64, 9> M = calibrate_3d_block(ex, ey, ez, start, end, lag);
+        double sse = block_predict_sse_3d(ex, ey, ez, start, end, lag, M);
+        if (best_sse < 0.0 || sse < best_sse) {
+            best_sse = sse;
+            best_lag = lag;
+            best_M = M;
+        }
+    }
+    out_M = best_M;
+    return best_lag;
+}
+
 } // namespace
 
-RodJoint2DResult rod_joint_2d_forward(const std::vector<Point2i>& points, u32 lag,
+RodJoint2DResult rod_joint_2d_forward(const std::vector<Point2i>& points, u32 force_lag,
                                        u32 quant_step, u32 resync_interval) {
     RodJoint2DResult r;
     r.count = points.size();
     if (points.empty()) return r;
     r.anchor = points[0];
-    r.lag = lag;
     r.quant_step = (quant_step == 0) ? 1 : quant_step;
     r.resync_interval = resync_interval;
     size_t m = points.size();
@@ -173,6 +261,7 @@ RodJoint2DResult rod_joint_2d_forward(const std::vector<Point2i>& points, u32 la
 
     size_t nrods = m - 1;
     size_t nblocks = (nrods + kRodJointBlockSize - 1) / kRodJointBlockSize;
+    r.block_lag.resize(nblocks);
     r.block_ratio_re.resize(nblocks);
     r.block_ratio_im.resize(nblocks);
     r.residual_x.resize(nrods);
@@ -199,7 +288,10 @@ RodJoint2DResult rod_joint_2d_forward(const std::vector<Point2i>& points, u32 la
         size_t start = blk * kRodJointBlockSize;
         size_t end = std::min(nrods, start + kRodJointBlockSize);
         i64 cr, ci;
-        calibrate_block(ex, ey, start, end, lag, cr, ci); // calibration may use true rods; only prediction needs closed-loop history
+        // Calibration (and lag selection) may use true rods; only
+        // prediction needs closed-loop reconstructed history.
+        u32 lag = pick_block_lag_2d(ex, ey, start, end, force_lag, cr, ci);
+        r.block_lag[blk] = lag;
         r.block_ratio_re[blk] = cr;
         r.block_ratio_im[blk] = ci;
 
@@ -239,11 +331,11 @@ std::vector<Point2i> rod_joint_2d_inverse(const RodJoint2DResult& r) {
     if (r.count < 2) return points;
 
     size_t nrods = (size_t)r.count - 1;
-    u32 lag = r.lag;
     u32 quant_step = (r.quant_step == 0) ? 1 : r.quant_step;
     std::vector<i32> rec_ex(nrods), rec_ey(nrods);
     for (size_t i = 0; i < nrods; i++) {
         size_t blk = i / kRodJointBlockSize;
+        u32 lag = r.block_lag[blk];
         i64 cr = r.block_ratio_re[blk];
         i64 ci = r.block_ratio_im[blk];
         i32 prev_ex = (i >= lag) ? rec_ex[i - lag] : 0;
@@ -265,7 +357,7 @@ std::vector<Point2i> rod_joint_2d_inverse(const RodJoint2DResult& r) {
     return points;
 }
 
-RodJoint3DResult rod_joint_3d_forward(const std::vector<Point3i>& points, u32 xy_lag) {
+RodJoint3DResult rod_joint_3d_forward(const std::vector<Point3i>& points, u32 xy_force_lag) {
     std::vector<Point2i> xy(points.size());
     std::vector<i32> zs(points.size());
     for (size_t i = 0; i < points.size(); i++) {
@@ -273,7 +365,7 @@ RodJoint3DResult rod_joint_3d_forward(const std::vector<Point3i>& points, u32 xy
         zs[i] = points[i].z;
     }
     RodJoint3DResult r;
-    r.xy = rod_joint_2d_forward(xy, xy_lag);
+    r.xy = rod_joint_2d_forward(xy, xy_force_lag);
     r.lift_z = pantograph_lift_forward(zs);
     return r;
 }
@@ -288,13 +380,12 @@ std::vector<Point3i> rod_joint_3d_inverse(const RodJoint3DResult& r) {
     return points;
 }
 
-RodJoint3DSimResult rod_joint_3d_similarity_forward(const std::vector<Point3i>& points, u32 lag,
+RodJoint3DSimResult rod_joint_3d_similarity_forward(const std::vector<Point3i>& points, u32 force_lag,
                                                      u32 quant_step, u32 resync_interval) {
     RodJoint3DSimResult r;
     r.count = points.size();
     if (points.empty()) return r;
     r.anchor = points[0];
-    r.lag = lag;
     r.quant_step = (quant_step == 0) ? 1 : quant_step;
     r.resync_interval = resync_interval;
     size_t m = points.size();
@@ -309,6 +400,7 @@ RodJoint3DSimResult rod_joint_3d_similarity_forward(const std::vector<Point3i>& 
 
     size_t nrods = m - 1;
     size_t nblocks = (nrods + kRodJoint3DBlockSize - 1) / kRodJoint3DBlockSize;
+    r.block_lag.resize(nblocks);
     r.block_matrix.resize(nblocks);
     r.residual_x.resize(nrods);
     r.residual_y.resize(nrods);
@@ -323,7 +415,9 @@ RodJoint3DSimResult rod_joint_3d_similarity_forward(const std::vector<Point3i>& 
     for (size_t blk = 0; blk < nblocks; blk++) {
         size_t start = blk * kRodJoint3DBlockSize;
         size_t end = std::min(nrods, start + kRodJoint3DBlockSize);
-        std::array<i64, 9> M = calibrate_3d_block(ex, ey, ez, start, end, lag);
+        std::array<i64, 9> M{};
+        u32 lag = pick_block_lag_3d(ex, ey, ez, start, end, force_lag, M);
+        r.block_lag[blk] = lag;
         r.block_matrix[blk] = M;
 
         for (size_t i = start; i < end; i++) {
@@ -369,11 +463,11 @@ std::vector<Point3i> rod_joint_3d_similarity_inverse(const RodJoint3DSimResult& 
     if (r.count < 2) return points;
 
     size_t nrods = (size_t)r.count - 1;
-    u32 lag = r.lag;
     u32 quant_step = (r.quant_step == 0) ? 1 : r.quant_step;
     std::vector<i32> rec_ex(nrods), rec_ey(nrods), rec_ez(nrods);
     for (size_t i = 0; i < nrods; i++) {
         size_t blk = i / kRodJoint3DBlockSize;
+        u32 lag = r.block_lag[blk];
         const std::array<i64, 9>& M = r.block_matrix[blk];
         i32 prev_x = (i >= lag) ? rec_ex[i - lag] : 0;
         i32 prev_y = (i >= lag) ? rec_ey[i - lag] : 0;

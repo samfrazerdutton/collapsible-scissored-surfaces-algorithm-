@@ -747,6 +747,67 @@ static void test_geo3d_lag_search_toroidal() {
     CHECK(blob.size() < raw_packed * 3 / 4);
 }
 
+// Demonstrates the actual gap per-block lag search closes: a single global
+// lag (the old design -- one forward() call per candidate, whole file)
+// can only ever be a compromise when the oscillation period itself
+// changes partway through the sequence, since no single lag fits both
+// halves. Per-block search (the new default) lets each calibration block
+// pick its own best-fitting lag independently, so it should track *both*
+// halves well simultaneously -- something no single forced lag can do.
+static void test_rod_joint_lag_search_period_drift() {
+    std::vector<Point3i> path;
+    double R = 800.0, r = 250.0;
+    for (int i = 0; i < 3000; i++) {
+        double u = i * 0.31;
+        // First half oscillates at one period, second half at a distinctly
+        // different one -- no single lag predicts both well.
+        double v_step = (i < 1500) ? 2.05 : 1.3;
+        double v = i * v_step;
+        double x = (R + r * std::cos(v)) * std::cos(u);
+        double y = (R + r * std::cos(v)) * std::sin(u);
+        double z = r * std::sin(v);
+        path.push_back({(i32)std::lround(x * 1000), (i32)std::lround(y * 1000), (i32)std::lround(z * 1000)});
+    }
+
+    // Best possible *single* forced lag across the whole file (mirrors
+    // what the old whole-file-search design would have produced), scored
+    // by total residual magnitude -- the same proxy compress_geo3d's old
+    // per-candidate loop implicitly optimized via actual encoded size.
+    i64 best_forced_sum = -1;
+    for (u32 lag : kRodJointCandidateLags) {
+        RodJoint3DSimResult forced = rod_joint_3d_similarity_forward(path, lag);
+        i64 sum = 0;
+        for (i32 v : forced.residual_x) sum += std::abs(v);
+        for (i32 v : forced.residual_y) sum += std::abs(v);
+        for (i32 v : forced.residual_z) sum += std::abs(v);
+        if (best_forced_sum < 0 || sum < best_forced_sum) best_forced_sum = sum;
+    }
+
+    // Per-block auto search (force_lag == 0, the default).
+    RodJoint3DSimResult auto_r = rod_joint_3d_similarity_forward(path);
+    i64 auto_sum = 0;
+    for (i32 v : auto_r.residual_x) auto_sum += std::abs(v);
+    for (i32 v : auto_r.residual_y) auto_sum += std::abs(v);
+    for (i32 v : auto_r.residual_z) auto_sum += std::abs(v);
+
+    // Round-trip correctness first -- compression quality is meaningless
+    // if this doesn't hold.
+    auto back = rod_joint_3d_similarity_inverse(auto_r);
+    CHECK(back.size() == path.size());
+    bool match = true;
+    for (size_t i = 0; i < path.size(); i++)
+        if (back[i].x != path[i].x || back[i].y != path[i].y || back[i].z != path[i].z) match = false;
+    CHECK(match);
+
+    // The actual claim: per-block search should meaningfully beat the best
+    // *single* lag choice on a shape specifically designed so no single
+    // lag fits the whole file.
+    CHECK(auto_sum < best_forced_sum * 3 / 4);
+    std::printf("  (lag search: best single-lag residual sum=%lld, per-block auto=%lld, %.1f%% smaller)\n",
+                 (long long)best_forced_sum, (long long)auto_sum,
+                 100.0 * (1.0 - (double)auto_sum / (double)best_forced_sum));
+}
+
 int main() {
     test_range_coder();
     test_lz_matcher();
@@ -761,6 +822,7 @@ int main() {
     test_codec_adaptive_skip();
     test_geo_codec();
     test_geo3d_lag_search_toroidal();
+    test_rod_joint_lag_search_period_drift();
     test_geo3d_codec_autoselect();
 
     std::printf("%d checks, %d failures\n", g_checks, g_failures);
