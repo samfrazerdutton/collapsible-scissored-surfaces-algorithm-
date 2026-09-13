@@ -307,7 +307,16 @@ std::vector<u8> compress(const std::vector<u8>& input, bool use_gpu, int lz_max_
         std::vector<i32> as_i32(input.size());
         for (size_t i = 0; i < input.size(); i++) as_i32[i] = (i32)input[i];
         LiftResult lr;
-        bool used_gpu = use_gpu && pantograph_lift_forward_cuda(as_i32, lr);
+        bool used_gpu = false;
+        if (use_gpu) {
+            // thread_local: each thread gets its own persistent GPU
+            // buffers (CudaLiftSession isn't safe to share across
+            // threads), but repeated compress() calls on the *same*
+            // thread -- the common case for a long-lived worker -- reuse
+            // them instead of paying cudaMalloc/cudaFree on every call.
+            static thread_local CudaLiftSession session;
+            used_gpu = session.forward(as_i32, lr);
+        }
         if (!used_gpu) lr = pantograph_lift_forward(as_i32);
 
         write_magic_mode(general_blob, Mode::General);

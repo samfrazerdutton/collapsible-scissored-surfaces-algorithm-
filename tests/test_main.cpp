@@ -394,6 +394,58 @@ static void test_codec() {
 
         std::printf("  (CUDA path exercised: forward_cuda succeeded=%s (small), %s (500KB), round-tripped correctly)\n",
                      gpu_ok ? "true" : "FALSE", big_gpu_ok ? "true" : "FALSE");
+
+        // CudaLiftSession must be a drop-in, bit-for-bit equivalent to the
+        // one-shot pantograph_lift_forward_cuda() -- reusing device
+        // buffers must never change the numeric result. Drive it through
+        // small -> large -> small again, specifically to exercise both
+        // directions of capacity change: growing buffers (small -> large)
+        // and reusing an already-larger buffer for a smaller call
+        // (large -> small) without the unused tail of the buffer leaking
+        // into the result.
+        {
+            CudaLiftSession session;
+            LiftResult s_small1;
+            bool ok1 = session.forward(as_i32, s_small1);
+            CHECK(ok1);
+            if (ok1) {
+                CHECK(s_small1.residuals.size() == gpu_lift.residuals.size());
+                bool same = true;
+                for (size_t lvl = 0; lvl < s_small1.residuals.size() && same; lvl++)
+                    if (s_small1.residuals[lvl] != gpu_lift.residuals[lvl]) same = false;
+                CHECK(same);
+                CHECK(s_small1.base == gpu_lift.base);
+                auto back1 = pantograph_lift_inverse(s_small1);
+                CHECK(back1 == as_i32);
+            }
+
+            LiftResult s_big;
+            bool ok2 = session.forward(big_i32, s_big);
+            CHECK(ok2);
+            if (ok2) {
+                auto back_big = pantograph_lift_inverse(s_big);
+                CHECK(back_big == big_i32);
+            }
+
+            // Same session, back to the small input -- reuses the larger
+            // buffers allocated for big_i32.
+            LiftResult s_small2;
+            bool ok3 = session.forward(as_i32, s_small2);
+            CHECK(ok3);
+            if (ok3) {
+                CHECK(s_small2.residuals.size() == gpu_lift.residuals.size());
+                bool same = true;
+                for (size_t lvl = 0; lvl < s_small2.residuals.size() && same; lvl++)
+                    if (s_small2.residuals[lvl] != gpu_lift.residuals[lvl]) same = false;
+                CHECK(same);
+                CHECK(s_small2.base == gpu_lift.base);
+                auto back2 = pantograph_lift_inverse(s_small2);
+                CHECK(back2 == as_i32);
+            }
+
+            std::printf("  (CudaLiftSession exercised: small->big->small all succeeded=%s, bit-identical to one-shot forward_cuda)\n",
+                         (ok1 && ok2 && ok3) ? "true" : "FALSE");
+        }
     } else {
         std::printf("  (CUDA not available at test time; GPU path skipped, CPU-only verified)\n");
     }

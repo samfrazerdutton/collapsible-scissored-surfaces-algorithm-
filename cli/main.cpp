@@ -264,13 +264,16 @@ int cmd_bench_lz(const std::string& path) {
 // same driver/GPU clock state) and reports the first call separately from
 // the rest: the first pays whatever one-time wake/context-creation cost
 // the GPU owes (see GPU_BENCHMARKS.md), while calls 2..N show the
-// steady-state per-call cost of this library's actual contract --
-// pantograph_lift_forward_cuda allocates and frees its own device buffers
-// every call, so this still isn't the best case a long-lived service
-// reusing buffers across calls could achieve, but it is what today's API
-// actually delivers under sustained use, measured honestly rather than
-// assumed.
-int cmd_bench_transform(size_t n, bool gpu, int repeat) {
+// steady-state per-call cost of whichever entry point is under test.
+//
+// use_session controls which GPU entry point is timed: the one-shot
+// pantograph_lift_forward_cuda() (allocates/frees device+pinned buffers
+// every single call) or a single CudaLiftSession reused across all
+// `repeat` calls (buffers allocated once, only grown if a later call
+// needs more capacity). Comparing the two directly, on the same input
+// size and repeat count, is how the actual cudaMalloc/cudaFree overhead
+// this session type exists to remove gets measured rather than assumed.
+int cmd_bench_transform(size_t n, bool gpu, int repeat, bool use_session) {
     std::vector<i32> data(n);
     for (size_t i = 0; i < n; i++) {
         data[i] = (i32)(1000.0 * std::sin((double)i * 0.001) + (double)(i % 7));
@@ -278,11 +281,12 @@ int cmd_bench_transform(size_t n, bool gpu, int repeat) {
 
     std::vector<double> times_ms;
     bool used_gpu = false;
+    CudaLiftSession session; // constructed even if unused; cheap when !gpu
     for (int rep = 0; rep < repeat; rep++) {
         auto t0 = std::chrono::steady_clock::now();
         LiftResult lr;
         if (gpu) {
-            used_gpu = pantograph_lift_forward_cuda(data, lr);
+            used_gpu = use_session ? session.forward(data, lr) : pantograph_lift_forward_cuda(data, lr);
             if (!used_gpu) lr = pantograph_lift_forward(data);
         } else {
             lr = pantograph_lift_forward(data);
@@ -291,9 +295,11 @@ int cmd_bench_transform(size_t n, bool gpu, int repeat) {
         times_ms.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
     }
 
+    const char* mode = use_session ? "session" : "one-shot";
     if (repeat == 1) {
         std::cout << "bench-transform: n=" << n << " gpu_requested=" << (gpu ? "yes" : "no")
-                  << " gpu_used=" << (used_gpu ? "yes" : "no") << " time_ms=" << times_ms[0] << "\n";
+                  << " gpu_used=" << (used_gpu ? "yes" : "no") << " mode=" << mode
+                  << " time_ms=" << times_ms[0] << "\n";
         return 0;
     }
 
@@ -304,7 +310,7 @@ int cmd_bench_transform(size_t n, bool gpu, int repeat) {
     }
     double rest_avg = rest_sum / (double)(repeat - 1);
     std::cout << "bench-transform: n=" << n << " gpu_requested=" << (gpu ? "yes" : "no")
-              << " gpu_used=" << (used_gpu ? "yes" : "no")
+              << " gpu_used=" << (used_gpu ? "yes" : "no") << " mode=" << mode
               << " first_ms=" << times_ms[0]
               << " rest_avg_ms=" << rest_avg
               << " rest_min_ms=" << rest_min
@@ -324,7 +330,7 @@ void usage() {
         "  scissorc decompress-geo3d <in> <out.xyz>\n"
         "  scissorc compress-geo3d-lossy <in.xyz> <out> --quant N --resync N [--scale N]\n"
         "  scissorc info <file>\n"
-        "  scissorc bench-transform <n> [--gpu] [--repeat N]\n";
+        "  scissorc bench-transform <n> [--gpu] [--session] [--repeat N]\n";
 }
 
 } // namespace
@@ -383,13 +389,15 @@ int main(int argc, char** argv) {
         } else if (cmd == "bench-transform" && argc >= 3) {
             size_t n = (size_t)std::stoull(argv[2]);
             bool gpu = false;
+            bool use_session = false;
             int repeat = 1;
             for (int i = 3; i < argc; i++) {
                 std::string a = argv[i];
                 if (a == "--gpu") gpu = true;
+                else if (a == "--session") use_session = true;
                 else if (a == "--repeat" && i + 1 < argc) repeat = std::stoi(argv[++i]);
             }
-            return cmd_bench_transform(n, gpu, repeat);
+            return cmd_bench_transform(n, gpu, repeat, use_session);
         }
     } catch (const std::exception& e) {
         std::cerr << "error: " << e.what() << "\n";

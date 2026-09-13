@@ -62,7 +62,12 @@ unmodified C++ source code, not text written for this project -- and
   GPU-resident across the whole multi-level pass (one upload, a handful of
   downloads, no per-level round trips), tested against the CPU path
   bit-for-bit.
-- **1334 round-trip correctness checks** (`tests/test_main.cpp` +
+- **Persistent GPU sessions** (`CudaLiftSession`) that reuse device/pinned
+  buffers across calls instead of allocating and freeing them every time --
+  `compress()` keeps one per thread automatically. Measured, not assumed:
+  ~3.5x faster sustained per-call time at 50K elements, ~1.7x at 2M (see
+  `DESIGN.md`).
+- **1346 round-trip correctness checks** (`tests/test_main.cpp` +
   `tests/test_capi.cpp`, the latter linking the real shared library to
   catch actual symbol-export problems), including a dedicated check that
   the GPU path actually succeeds (not just that the overall call
@@ -101,6 +106,10 @@ python bench/run_benchmarks.py
 
 # Measure the CPU-vs-GPU transform crossover on your own machine
 python bench/gpu_crossover.py
+
+# Compare one-shot vs. persistent-session GPU buffer reuse (see DESIGN.md)
+build/scissorc.exe bench-transform 2000000 --gpu --repeat 20
+build/scissorc.exe bench-transform 2000000 --gpu --session --repeat 20
 
 # Realistic (not maximally repetitive) use-case datasets and results
 python bench/use_cases.py

@@ -147,7 +147,7 @@ would make entropy coding itself GPU-parallel, but it is also considerably
 easier to get subtly wrong. Given the choice between a flashier entropy
 coder and one that is provably bit-exact under test, correctness won:
 the range coder here is simple enough to reason about completely, and all
-1315 round-trip checks (see `tests/test_main.cpp`) pass, including the
+1327 round-trip checks (see `tests/test_main.cpp`) pass, including the
 CUDA path. Interleaved-stream rANS for GPU-parallel entropy decode is a
 natural next step (see Future Work).
 
@@ -427,6 +427,58 @@ either way. Headline findings from that file:
   automatic CPU fallback path handled it transparently — the
   graceful-degradation design being exercised by a real failure, not just
   a theoretical code path.
+
+### Persistent GPU sessions (`CudaLiftSession`): removing the remaining per-call allocation cost
+
+Everything above is GPU-resident *within* one `pantograph_lift_forward_cuda`
+call — but that function still calls `cudaMalloc`/`cudaMallocHost` for
+every device and pinned-host buffer it needs, and frees all of them again
+before returning. That's the right contract for a single ad-hoc
+conversion, but it's real, avoidable overhead for a caller making many
+calls back to back (a long-lived worker thread inside a service, or
+`compress()` processing a stream of inputs) — `cudaMalloc`/`cudaFree` are
+actual driver calls with real latency, not free bookkeeping.
+
+`CudaLiftSession` (`include/csa/pantograph_lift_cuda.hpp`,
+`cuda/pantograph_lift_cuda.cu`) is the same forward pass wrapped around
+buffers that persist for the session's lifetime instead of per call: its
+constructor forces CUDA context creation up front (`cudaFree(0)`, the
+standard idiom, so that one-time cost is paid once and explicitly rather
+than folding into whichever `forward()` call happens to run first), and
+each device/pinned buffer only grows — via an `ensure_capacity` helper,
+the same amortized-growth idea `std::vector` uses — when a call needs more
+room than any call before it; it's never shrunk or freed until the
+session itself is destroyed. Reusing a larger buffer for a smaller
+subsequent call is safe: every kernel indexes by the *current* call's
+element counts (`half`, `padded_len`, ...), never by the buffer's
+capacity, so leftover data from a previous larger call in the unused tail
+of a buffer is simply never read. `codec.cpp`'s `compress()` now keeps one
+`thread_local` `CudaLiftSession` and reuses it across calls automatically
+— not thread-safe to share one session across threads (its buffers aren't
+synchronized), so each thread gets its own, which is also exactly what a
+`thread_local` gives for free.
+
+**Measured, not assumed**: `scissorc bench-transform <n> --gpu --session
+--repeat N` reuses one session across all `N` calls; dropping `--session`
+times the old one-shot path on the same input/repeat count for a direct
+comparison. On this machine (RTX 2060 Max-Q):
+
+| input size | one-shot (steady-state avg) | session (steady-state avg) | speedup |
+|---|---:|---:|---:|
+| 50,000 elements | 1.85 ms | 0.53 ms | ~3.5x |
+| 2,000,000 elements | 14.59 ms | 8.46 ms | ~1.7x |
+
+The smaller input shows a much bigger relative win, as expected: at 50K
+elements the actual transform work is tiny, so allocation overhead was a
+larger fraction of the total to begin with; at 2M elements real kernel
+work dominates more, so removing allocation overhead still helps
+substantially but by a smaller multiple. Correctness is covered by
+`tests/test_main.cpp`'s dedicated `CudaLiftSession` check, which drives one
+session through small → large → small inputs and requires the result to
+be bit-identical to `pantograph_lift_forward_cuda` at every step —
+specifically to catch the failure mode this design has to avoid (a buffer
+grown for a larger call silently corrupting or truncating a later,
+smaller call's result).
 
 ## Honest limitations / future work
 

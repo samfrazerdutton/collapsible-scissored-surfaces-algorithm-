@@ -10,4 +10,13 @@ bool pantograph_lift_forward_cuda(const std::vector<i32>&, LiftResult&) {
     return false;
 }
 
+struct CudaLiftSession::Impl {};
+
+CudaLiftSession::CudaLiftSession() : impl_(nullptr) {}
+CudaLiftSession::~CudaLiftSession() {}
+
+bool CudaLiftSession::forward(const std::vector<i32>&, LiftResult&) {
+    return false;
+}
+
 } // namespace csa
