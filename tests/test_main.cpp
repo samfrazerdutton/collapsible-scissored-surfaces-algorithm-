@@ -8,6 +8,7 @@
 #include "csa/pantograph_lift_cuda.hpp"
 #include "csa/range_coder.hpp"
 #include "csa/rod_joint_transform.hpp"
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <random>
@@ -398,6 +399,120 @@ static void test_codec() {
     }
 }
 
+// Regression guard for the adaptive Pantograph-Lift skip: a large,
+// highly repetitive input should still round-trip correctly and land on
+// the LZ candidate (mode byte 4) even when Pantograph Lift was skipped.
+static void test_codec_adaptive_skip() {
+    std::string unit = "the quick brown fox jumps over the lazy dog. ";
+    std::string text;
+    while (text.size() < 200000) text += unit; // well past kAdaptiveSizeThreshold
+    std::vector<u8> input(text.begin(), text.end());
+
+    auto blob = compress(input);
+    CHECK(blob.size() > 5);
+    CHECK(blob[4] == 4); // Mode::GeneralLZ
+    auto back = decompress(blob);
+    CHECK(back == input);
+    CHECK(blob.size() < input.size() / 20); // still compresses excellently
+}
+
+// The lossy Rod-Joint path: quantized residuals with periodic exact
+// resync to bound drift. Checks the three properties that actually
+// matter -- per-coordinate error stays within the documented bound,
+// resync genuinely limits how far absolute error can drift, and lossy
+// mode actually compresses better than lossless (otherwise what's the
+// point) -- not just "it doesn't crash".
+static void test_rod_joint_2d_lossy() {
+    std::mt19937 rng(4242);
+
+    // A believable noisy path (not a perfect analytic curve): lossy mode
+    // should help most on exactly this kind of real-world-ish data.
+    std::vector<Point2i> path;
+    double x = 0, y = 0, heading = 0;
+    for (int i = 0; i < 4000; i++) {
+        heading += std::uniform_real_distribution<double>(-0.05, 0.05)(rng);
+        double speed = 8.0 + std::uniform_real_distribution<double>(-0.5, 0.5)(rng);
+        x += speed * std::cos(heading);
+        y += speed * std::sin(heading);
+        path.push_back({(i32)std::lround(x), (i32)std::lround(y)});
+    }
+
+    u32 quant_step = 20;
+    u32 resync_interval = 64;
+    RodJoint2DResult r = rod_joint_2d_forward(path, /*lag=*/1, quant_step, resync_interval);
+    auto back = rod_joint_2d_inverse(r);
+    CHECK(back.size() == path.size());
+    u32 bound = rod_joint_2d_error_bound(quant_step);
+
+    // Per-rod reconstruction error bound applies to *non-resync* rods --
+    // a resync rod deliberately absorbs whatever drift accumulated since
+    // the last resync (that's the whole mechanism), so its own rod value
+    // can differ a lot from the true rod; that's expected, not a bug.
+    // Non-resync rods still individually track the true rod tightly.
+    bool nonresync_rods_within_bound = true;
+    for (size_t i = 1; i < path.size(); i++) {
+        bool is_resync = (i % resync_interval) == 0;
+        if (is_resync) continue;
+        i32 true_rod_x = path[i].x - path[i - 1].x;
+        i32 true_rod_y = path[i].y - path[i - 1].y;
+        i32 rec_rod_x = back[i].x - back[i - 1].x;
+        i32 rec_rod_y = back[i].y - back[i - 1].y;
+        // Allow a small rounding slack (+1) since the bound is
+        // approximate for odd quant_step, not a razor-exact guarantee.
+        if ((u32)std::abs(true_rod_x - rec_rod_x) > bound + 1) nonresync_rods_within_bound = false;
+        if ((u32)std::abs(true_rod_y - rec_rod_y) > bound + 1) nonresync_rods_within_bound = false;
+    }
+    CHECK(nonresync_rods_within_bound);
+
+    // Resync actually resets drift: absolute position must be *exact*
+    // right at each resync point (that's the entire point of the fix --
+    // making the rod land on the true absolute point, not just on the
+    // true rod added to an already-drifted position), and error between
+    // resyncs must stay bounded rather than growing across the whole path.
+    bool resync_points_exact = true;
+    i32 max_abs_error = 0;
+    for (size_t i = 0; i < path.size(); i++) {
+        i32 ex = std::abs(path[i].x - back[i].x);
+        i32 ey = std::abs(path[i].y - back[i].y);
+        max_abs_error = std::max({max_abs_error, ex, ey});
+        if (i > 0 && (i % resync_interval) == 0 && (ex != 0 || ey != 0)) resync_points_exact = false;
+    }
+    CHECK(resync_points_exact);
+    CHECK(max_abs_error <= (i32)(bound * resync_interval)); // generous but genuinely bounded, not "happens to be small"
+
+    // Lossy mode must actually compress better than lossless on the same
+    // data, or there's no point to it.
+    auto lossless_blob = compress_geo2d(path);
+    auto lossy_blob = compress_geo2d_lossy(path, quant_step, resync_interval);
+    CHECK(lossy_blob.size() < lossless_blob.size());
+
+    // Decompress via the ordinary decompress_geo2d (no special "lossy
+    // mode" API) -- quant_step/resync ride in the blob itself.
+    // compress_geo2d_lossy searches candidate lags independently and may
+    // not pick lag=1, so compare its result against the *original* path's
+    // error bound (the same property just checked on `back`), not
+    // byte-for-byte against `back` (which was computed with lag forced
+    // to 1 and may legitimately differ).
+    auto lossy_decoded = decompress_geo2d(lossy_blob);
+    CHECK(lossy_decoded.size() == path.size());
+    i32 lossy_max_abs_error = 0;
+    for (size_t i = 0; i < path.size(); i++) {
+        lossy_max_abs_error = std::max({lossy_max_abs_error,
+                                         std::abs(path[i].x - lossy_decoded[i].x),
+                                         std::abs(path[i].y - lossy_decoded[i].y)});
+    }
+    CHECK(lossy_max_abs_error <= (i32)(bound * resync_interval));
+
+    // quant_step <= 1 must be exactly lossless (no approximation at all).
+    auto exact_blob = compress_geo2d_lossy(path, 1, 0);
+    auto exact_back = decompress_geo2d(exact_blob);
+    CHECK(exact_back.size() == path.size());
+    bool exact_match = true;
+    for (size_t i = 0; i < path.size(); i++)
+        if (exact_back[i].x != path[i].x || exact_back[i].y != path[i].y) exact_match = false;
+    CHECK(exact_match);
+}
+
 static void test_geo_codec() {
     std::vector<Point2i> spiral;
     double x = 50, y = 0, dx = 3, dy = 0;
@@ -519,7 +634,9 @@ int main() {
     test_rod_joint_2d();
     test_rod_joint_3d();
     test_rod_joint_3d_similarity();
+    test_rod_joint_2d_lossy();
     test_codec();
+    test_codec_adaptive_skip();
     test_geo_codec();
     test_geo3d_lag_search_toroidal();
     test_geo3d_codec_autoselect();

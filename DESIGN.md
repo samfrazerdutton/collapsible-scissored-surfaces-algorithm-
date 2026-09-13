@@ -147,7 +147,7 @@ would make entropy coding itself GPU-parallel, but it is also considerably
 easier to get subtly wrong. Given the choice between a flashier entropy
 coder and one that is provably bit-exact under test, correctness won:
 the range coder here is simple enough to reason about completely, and all
-1293 round-trip checks (see `tests/test_main.cpp`) pass, including the
+1306 round-trip checks (see `tests/test_main.cpp`) pass, including the
 CUDA path. Interleaved-stream rANS for GPU-parallel entropy decode is a
 natural next step (see Future Work).
 
@@ -221,6 +221,83 @@ One shared bitstream, `include/csa/codec.hpp`:
 and keeps whichever encodes smallest, so callers never need to know in
 advance whether their data is more "smooth/predictive" or more
 "repeated-substring" in nature.
+
+### Adaptive heuristic: skipping Pantograph Lift on measured evidence
+
+`compress()` computes the LZ candidate first, and only runs Pantograph
+Lift at all if the input is at least `kAdaptiveSizeThreshold` (100KB) and
+LZ's result wasn't already very strong (`< kAdaptiveLzStrongRatio`, 35% of
+the input). Below that size, trying every candidate costs milliseconds
+regardless, so there's no reason to skip anything. Above it, an LZ result
+that good is strong *measured* evidence (not a guessed "this looks like
+text" content-type classifier) that the data has exploitable repeated-
+substring structure Pantograph Lift's predictive model is very unlikely to
+beat. This is an honest tradeoff, not a free lunch: it is possible for an
+adversarial file to have LZ do reasonably well *and* have Pantograph Lift
+do better still, in which case this heuristic gives up a small, unmeasured
+amount of ratio for a real, measured amount of speed on large inputs. See
+`tests/test_main.cpp`'s `test_codec_adaptive_skip` for the regression
+guard.
+
+### Lossy mode: quantized residuals with periodic exact resync
+
+The Rod-Joint Transform's 2D path (`rod_joint_2d_forward`/`_inverse`) and
+`codec.cpp`'s `compress_geo2d_lossy` support genuine lossy compression,
+not just lossless -- "flexible joints that approximate the target shape"
+in the pantograph-lattice metaphor, versus rigid/exact ones. Lossless and
+lossy share one code path parameterized by `quant_step`: a rod's residual
+is quantized to the nearest multiple of `quant_step` (rather than stored
+exactly), and `quant_step == 1` is provably identical to the original
+lossless behavior (`round(d/1)*1 == d` always), so this was a safe,
+non-breaking generalization of the existing transform, not a parallel
+implementation.
+
+The design is closed-loop (the same idea DPCM and video codecs use):
+prediction for rod `i` is always based on the *reconstructed* (possibly
+lossy) rod `i-lag`, never the true original one, so the encoder computes
+exactly what the decoder will independently reconstruct. Per-rod error is
+therefore bounded by `quant_step/2` (see `rod_joint_2d_error_bound()`) --
+but because rods accumulate into an absolute point path, that per-rod
+error is a random walk over the sequence, and *absolute* position error
+can drift further the longer a run goes since the last exact point.
+`resync_interval` bounds that: every `resync_interval` rods, one rod is
+computed to land the reconstructed *absolute point* exactly on the true
+one, not just to reproduce the true *rod* value. This distinction mattered
+in practice: an earlier version made the resync rod itself exact (equal
+to the true rod) but added it to whatever position had already drifted,
+which only stops drift from growing further without ever undoing it --
+caught by `tests/test_main.cpp`'s `test_rod_joint_2d_lossy`, which checks
+that error resets to exactly zero *at* resync points, not just that it
+stays "small".
+
+`scissorc compress-geo2d-lossy <in> <out> --quant N --resync N` exposes
+this from the CLI, reporting the real *measured* max coordinate error
+(by actually decoding and comparing), not just the theoretical bound.
+
+### C ABI and language bindings (`include/csa/csa_capi.h`, `libcsa`)
+
+`src/csa_capi.cpp` wraps the core `compress`/`decompress`/`compress_geo2d`/
+`compress_geo3d` functions (plus the lossy variant) behind a pure C
+interface -- no C++ types (`std::vector`, `std::string`, `Point2i`, ...)
+cross the boundary, only plain pointers/sizes and a `csa_buffer{data,
+size}` struct, which is what lets a shared library built with one compiler
+toolchain (MSVC) link correctly from a program built with a different one
+(GCC, Clang) or a completely different language. This is the actual
+prerequisite for any language binding; the C++ headers alone are not
+ABI-stable across compilers.
+
+Errors are reported via a thread-local last-error string
+(`csa_last_error()`) rather than exceptions or error codes mixed into the
+return value, since a `csa_buffer{nullptr, 0}` is ambiguous between "empty
+result" (e.g. decompressing an empty file) and "failed" -- callers check
+`csa_last_error()` to disambiguate, and it's cleared on every success.
+
+`bindings/python/csa.py` is a `ctypes` wrapper on top of this ABI --
+`import csa; csa.compress(data)` -- tested end-to-end against the actual
+built shared library (`bindings/python/test_bindings.py`), not mocked.
+`tests/test_capi.cpp` similarly links against the real shared library
+(not `csa_core` directly), specifically to catch real symbol-export/
+linking problems that testing the C++ core alone never would.
 
 ## GPU acceleration (`cuda/pantograph_lift_cuda.cu`)
 
@@ -327,6 +404,25 @@ either way. Headline findings from that file:
   there comes from the Burrows-Wheeler Transform rearranging the data
   into long runs of similar bytes before entropy coding, not from its LZ
   stage.
+- **Lossy mode is 2D-only** (`rod_joint_2d_forward`/`compress_geo2d_lossy`).
+  Extending the same closed-loop-quantization-plus-resync design to the 3D
+  similarity joint (`rod_joint_3d_similarity_forward`) is a natural next
+  step for lossy point-cloud/LiDAR-frame compression specifically, and
+  should be a fairly mechanical port of the same fix now that the 2D
+  version's drift-correction bug has been found and fixed.
+- **Rust/C#/Go bindings** on top of the same C ABI (`csa_capi.h`) that the
+  Python bindings already use -- the hard prerequisite (a stable, no-C++-
+  types-crossing-the-boundary interface) now exists; generating each
+  additional language's wrapper is comparatively mechanical (`bindgen` for
+  Rust, `P/Invoke` for C#, `cgo` for Go) but each is still real,
+  untrivial work that hasn't been done.
+- **A genuinely cross-vendor GPU backend** (Vulkan Compute, WebGPU, or
+  similar) would let the parallel block-coding kernels run on non-NVIDIA
+  hardware and non-Windows/Linux platforms (macOS/Metal, mobile, WASM).
+  This is a full second GPU backend in a different API, not an
+  incremental addition to the existing CUDA path, and is out of scope for
+  what a single-repository research project can responsibly claim to have
+  built alongside everything else here.
 
 ## Build gotcha: adding a new `__global__` kernel
 

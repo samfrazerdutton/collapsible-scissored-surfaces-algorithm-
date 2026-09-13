@@ -55,7 +55,27 @@ endif()
 add_executable(scissorc cli/main.cpp)
 target_link_libraries(scissorc PRIVATE csa_core)
 
+# libcsa: stable C ABI shared library for language bindings (Python, Rust,
+# C#, Go, ...) -- see include/csa/csa_capi.h. No C++ types cross this
+# boundary, so it links the same way regardless of which toolchain built
+# it vs. which one is loading it.
+add_library(csa_capi SHARED src/csa_capi.cpp)
+target_link_libraries(csa_capi PRIVATE csa_core)
+target_include_directories(csa_capi PUBLIC include)
+target_compile_definitions(csa_capi PRIVATE CSA_BUILDING_DLL)
+set_target_properties(csa_capi PROPERTIES
+    WINDOWS_EXPORT_ALL_SYMBOLS ON   # belt-and-braces alongside the __declspec macros in csa_capi.h
+    OUTPUT_NAME "csa"                # -> csa.dll / libcsa.so / libcsa.dylib
+)
+
 enable_testing()
 add_executable(csa_tests tests/test_main.cpp)
 target_link_libraries(csa_tests PRIVATE csa_core)
 add_test(NAME csa_tests COMMAND csa_tests)
+
+# Links against the actual shared library (not csa_core directly) so a
+# real symbol-export/linking problem in the C ABI can't hide behind the
+# C++ tests, which never cross that boundary.
+add_executable(csa_capi_test tests/test_capi.cpp)
+target_link_libraries(csa_capi_test PRIVATE csa_capi)
+add_test(NAME csa_capi_test COMMAND csa_capi_test)

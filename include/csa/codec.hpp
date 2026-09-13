@@ -28,6 +28,16 @@ std::vector<u8> decompress(const std::vector<u8>& blob);
 std::vector<u8> compress_geo2d(const std::vector<Point2i>& points);
 std::vector<Point2i> decompress_geo2d(const std::vector<u8>& blob);
 
+// Lossy variant: quantizes rod residuals to the nearest multiple of
+// quant_step (see rod_joint_transform.hpp for the closed-loop design and
+// rod_joint_2d_error_bound() for the resulting per-coordinate error
+// bound), with an exact resync rod every resync_interval rods to bound
+// how far absolute position error can drift (0 = never resync). Decoding
+// is via the same decompress_geo2d -- the blob carries its own
+// quant_step/resync_interval, so the decoder needs no special "lossy
+// mode" of its own. quant_step <= 1 is exactly compress_geo2d (lossless).
+std::vector<u8> compress_geo2d_lossy(const std::vector<Point2i>& points, u32 quant_step, u32 resync_interval);
+
 // Axis-wise geometric mode for 3D point sequences.
 std::vector<u8> compress_geo3d(const std::vector<Point3i>& points);
 std::vector<Point3i> decompress_geo3d(const std::vector<u8>& blob);

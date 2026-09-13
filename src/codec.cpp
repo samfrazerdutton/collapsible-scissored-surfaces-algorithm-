@@ -131,6 +131,8 @@ void serialize_geo2d(const RodJoint2DResult& r, std::vector<u8>& out) {
     put_i32(out, r.anchor.x);
     put_i32(out, r.anchor.y);
     put_u32(out, r.lag);
+    put_u32(out, r.quant_step);
+    put_u32(out, r.resync_interval);
 
     std::vector<u8> flat;
     for (i64 v : r.block_ratio_re) write_varint(flat, zigzag_encode64(v));
@@ -149,6 +151,8 @@ RodJoint2DResult deserialize_geo2d(const u8* data, size_t size, size_t& pos) {
     r.anchor.x = get_i32(data, size, pos);
     r.anchor.y = get_i32(data, size, pos);
     r.lag = get_u32(data, size, pos);
+    r.quant_step = get_u32(data, size, pos);
+    r.resync_interval = get_u32(data, size, pos);
 
     u64 raw_len = get_u64(data, size, pos);
     u64 coded_len = get_u64(data, size, pos);
@@ -247,6 +251,27 @@ RodJoint3DSimResult deserialize_geo3d_sim(const u8* data, size_t size, size_t& p
 
 } // namespace
 
+namespace {
+// Below this size, trying every candidate always costs so little
+// (milliseconds) that there's no reason to skip any of them "to save
+// time" -- the adaptive skip below only kicks in where it can actually
+// matter.
+constexpr size_t kAdaptiveSizeThreshold = 100'000;
+// If the LZ candidate already compressed to less than this fraction of
+// the input, that's strong *measured* evidence (not a guessed content
+// type) that the data has exploitable repeated-substring structure --
+// Pantograph Lift's predictive model is very unlikely to beat a result
+// already this strong, so it's skipped to save real time on large
+// inputs. This is a real, if imperfect, tradeoff: it is conceivable for
+// an adversarial file to have LZ do reasonably well *and* have Pantograph
+// Lift do even better, in which case this heuristic gives up a small,
+// unmeasured amount of ratio for a real, measured amount of speed. It
+// never runs below kAdaptiveSizeThreshold, and it is always based on
+// this file's actual LZ result, never a guess from a file extension or a
+// sniffed "looks like text" classifier.
+constexpr double kAdaptiveLzStrongRatio = 0.35;
+} // namespace
+
 std::vector<u8> compress(const std::vector<u8>& input, bool use_gpu) {
     // RAW candidate.
     std::vector<u8> raw_blob;
@@ -256,26 +281,35 @@ std::vector<u8> compress(const std::vector<u8>& input, bool use_gpu) {
 
     if (input.empty()) return raw_blob;
 
-    // GENERAL candidate.
-    std::vector<i32> as_i32(input.size());
-    for (size_t i = 0; i < input.size(); i++) as_i32[i] = (i32)input[i];
-    LiftResult lr;
-    bool used_gpu = use_gpu && pantograph_lift_forward_cuda(as_i32, lr);
-    if (!used_gpu) lr = pantograph_lift_forward(as_i32);
-
-    std::vector<u8> general_blob;
-    write_magic_mode(general_blob, Mode::General);
-    serialize_lift(lr, general_blob);
-
-    // GENERAL-LZ candidate.
+    // GENERAL-LZ candidate (computed first: its result is also the signal
+    // the adaptive heuristic below uses to decide whether Pantograph Lift
+    // is worth trying at all).
     std::vector<u8> lz_blob;
     write_magic_mode(lz_blob, Mode::GeneralLZ);
     std::vector<u8> lz_payload = lz_encode(input);
     lz_blob.insert(lz_blob.end(), lz_payload.begin(), lz_payload.end());
 
+    bool skip_pantograph = false;
+    if (input.size() >= kAdaptiveSizeThreshold) {
+        double lz_ratio = (double)lz_blob.size() / (double)input.size();
+        skip_pantograph = lz_ratio < kAdaptiveLzStrongRatio;
+    }
+
     const std::vector<u8>* best = &raw_blob;
-    if (general_blob.size() < best->size()) best = &general_blob;
     if (lz_blob.size() < best->size()) best = &lz_blob;
+
+    std::vector<u8> general_blob;
+    if (!skip_pantograph) {
+        std::vector<i32> as_i32(input.size());
+        for (size_t i = 0; i < input.size(); i++) as_i32[i] = (i32)input[i];
+        LiftResult lr;
+        bool used_gpu = use_gpu && pantograph_lift_forward_cuda(as_i32, lr);
+        if (!used_gpu) lr = pantograph_lift_forward(as_i32);
+
+        write_magic_mode(general_blob, Mode::General);
+        serialize_lift(lr, general_blob);
+        if (general_blob.size() < best->size()) best = &general_blob;
+    }
     return *best;
 }
 
@@ -325,7 +359,20 @@ std::vector<Point2i> decompress_geo2d(const std::vector<u8>& blob) {
     Mode mode = read_magic_mode(blob.data(), blob.size(), pos);
     if (mode != Mode::Geo2D) throw std::runtime_error("csa: not a Geo2D stream");
     RodJoint2DResult r = deserialize_geo2d(blob.data(), blob.size(), pos);
-    return rod_joint_2d_inverse(r);
+    return rod_joint_2d_inverse(r); // handles lossy blobs transparently: quant_step/resync_interval ride in the blob itself
+}
+
+std::vector<u8> compress_geo2d_lossy(const std::vector<Point2i>& points, u32 quant_step, u32 resync_interval) {
+    if (quant_step <= 1) return compress_geo2d(points); // q<=1 has no lossy effect; use the lag-searching lossless path
+    std::vector<u8> best;
+    for (u32 lag : kRodJointCandidateLags) {
+        RodJoint2DResult r = rod_joint_2d_forward(points, lag, quant_step, resync_interval);
+        std::vector<u8> out;
+        write_magic_mode(out, Mode::Geo2D);
+        serialize_geo2d(r, out);
+        if (best.empty() || out.size() < best.size()) best = std::move(out);
+    }
+    return best;
 }
 
 // Geo3D tries two candidate models -- the xy-rotation+z-affine composition

@@ -80,18 +80,47 @@ constexpr size_t kRodJoint3DBlockSize = 128; // rods per calibration block (3D s
 constexpr u32 kRodJointCandidateLags[] = {1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 16, 20, 24, 32};
 constexpr size_t kRodJointNumCandidateLags = sizeof(kRodJointCandidateLags) / sizeof(kRodJointCandidateLags[0]);
 
+// Lossless and lossy share one code path: a rod's residual is quantized
+// to the nearest multiple of `quant_step` (q=1 is exact -- round(d/1)*1
+// == d always, so lossless is simply the q=1 special case, not a
+// separate implementation). What's actually stored is the quantized
+// *index* (residual/q, rounded), which is why lossy mode compresses much
+// better: the values being entropy-coded are smaller by roughly a factor
+// of q. Critically, prediction for rod i uses the *reconstructed* (lossy)
+// rod i-lag, not the true original one -- the same closed-loop DPCM
+// design real predictive codecs use, so the encoder and decoder always
+// agree on history. Per-rod reconstruction error is bounded by q/2 in
+// each coordinate, but because rods accumulate into an absolute point
+// path (points[i+1] = points[i] + rod[i]), that per-rod error is a random
+// walk over the sequence and *absolute* position error can drift further
+// the longer the run since the last exact point. `resync_interval` bounds
+// that drift: every `resync_interval` rods, one rod is stored exactly
+// (lossless) regardless of `quant_step`, which resets accumulated error
+// to zero there -- the same role a keyframe plays in a video codec.
+// resync_interval == 0 means "never" (fine for lossless use, or for short
+// sequences where drift never gets large enough to matter).
 struct RodJoint2DResult {
     Point2i anchor{0, 0};
     u64 count = 0;                    // number of points
     u32 lag = 1;                      // rod[i] predicted from rod[i-lag]
+    u32 quant_step = 1;                // 1 == lossless
+    u32 resync_interval = 0;           // 0 == no periodic exact resync
     std::vector<i64> block_ratio_re;  // per block, Q16.16 fixed-point joint constant
     std::vector<i64> block_ratio_im;  // c = ratio_re + i*ratio_im
-    std::vector<i32> residual_x;      // size count-1 (empty if count <= 1)
+    std::vector<i32> residual_x;      // size count-1 (empty if count <= 1); quantized index when quant_step > 1
     std::vector<i32> residual_y;
 };
 
-RodJoint2DResult rod_joint_2d_forward(const std::vector<Point2i>& points, u32 lag = 1);
+RodJoint2DResult rod_joint_2d_forward(const std::vector<Point2i>& points, u32 lag = 1,
+                                       u32 quant_step = 1, u32 resync_interval = 0);
 std::vector<Point2i> rod_joint_2d_inverse(const RodJoint2DResult& r);
+
+// Reports the exact per-coordinate reconstruction error bound implied by
+// a given quant_step: any lossy-mode coordinate is within this many units
+// of its true value (0 for quant_step <= 1, i.e. lossless).
+inline u32 rod_joint_2d_error_bound(u32 quant_step) {
+    return quant_step <= 1 ? 0 : (quant_step / 2);
+}
 
 struct RodJoint3DResult {
     RodJoint2DResult xy;

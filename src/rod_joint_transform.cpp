@@ -13,6 +13,14 @@ inline i64 clampd(double v, double lo, double hi) {
     return (i64)llround(v * (double)kFixedOne);
 }
 
+// Rounds d/q to the nearest integer (round-half-away-from-zero), for
+// q >= 1. q == 1 returns d unchanged exactly, which is what makes q=1
+// mean "lossless" rather than "lossy with a suspiciously small step".
+inline i64 quant_round_div(i64 d, i64 q) {
+    if (q <= 1) return d;
+    return (d >= 0) ? (d + q / 2) / q : -((-d + q / 2) / q);
+}
+
 // complex multiply: (cr + i*ci) * (ex + i*ey), all fixed-point/int inputs,
 // result rounded to nearest integer pair.
 inline void complex_mul_round(i64 cr, i64 ci, i32 ex, i32 ey, i32& out_re, i32& out_im) {
@@ -144,12 +152,15 @@ std::array<i64, 9> calibrate_3d_block(const std::vector<i32>& ex, const std::vec
 
 } // namespace
 
-RodJoint2DResult rod_joint_2d_forward(const std::vector<Point2i>& points, u32 lag) {
+RodJoint2DResult rod_joint_2d_forward(const std::vector<Point2i>& points, u32 lag,
+                                       u32 quant_step, u32 resync_interval) {
     RodJoint2DResult r;
     r.count = points.size();
     if (points.empty()) return r;
     r.anchor = points[0];
     r.lag = lag;
+    r.quant_step = (quant_step == 0) ? 1 : quant_step;
+    r.resync_interval = resync_interval;
     size_t m = points.size();
     if (m < 2) return r;
 
@@ -167,21 +178,54 @@ RodJoint2DResult rod_joint_2d_forward(const std::vector<Point2i>& points, u32 la
     r.residual_x.resize(nrods);
     r.residual_y.resize(nrods);
 
+    // Reconstructed (possibly lossy) rod history -- prediction is always
+    // based on this, never on the true `ex`/`ey`, so the encoder stays in
+    // lockstep with what the decoder will independently reconstruct. For
+    // quant_step == 1 this is provably identical to `ex`/`ey` (see the
+    // header comment), so lossless behavior is unchanged.
+    std::vector<i32> rec_ex(nrods), rec_ey(nrods);
+
+    // Running reconstructed absolute position (what a decoder would have
+    // accumulated so far). A resync rod's target is *not* the true rod
+    // ex[i]/ey[i] -- using that would only stop drift from growing
+    // further, it would not undo drift already accumulated from earlier
+    // lossy rods, since it would still be added to an already-off
+    // rec_p{x,y}. The target that actually lands exactly on the true
+    // absolute point points[i+1] is (points[i+1] - rec_p), computed
+    // against whatever rec_p currently is.
+    i64 rec_px = points[0].x, rec_py = points[0].y;
+
     for (size_t blk = 0; blk < nblocks; blk++) {
         size_t start = blk * kRodJointBlockSize;
         size_t end = std::min(nrods, start + kRodJointBlockSize);
         i64 cr, ci;
-        calibrate_block(ex, ey, start, end, lag, cr, ci);
+        calibrate_block(ex, ey, start, end, lag, cr, ci); // calibration may use true rods; only prediction needs closed-loop history
         r.block_ratio_re[blk] = cr;
         r.block_ratio_im[blk] = ci;
 
         for (size_t i = start; i < end; i++) {
-            i32 prev_ex = (i >= lag) ? ex[i - lag] : 0;
-            i32 prev_ey = (i >= lag) ? ey[i - lag] : 0;
+            i32 prev_ex = (i >= lag) ? rec_ex[i - lag] : 0;
+            i32 prev_ey = (i >= lag) ? rec_ey[i - lag] : 0;
             i32 pred_re, pred_im;
             complex_mul_round(cr, ci, prev_ex, prev_ey, pred_re, pred_im);
-            r.residual_x[i] = ex[i] - pred_re;
-            r.residual_y[i] = ey[i] - pred_im;
+
+            bool is_resync = (r.resync_interval > 0) && (((i + 1) % r.resync_interval) == 0);
+            u32 q_here = is_resync ? 1 : r.quant_step;
+
+            i64 target_dx = is_resync ? ((i64)points[i + 1].x - rec_px) : (i64)ex[i];
+            i64 target_dy = is_resync ? ((i64)points[i + 1].y - rec_py) : (i64)ey[i];
+            i64 raw_dx = target_dx - pred_re;
+            i64 raw_dy = target_dy - pred_im;
+
+            i64 qx = quant_round_div(raw_dx, (i64)q_here);
+            i64 qy = quant_round_div(raw_dy, (i64)q_here);
+            r.residual_x[i] = (i32)qx;
+            r.residual_y[i] = (i32)qy;
+
+            rec_ex[i] = (i32)(pred_re + qx * (i64)q_here);
+            rec_ey[i] = (i32)(pred_im + qy * (i64)q_here);
+            rec_px += rec_ex[i];
+            rec_py += rec_ey[i];
         }
     }
     return r;
@@ -196,19 +240,27 @@ std::vector<Point2i> rod_joint_2d_inverse(const RodJoint2DResult& r) {
 
     size_t nrods = (size_t)r.count - 1;
     u32 lag = r.lag;
-    std::vector<i32> ex(nrods), ey(nrods);
+    u32 quant_step = (r.quant_step == 0) ? 1 : r.quant_step;
+    std::vector<i32> rec_ex(nrods), rec_ey(nrods);
     for (size_t i = 0; i < nrods; i++) {
         size_t blk = i / kRodJointBlockSize;
         i64 cr = r.block_ratio_re[blk];
         i64 ci = r.block_ratio_im[blk];
-        i32 prev_ex = (i >= lag) ? ex[i - lag] : 0;
-        i32 prev_ey = (i >= lag) ? ey[i - lag] : 0;
+        i32 prev_ex = (i >= lag) ? rec_ex[i - lag] : 0;
+        i32 prev_ey = (i >= lag) ? rec_ey[i - lag] : 0;
         i32 pred_re, pred_im;
         complex_mul_round(cr, ci, prev_ex, prev_ey, pred_re, pred_im);
-        ex[i] = pred_re + r.residual_x[i];
-        ey[i] = pred_im + r.residual_y[i];
-        points[i + 1].x = points[i].x + ex[i];
-        points[i + 1].y = points[i].y + ey[i];
+
+        bool is_resync = (r.resync_interval > 0) && (((i + 1) % r.resync_interval) == 0);
+        u32 q_here = is_resync ? 1 : quant_step;
+
+        i64 qx = r.residual_x[i];
+        i64 qy = r.residual_y[i];
+        rec_ex[i] = (i32)(pred_re + qx * (i64)q_here);
+        rec_ey[i] = (i32)(pred_im + qy * (i64)q_here);
+
+        points[i + 1].x = points[i].x + rec_ex[i];
+        points[i + 1].y = points[i].y + rec_ey[i];
     }
     return points;
 }

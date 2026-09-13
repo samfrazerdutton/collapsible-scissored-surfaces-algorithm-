@@ -40,14 +40,25 @@ on realistic (not maximally repetitive) text/log/telemetry files, and
 - **Adaptive order-1 range coder** -- the entropy-coding backend shared by
   every mode (generalized to arbitrary alphabet sizes for the LZ matcher's
   literal/length/distance streams, not just the original 256-byte case).
+- **A real lossy mode** for the 2D Rod-Joint Transform -- quantized
+  prediction residuals with periodic exact resync to bound absolute-
+  position drift, not just lossless. `quant_step <= 1` is provably
+  identical to lossless; larger steps trade a bounded, measured
+  coordinate error for real compression gains (see `DESIGN.md`).
+- **A stable C ABI** (`include/csa/csa_capi.h`, built as `csa.dll` /
+  `libcsa.so` / `libcsa.dylib`) with no C++ types crossing the boundary,
+  plus a **Python `ctypes` binding** (`bindings/python/csa.py`) on top of
+  it -- both tested against the actual built shared library, not mocked.
 - **CUDA kernel** for the Pantograph Lift's forward transform (genuinely
   parallel: every pair within a decomposition level is independent),
   GPU-resident across the whole multi-level pass (one upload, a handful of
   downloads, no per-level round trips), tested against the CPU path
   bit-for-bit.
-- **1293 round-trip correctness checks** (`tests/test_main.cpp`), including
-  a dedicated check that the GPU path actually succeeds (not just that the
-  overall call round-trips via CPU fallback), all passing.
+- **1306 round-trip correctness checks** (`tests/test_main.cpp` +
+  `tests/test_capi.cpp`, the latter linking the real shared library to
+  catch actual symbol-export problems), including a dedicated check that
+  the GPU path actually succeeds (not just that the overall call
+  round-trips via CPU fallback), all passing.
 - **A benchmark suite** (`bench/`) comparing against gzip/bz2/lzma on both
   synthetic shape classes and domain-realistic data (a simulated single-ring
   LiDAR scan, synthetic server logs, JSON telemetry, sensor CSV exports),
@@ -80,6 +91,13 @@ python bench/gpu_crossover.py
 
 # Realistic (not maximally repetitive) use-case datasets and results
 python bench/use_cases.py
+
+# Lossy geometric mode: quantized residuals, bounded error, real ratio gain
+build/scissorc.exe compress-geo2d-lossy track.xy track_lossy.csa --quant 20 --resync 64
+
+# Python bindings (ctypes, on top of the C ABI in include/csa/csa_capi.h)
+python bindings/python/test_bindings.py
+python -c "import sys; sys.path.insert(0, 'bindings/python'); import csa; print(csa.compress(b'hello world'))"
 ```
 
 ## Headline results
@@ -148,11 +166,13 @@ python bench/use_cases.py
 ## Repo layout
 
 ```
-include/csa/      public headers (transforms, range coder, codec, CUDA API)
-src/              CPU implementation
+include/csa/      public headers (transforms, range coder, codec, CUDA API, C ABI)
+src/              CPU implementation (+ csa_capi.cpp, the C ABI shim)
 cuda/             CUDA kernel (built only if a CUDA compiler is found)
 cli/              scissorc command-line tool
-tests/            self-contained round-trip test suite (no external deps)
+bindings/python/  ctypes bindings (csa.py) + test_bindings.py, on the C ABI
+tests/            round-trip test suite (test_main.cpp) + C-ABI test that
+                  links the real shared library (test_capi.cpp), no external deps
 bench/            dataset generator + benchmark runner (writes BENCHMARKS.md)
                   + GPU crossover benchmark (writes GPU_BENCHMARKS.md)
                   + realistic use-case scenarios (writes USE_CASES.md)
