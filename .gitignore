@@ -7,3 +7,5 @@ bench/_tmp/
 *.lib
 *.pdb
 __pycache__/
+bindings/rust/target/
+Cargo.lock

@@ -1,0 +1,111 @@
+// Smoke test for the Rust FFI bindings, run against the actual built
+// shared library (not a mock) -- mirrors bindings/python/test_bindings.py
+// so both bindings are held to the same real end-to-end bar.
+
+fn lcg_next(seed: &mut u32) -> f64 {
+    *seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+    (*seed >> 8) as f64 / (1u32 << 24) as f64
+}
+
+#[test]
+fn general_round_trip() {
+    let data = "the quick brown fox jumps over the lazy dog. ".repeat(500);
+    let data = data.as_bytes();
+    let compressed = csa::compress(data, false).expect("compress failed");
+    assert!(!compressed.is_empty());
+    assert!(compressed.len() < data.len() / 10, "expected strong ratio on repetitive text");
+    let back = csa::decompress(&compressed).expect("decompress failed");
+    assert_eq!(back, data);
+}
+
+#[test]
+fn geo2d_round_trip() {
+    let mut points = Vec::new();
+    let (mut x, mut y, mut dx, mut dy) = (50.0_f64, 0.0_f64, 3.0_f64, 0.0_f64);
+    for _ in 0..300 {
+        points.push((x.round() as i32, y.round() as i32));
+        let ndx = 1.02 * (dx * 0.15_f64.cos() - dy * 0.15_f64.sin());
+        let ndy = 1.02 * (dx * 0.15_f64.sin() + dy * 0.15_f64.cos());
+        dx = ndx;
+        dy = ndy;
+        x += dx;
+        y += dy;
+    }
+
+    let blob = csa::compress_geo2d(&points).expect("compress_geo2d failed");
+    assert!(!blob.is_empty());
+    let back = csa::decompress_geo2d(&blob).expect("decompress_geo2d failed");
+    assert_eq!(back, points);
+}
+
+#[test]
+fn geo2d_lossy_bounded_error() {
+    let mut points = Vec::new();
+    let (mut x, mut y, mut heading) = (0.0_f64, 0.0_f64, 0.0_f64);
+    let mut seed = 7u32;
+    for _ in 0..2000 {
+        heading += (lcg_next(&mut seed) - 0.5) * 0.1;
+        let speed = 8.0 + (lcg_next(&mut seed) - 0.5);
+        x += speed * heading.cos();
+        y += speed * heading.sin();
+        points.push((x.round() as i32, y.round() as i32));
+    }
+
+    let lossless = csa::compress_geo2d(&points).unwrap();
+    let lossy = csa::compress_geo2d_lossy(&points, 20, 64).unwrap();
+    assert!(lossy.len() < lossless.len(), "lossy ({}) should beat lossless ({})", lossy.len(), lossless.len());
+
+    let back = csa::decompress_geo2d(&lossy).unwrap();
+    assert_eq!(back.len(), points.len());
+    let max_err = points
+        .iter()
+        .zip(back.iter())
+        .map(|(a, b)| (a.0 - b.0).abs().max((a.1 - b.1).abs()))
+        .max()
+        .unwrap();
+    assert!(max_err <= 20 * 64, "max_err={max_err} exceeds bound");
+}
+
+#[test]
+fn geo3d_lossy_bounded_error() {
+    let mut points = Vec::new();
+    let (mut x, mut y, mut z, mut heading) = (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
+    let mut seed = 314159u32;
+    for _ in 0..2000 {
+        heading += (lcg_next(&mut seed) - 0.5) * 0.08;
+        let speed = 8.0 + (lcg_next(&mut seed) - 0.5);
+        x += speed * heading.cos();
+        y += speed * heading.sin();
+        z += 3.0 + (lcg_next(&mut seed) - 0.5) * 0.5;
+        points.push((x.round() as i32, y.round() as i32, z.round() as i32));
+    }
+
+    let lossless = csa::compress_geo3d(&points).unwrap();
+    let back_lossless = csa::decompress_geo3d(&lossless).unwrap();
+    assert_eq!(back_lossless, points);
+
+    let lossy = csa::compress_geo3d_lossy(&points, 20, 64).unwrap();
+    assert!(lossy.len() < lossless.len(), "3d lossy ({}) should beat lossless ({})", lossy.len(), lossless.len());
+
+    let back = csa::decompress_geo3d(&lossy).unwrap();
+    assert_eq!(back.len(), points.len());
+    let max_err = points
+        .iter()
+        .zip(back.iter())
+        .map(|(a, b)| (a.0 - b.0).abs().max((a.1 - b.1).abs()).max((a.2 - b.2).abs()))
+        .max()
+        .unwrap();
+    assert!(max_err <= 20 * 64, "max_err={max_err} exceeds bound");
+}
+
+#[test]
+fn error_handling_on_garbage_input() {
+    let garbage = [1u8, 2, 3, 4, 5];
+    let err = csa::decompress(&garbage).expect_err("expected an error on garbage input");
+    assert!(!err.0.is_empty());
+}
+
+#[test]
+fn cuda_available_does_not_panic() {
+    let _ = csa::cuda_available();
+}

@@ -1,0 +1,10 @@
+[package]
+name = "csa"
+version = "0.1.0"
+edition = "2021"
+description = "Rust bindings for libcsa (Collapsible Scissored Surfaces Algorithm), via FFI on top of the stable C ABI in include/csa/csa_capi.h."
+build = "build.rs"
+
+[lib]
+name = "csa"
+path = "src/lib.rs"

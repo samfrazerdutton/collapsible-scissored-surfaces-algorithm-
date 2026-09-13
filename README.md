@@ -55,8 +55,9 @@ unmodified C++ source code, not text written for this project -- and
   `DESIGN.md`).
 - **A stable C ABI** (`include/csa/csa_capi.h`, built as `csa.dll` /
   `libcsa.so` / `libcsa.dylib`) with no C++ types crossing the boundary,
-  plus a **Python `ctypes` binding** (`bindings/python/csa.py`) on top of
-  it -- both tested against the actual built shared library, not mocked.
+  plus **Python `ctypes`** (`bindings/python/csa.py`) and **Rust FFI**
+  (`bindings/rust/`) bindings on top of it -- both tested end-to-end
+  against the actual built shared library, not mocked.
 - **CUDA kernel** for the Pantograph Lift's forward transform (genuinely
   parallel: every pair within a decomposition level is independent),
   GPU-resident across the whole multi-level pass (one upload, a handful of
@@ -121,6 +122,9 @@ build/scissorc.exe compress-geo3d-lossy track.xyz track_lossy.csa --quant 20 --r
 # Python bindings (ctypes, on top of the C ABI in include/csa/csa_capi.h)
 python bindings/python/test_bindings.py
 python -c "import sys; sys.path.insert(0, 'bindings/python'); import csa; print(csa.compress(b'hello world'))"
+
+# Rust bindings (FFI, on top of the same C ABI)
+cd bindings/rust && cargo test
 ```
 
 ## Headline results

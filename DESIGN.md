@@ -348,6 +348,22 @@ built shared library (`bindings/python/test_bindings.py`), not mocked.
 (not `csa_core` directly), specifically to catch real symbol-export/
 linking problems that testing the C++ core alone never would.
 
+`bindings/rust/` is the same idea via `extern "C"` FFI instead of
+`ctypes`: a `build.rs` locates the built shared library (same
+`CSA_LIB_PATH`-env-var-or-relative-`build/`-directory rule as the Python
+bindings), links against it, and copies the runtime `.dll`/`.so`/`.dylib`
+next to whatever binaries `cargo` produces (Windows needs the library in
+the launching executable's own directory or on `PATH` to find it at
+runtime, which a link-only `cargo:rustc-link-lib` doesn't handle by
+itself). Multi-byte fields are read from the returned buffer with
+`read_unaligned` rather than a direct pointer cast, since a malloc'd
+buffer's alignment isn't part of the C ABI's contract even though it
+happens to work out in practice. `bindings/rust/tests/integration.rs`
+mirrors `test_bindings.py` case-for-case (general round-trip, geo2d
+round-trip, 2D and 3D lossy bounded-error checks, error-path handling) and
+runs via `cargo test` against the real library, the same testing
+discipline as the Python and C-ABI test suites.
+
 ## GPU acceleration (`cuda/pantograph_lift_cuda.cu`)
 
 The Pantograph Lift's per-level transform is embarrassingly parallel: given
@@ -509,12 +525,12 @@ smaller call's result).
   composition** (see the lossy-mode section above) -- extending the
   composition's z-axis Pantograph Lift to support quantization too would
   close that gap, at the cost of another lossy code path to maintain.
-- **Rust/C#/Go bindings** on top of the same C ABI (`csa_capi.h`) that the
-  Python bindings already use -- the hard prerequisite (a stable, no-C++-
-  types-crossing-the-boundary interface) now exists; generating each
-  additional language's wrapper is comparatively mechanical (`bindgen` for
-  Rust, `P/Invoke` for C#, `cgo` for Go) but each is still real,
-  untrivial work that hasn't been done.
+- **C#/Go bindings** on top of the same C ABI (`csa_capi.h`) that the
+  Python and Rust bindings already use -- the hard prerequisite (a stable,
+  no-C++-types-crossing-the-boundary interface) now exists; generating
+  each additional language's wrapper is comparatively mechanical
+  (`P/Invoke` for C#, `cgo` for Go) but each is still real, untrivial work
+  that hasn't been done.
 - **A genuinely cross-vendor GPU backend** (Vulkan Compute, WebGPU, or
   similar) would let the parallel block-coding kernels run on non-NVIDIA
   hardware and non-Windows/Linux platforms (macOS/Metal, mobile, WASM).
