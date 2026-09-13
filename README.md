@@ -21,11 +21,13 @@ hand-typed).
   transform (C++17), the byte-stream analogue of the mechanism.
 - **Rod-Joint Transform** -- the literal geometric analogue for point
   sequences (GPS tracks, spirals, helices, LiDAR scans): each edge vector
-  is predicted from the previous one via a calibrated rotation+scale
-  constant. 3D point sequences try two models per file automatically (a
-  2D rotation joint on (x,y) + affine fit on z, and a true 3D
-  similarity joint fit via Horn's closed-form quaternion method) and keep
-  whichever encodes smaller.
+  is predicted from an earlier one (not always the immediately preceding
+  one -- a small set of candidate lags is searched and whichever encodes
+  smallest wins, letting quasi-periodic paths align with their own
+  oscillation period) via a calibrated rotation+scale constant. 3D point
+  sequences try two models per file automatically (a 2D rotation joint on
+  (x,y) + affine fit on z, and a true 3D similarity joint fit via Horn's
+  closed-form quaternion method) and keep whichever encodes smaller.
 - **Adaptive order-1 range coder** -- the entropy-coding backend shared by
   both transforms.
 - **CUDA kernel** for the Pantograph Lift's forward transform (genuinely
@@ -70,10 +72,10 @@ python bench/gpu_crossover.py
 
 | dataset | shape class | vs. best of gzip/bz2/lzma |
 |---|---|---|
-| `spiral.xy` | logarithmic spiral | **91% smaller** than raw; beats lzma by ~7x |
+| `spiral.xy` | logarithmic spiral | **92% smaller** than raw; beats lzma by ~8x |
 | `helix.xyz` | helical point cloud | **95% smaller**; beats lzma by ~12x (true 3D similarity joint) |
 | `gps_track.xy` | noisy real-world-style path | beats lzma by ~1.3x |
-| `toroidal.xyz` | doubly-curved (wobbling radius) | **loses** to lzma -- honest limitation, see below |
+| `toroidal.xyz` | doubly-curved (wobbling radius) | **32% smaller; beats lzma** -- see below for how |
 
 ## Honesty, not hype
 
@@ -81,28 +83,36 @@ python bench/gpu_crossover.py
   source paper calls out (helical, spiral, toroidal-adjacent paths) --
   because those are exactly what a rotation+scale joint models. It is not
   a general-purpose point-cloud compressor and doesn't try to be.
-- `toroidal.xyz` is reported as a loss against lzma, on purpose: its
-  radius itself oscillates, which a single calibrated rotation+scale
-  constant (even recalibrated periodically) can't track. That's a real,
-  current limitation, not a benchmark artifact -- see `DESIGN.md`'s
-  Future Work section.
+- `toroidal.xyz` used to be reported as an honest loss against lzma: its
+  radius oscillates roughly every 3 rods, far faster than any calibration
+  block predicting from the immediately preceding rod could track. The
+  actual fix wasn't a fancier per-block fit -- both Geo3D models now
+  search a small set of candidate lags (predict rod `i` from rod `i-lag`
+  for lag in {1..32}) and keep whichever encodes smallest, the same idea
+  speech/audio codecs use for periodic signals. Lag 3 aligns almost
+  exactly with this shape's oscillation period, turning a 15%-smaller
+  loss into a 32%-smaller win. See `DESIGN.md` for the mechanism.
 - The general-purpose Pantograph Lift mode does not beat gzip/bz2/lzma on
   ordinary text and isn't meant to -- it's a from-scratch reversible
   transform, not a reimplementation of Lempel-Ziv, and the geometric mode
   is the actual point of this repo.
-- GPU timing is reported honestly. This laptop GPU (RTX 2060 Max-Q) idles
-  down between uses and the first CUDA call after idling pays a real
-  ~1.2s wake/context-creation cost, independent of data size -- a genuine
-  reason a single ad-hoc `--gpu` call can look much slower than the CPU
-  path. Once warm, `GPU_BENCHMARKS.md`'s dedicated transform-only
-  measurement shows GPU-vs-CPU time converging steadily from ~128x slower
-  at 100K elements to near parity (~0.8-0.98x) at 256M elements, the
-  practical VRAM ceiling on this card -- the CPU path was still faster at
-  every size actually tested, an honest negative result reported as
-  measured, not papered over. This mirrors the same PCIe/warm-up-bound
-  pattern this repo owner's other GPU-resident projects (a GPU-resident
-  CKKS homomorphic-encryption library, and a production LiDAR CUDA
-  pipeline) already measured and documented.
+- GPU timing is reported honestly, at two different fidelities. Launching
+  a fresh process per measurement (which pays its own allocation, and a
+  real ~1.2s wake/context-creation cost if this laptop GPU had idled since
+  the last call), GPU-vs-CPU time converges from ~128x slower at 100K
+  elements to ~0.6-0.8x at 256M elements -- the CPU path still wins every
+  size measured that way. But that understates real deployment: a service
+  handles many requests from one long-lived process, not one process per
+  input, and measuring *that* directly (`scissorc bench-transform --repeat
+  N`, steady-state average once the GPU's clocks have ramped up) shows GPU
+  reaching **~0.98-1.00x of CPU time at 16M-256M elements, and an outright
+  win at 64M** in the runs recorded in `GPU_BENCHMARKS.md`. Genuine parity
+  for a mid-range laptop GPU against a modern CPU, reported as measured --
+  not the fixed one-shot number, and not oversold as a definitive win
+  everywhere either. This mirrors the same PCIe/warm-up-bound pattern this
+  repo owner's other GPU-resident projects (a GPU-resident CKKS
+  homomorphic-encryption library, and a production LiDAR CUDA pipeline)
+  already measured and documented.
 
 ## Repo layout
 

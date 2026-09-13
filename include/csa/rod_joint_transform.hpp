@@ -8,7 +8,7 @@
 // joint, is enough to deploy an entire helical/toroidal surface from a
 // collapsed line. Here the same idea is a calibrated complex constant c
 // (a 2D rotation+scale — a "similarity" ratio) that predicts each rod from
-// the previous one: rod[i] ~= c * rod[i-1]. Only the exact integer
+// an earlier one: rod[i] ~= c * rod[i-lag]. Only the exact integer
 // residual is stored, so reconstruction is bit-exact regardless of how
 // good the calibration is. For a perfect logarithmic spiral/helix
 // projection, c alone (2 numbers) plus the anchor point predicts the
@@ -19,6 +19,18 @@
 // can't track a path whose curvature itself drifts (e.g. a wobbling
 // radius), so periodic recalibration trades a still-tiny parameter count
 // for real local adaptivity.
+//
+// `lag` defaults to 1 (predict from the immediately preceding rod), but a
+// path whose rods oscillate with a period shorter than any reasonable
+// calibration block (e.g. a toroidal cross-section's radius, which can
+// complete a full cycle every 2-3 rods) can never be tracked by an
+// immediate-previous-rod predictor no matter how often it's recalibrated
+// -- a lag matching that period aligns the prediction directly instead.
+// codec.cpp's compress_geo2d/compress_geo3d search a small set of
+// candidate lags (see kRodJointCandidateLags) and keep whichever actually
+// encodes smallest; this is exactly the same kind of long-term/pitch
+// prediction speech and audio codecs use for periodic signals, applied
+// here to rod sequences instead of waveform samples.
 //
 // 3D point sequences have two candidate models, and the codec (see
 // codec.cpp's compress_geo3d) tries both and keeps whichever encodes
@@ -65,16 +77,20 @@ struct Point3i { i32 x, y, z; };
 constexpr size_t kRodJointBlockSize = 128;   // rods per calibration block (2D)
 constexpr size_t kRodJoint3DBlockSize = 128; // rods per calibration block (3D similarity)
 
+constexpr u32 kRodJointCandidateLags[] = {1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 16, 20, 24, 32};
+constexpr size_t kRodJointNumCandidateLags = sizeof(kRodJointCandidateLags) / sizeof(kRodJointCandidateLags[0]);
+
 struct RodJoint2DResult {
     Point2i anchor{0, 0};
     u64 count = 0;                    // number of points
+    u32 lag = 1;                      // rod[i] predicted from rod[i-lag]
     std::vector<i64> block_ratio_re;  // per block, Q16.16 fixed-point joint constant
     std::vector<i64> block_ratio_im;  // c = ratio_re + i*ratio_im
     std::vector<i32> residual_x;      // size count-1 (empty if count <= 1)
     std::vector<i32> residual_y;
 };
 
-RodJoint2DResult rod_joint_2d_forward(const std::vector<Point2i>& points);
+RodJoint2DResult rod_joint_2d_forward(const std::vector<Point2i>& points, u32 lag = 1);
 std::vector<Point2i> rod_joint_2d_inverse(const RodJoint2DResult& r);
 
 struct RodJoint3DResult {
@@ -82,17 +98,18 @@ struct RodJoint3DResult {
     LiftResult lift_z;
 };
 
-RodJoint3DResult rod_joint_3d_forward(const std::vector<Point3i>& points);
+RodJoint3DResult rod_joint_3d_forward(const std::vector<Point3i>& points, u32 xy_lag = 1);
 std::vector<Point3i> rod_joint_3d_inverse(const RodJoint3DResult& r);
 
 struct RodJoint3DSimResult {
     Point3i anchor{0, 0, 0};
     u64 count = 0;
+    u32 lag = 1;                      // rod[i] predicted from rod[i-lag]
     std::vector<std::array<i64, 9>> block_matrix; // per block, row-major 3x3, Q16.16
     std::vector<i32> residual_x, residual_y, residual_z; // size count-1 each
 };
 
-RodJoint3DSimResult rod_joint_3d_similarity_forward(const std::vector<Point3i>& points);
+RodJoint3DSimResult rod_joint_3d_similarity_forward(const std::vector<Point3i>& points, u32 lag = 1);
 std::vector<Point3i> rod_joint_3d_similarity_inverse(const RodJoint3DSimResult& r);
 
 } // namespace csa

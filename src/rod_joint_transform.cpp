@@ -22,14 +22,14 @@ inline void complex_mul_round(i64 cr, i64 ci, i32 ex, i32 ey, i32& out_re, i32& 
     out_im = (i32)im;
 }
 
-// Least-squares calibration of c over rod pairs (e[i-1] -> e[i]) for
-// i in [start, end) (0-indexed into ex/ey), skipping i==0 (the virtual
-// zero seed rod, which carries no rotation information).
+// Least-squares calibration of c over rod pairs (e[i-lag] -> e[i]) for
+// i in [start, end) (0-indexed into ex/ey), skipping i < lag (rods with
+// no rod that far back yet, which predict from a virtual zero).
 void calibrate_block(const std::vector<i32>& ex, const std::vector<i32>& ey,
-                      size_t start, size_t end, i64& out_re, i64& out_im) {
+                      size_t start, size_t end, u32 lag, i64& out_re, i64& out_im) {
     double sum_re = 0.0, sum_im = 0.0, sum_norm = 0.0;
-    for (size_t i = std::max(start, size_t(1)); i < end; i++) {
-        double pex = ex[i - 1], pey = ey[i - 1];
+    for (size_t i = std::max(start, (size_t)lag); i < end; i++) {
+        double pex = ex[i - lag], pey = ey[i - lag];
         double cex = ex[i], cey = ey[i];
         sum_re += pex * cex + pey * cey;
         sum_im += pex * cey - pey * cex;
@@ -55,7 +55,7 @@ inline void mat3_mul_round(const std::array<i64, 9>& m, i32 x, i32 y, i32 z,
 
 // Horn's closed-form absolute-orientation method, specialized to fit a
 // single similarity (rotation + uniform scale) predicting rod[i] from
-// rod[i-1] over i in [start, end). Rather than a general eigensolver, the
+// rod[i-lag] over i in [start, end). Rather than a general eigensolver, the
 // optimal rotation quaternion is found as the dominant eigenvector of the
 // symmetric 4x4 "profile" matrix N via shifted power iteration: N has
 // trace 0 (so its eigenvalues aren't all one sign), so it is shifted by
@@ -65,10 +65,10 @@ inline void mat3_mul_round(const std::array<i64, 9>& m, i32 x, i32 y, i32 z,
 // use whatever matrix comes out, exactly, so this never affects
 // correctness even in a degenerate/non-converged case.
 std::array<i64, 9> calibrate_3d_block(const std::vector<i32>& ex, const std::vector<i32>& ey,
-                                       const std::vector<i32>& ez, size_t start, size_t end) {
+                                       const std::vector<i32>& ez, size_t start, size_t end, u32 lag) {
     double H[3][3] = {{0}};
-    for (size_t i = std::max(start, size_t(1)); i < end; i++) {
-        double p[3] = {(double)ex[i - 1], (double)ey[i - 1], (double)ez[i - 1]};
+    for (size_t i = std::max(start, (size_t)lag); i < end; i++) {
+        double p[3] = {(double)ex[i - lag], (double)ey[i - lag], (double)ez[i - lag]};
         double c[3] = {(double)ex[i], (double)ey[i], (double)ez[i]};
         for (int a = 0; a < 3; a++)
             for (int b = 0; b < 3; b++)
@@ -123,8 +123,8 @@ std::array<i64, 9> calibrate_3d_block(const std::vector<i32>& ex, const std::vec
 
     // Optimal uniform scale given R (Umeyama): s = sum(cur . R*prev) / sum(|prev|^2).
     double num = 0.0, den = 0.0;
-    for (size_t i = std::max(start, size_t(1)); i < end; i++) {
-        double p[3] = {(double)ex[i - 1], (double)ey[i - 1], (double)ez[i - 1]};
+    for (size_t i = std::max(start, (size_t)lag); i < end; i++) {
+        double p[3] = {(double)ex[i - lag], (double)ey[i - lag], (double)ez[i - lag]};
         double c[3] = {(double)ex[i], (double)ey[i], (double)ez[i]};
         double rp[3];
         for (int a = 0; a < 3; a++) rp[a] = R[a][0]*p[0] + R[a][1]*p[1] + R[a][2]*p[2];
@@ -144,11 +144,12 @@ std::array<i64, 9> calibrate_3d_block(const std::vector<i32>& ex, const std::vec
 
 } // namespace
 
-RodJoint2DResult rod_joint_2d_forward(const std::vector<Point2i>& points) {
+RodJoint2DResult rod_joint_2d_forward(const std::vector<Point2i>& points, u32 lag) {
     RodJoint2DResult r;
     r.count = points.size();
     if (points.empty()) return r;
     r.anchor = points[0];
+    r.lag = lag;
     size_t m = points.size();
     if (m < 2) return r;
 
@@ -166,22 +167,21 @@ RodJoint2DResult rod_joint_2d_forward(const std::vector<Point2i>& points) {
     r.residual_x.resize(nrods);
     r.residual_y.resize(nrods);
 
-    i32 prev_ex = 0, prev_ey = 0;
     for (size_t blk = 0; blk < nblocks; blk++) {
         size_t start = blk * kRodJointBlockSize;
         size_t end = std::min(nrods, start + kRodJointBlockSize);
         i64 cr, ci;
-        calibrate_block(ex, ey, start, end, cr, ci);
+        calibrate_block(ex, ey, start, end, lag, cr, ci);
         r.block_ratio_re[blk] = cr;
         r.block_ratio_im[blk] = ci;
 
         for (size_t i = start; i < end; i++) {
+            i32 prev_ex = (i >= lag) ? ex[i - lag] : 0;
+            i32 prev_ey = (i >= lag) ? ey[i - lag] : 0;
             i32 pred_re, pred_im;
             complex_mul_round(cr, ci, prev_ex, prev_ey, pred_re, pred_im);
             r.residual_x[i] = ex[i] - pred_re;
             r.residual_y[i] = ey[i] - pred_im;
-            prev_ex = ex[i];
-            prev_ey = ey[i];
         }
     }
     return r;
@@ -194,24 +194,26 @@ std::vector<Point2i> rod_joint_2d_inverse(const RodJoint2DResult& r) {
     points[0] = r.anchor;
     if (r.count < 2) return points;
 
-    i32 prev_ex = 0, prev_ey = 0;
-    for (size_t i = 0; i < r.count - 1; i++) {
+    size_t nrods = (size_t)r.count - 1;
+    u32 lag = r.lag;
+    std::vector<i32> ex(nrods), ey(nrods);
+    for (size_t i = 0; i < nrods; i++) {
         size_t blk = i / kRodJointBlockSize;
         i64 cr = r.block_ratio_re[blk];
         i64 ci = r.block_ratio_im[blk];
+        i32 prev_ex = (i >= lag) ? ex[i - lag] : 0;
+        i32 prev_ey = (i >= lag) ? ey[i - lag] : 0;
         i32 pred_re, pred_im;
         complex_mul_round(cr, ci, prev_ex, prev_ey, pred_re, pred_im);
-        i32 ex = pred_re + r.residual_x[i];
-        i32 ey = pred_im + r.residual_y[i];
-        points[i + 1].x = points[i].x + ex;
-        points[i + 1].y = points[i].y + ey;
-        prev_ex = ex;
-        prev_ey = ey;
+        ex[i] = pred_re + r.residual_x[i];
+        ey[i] = pred_im + r.residual_y[i];
+        points[i + 1].x = points[i].x + ex[i];
+        points[i + 1].y = points[i].y + ey[i];
     }
     return points;
 }
 
-RodJoint3DResult rod_joint_3d_forward(const std::vector<Point3i>& points) {
+RodJoint3DResult rod_joint_3d_forward(const std::vector<Point3i>& points, u32 xy_lag) {
     std::vector<Point2i> xy(points.size());
     std::vector<i32> zs(points.size());
     for (size_t i = 0; i < points.size(); i++) {
@@ -219,7 +221,7 @@ RodJoint3DResult rod_joint_3d_forward(const std::vector<Point3i>& points) {
         zs[i] = points[i].z;
     }
     RodJoint3DResult r;
-    r.xy = rod_joint_2d_forward(xy);
+    r.xy = rod_joint_2d_forward(xy, xy_lag);
     r.lift_z = pantograph_lift_forward(zs);
     return r;
 }
@@ -234,11 +236,12 @@ std::vector<Point3i> rod_joint_3d_inverse(const RodJoint3DResult& r) {
     return points;
 }
 
-RodJoint3DSimResult rod_joint_3d_similarity_forward(const std::vector<Point3i>& points) {
+RodJoint3DSimResult rod_joint_3d_similarity_forward(const std::vector<Point3i>& points, u32 lag) {
     RodJoint3DSimResult r;
     r.count = points.size();
     if (points.empty()) return r;
     r.anchor = points[0];
+    r.lag = lag;
     size_t m = points.size();
     if (m < 2) return r;
 
@@ -256,22 +259,21 @@ RodJoint3DSimResult rod_joint_3d_similarity_forward(const std::vector<Point3i>& 
     r.residual_y.resize(nrods);
     r.residual_z.resize(nrods);
 
-    i32 prev_x = 0, prev_y = 0, prev_z = 0;
     for (size_t blk = 0; blk < nblocks; blk++) {
         size_t start = blk * kRodJoint3DBlockSize;
         size_t end = std::min(nrods, start + kRodJoint3DBlockSize);
-        std::array<i64, 9> M = calibrate_3d_block(ex, ey, ez, start, end);
+        std::array<i64, 9> M = calibrate_3d_block(ex, ey, ez, start, end, lag);
         r.block_matrix[blk] = M;
 
         for (size_t i = start; i < end; i++) {
+            i32 prev_x = (i >= lag) ? ex[i - lag] : 0;
+            i32 prev_y = (i >= lag) ? ey[i - lag] : 0;
+            i32 prev_z = (i >= lag) ? ez[i - lag] : 0;
             i32 px, py, pz;
             mat3_mul_round(M, prev_x, prev_y, prev_z, px, py, pz);
             r.residual_x[i] = ex[i] - px;
             r.residual_y[i] = ey[i] - py;
             r.residual_z[i] = ez[i] - pz;
-            prev_x = ex[i];
-            prev_y = ey[i];
-            prev_z = ez[i];
         }
     }
     return r;
@@ -284,21 +286,23 @@ std::vector<Point3i> rod_joint_3d_similarity_inverse(const RodJoint3DSimResult& 
     points[0] = r.anchor;
     if (r.count < 2) return points;
 
-    i32 prev_x = 0, prev_y = 0, prev_z = 0;
-    for (size_t i = 0; i < r.count - 1; i++) {
+    size_t nrods = (size_t)r.count - 1;
+    u32 lag = r.lag;
+    std::vector<i32> ex(nrods), ey(nrods), ez(nrods);
+    for (size_t i = 0; i < nrods; i++) {
         size_t blk = i / kRodJoint3DBlockSize;
         const std::array<i64, 9>& M = r.block_matrix[blk];
+        i32 prev_x = (i >= lag) ? ex[i - lag] : 0;
+        i32 prev_y = (i >= lag) ? ey[i - lag] : 0;
+        i32 prev_z = (i >= lag) ? ez[i - lag] : 0;
         i32 px, py, pz;
         mat3_mul_round(M, prev_x, prev_y, prev_z, px, py, pz);
-        i32 ex = px + r.residual_x[i];
-        i32 ey = py + r.residual_y[i];
-        i32 ez = pz + r.residual_z[i];
-        points[i + 1].x = points[i].x + ex;
-        points[i + 1].y = points[i].y + ey;
-        points[i + 1].z = points[i].z + ez;
-        prev_x = ex;
-        prev_y = ey;
-        prev_z = ez;
+        ex[i] = px + r.residual_x[i];
+        ey[i] = py + r.residual_y[i];
+        ez[i] = pz + r.residual_z[i];
+        points[i + 1].x = points[i].x + ex[i];
+        points[i + 1].y = points[i].y + ey[i];
+        points[i + 1].z = points[i].z + ez[i];
     }
     return points;
 }

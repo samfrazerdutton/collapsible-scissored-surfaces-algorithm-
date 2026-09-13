@@ -114,10 +114,26 @@ costs compression ratio -- the residual is still `actual - predicted`,
 computed identically on encode and decode, so correctness never depends
 on it.
 
-See `BENCHMARKS.md` for what these models win and where they still fall
-short (toroidal paths, whose xy-radius itself oscillates roughly every 3
-samples -- far faster than any per-block calibration, even the true 3D
-joint's, can track).
+**Predicting from `rod[i-lag]`, not always `rod[i-1]`.** A toroidal
+cross-section's xy-radius oscillates roughly every 3 rods -- far faster
+than any calibration block (even recalibrated every 128 rods) predicting
+from the *immediately preceding* rod could ever track, no matter how good
+the rotation+scale fit is. The fix isn't a richer per-block model; it's
+recognizing that "predict from `rod[i-1]`" was an unnecessary assumption.
+Both `rod_joint_2d_forward` and `rod_joint_3d_similarity_forward` take a
+`lag` parameter: rod `i` is predicted from rod `i-lag` (the calibration
+math is unchanged, just re-indexed). `compress_geo2d`/`compress_geo3d`
+(in `codec.cpp`) search `kRodJointCandidateLags` = {1, 2, 3, 4, 5, 6, 7, 8,
+10, 12, 16, 20, 24, 32} and keep whichever lag actually encodes smallest —
+each candidate is a full, cheap encode (a few thousand points takes
+milliseconds), so comparing true output size beats guessing from a
+residual-magnitude proxy. This is the same idea as long-term/pitch
+prediction in speech and audio codecs, applied to rod sequences instead
+of waveform samples. For `toroidal.xyz`, lag 3 aligns almost exactly with
+the oscillation period and turns a 15%-smaller loss against lzma into a
+32%-smaller win (see `BENCHMARKS.md`); every other shape ticked up
+slightly too, since lag=1 usually isn't *exactly* optimal even when it's
+close.
 
 ### 3. Entropy backend: adaptive order-1 range coder (`include/csa/range_coder.hpp`)
 
@@ -179,6 +195,16 @@ regardless of how many decomposition levels the input has.
    Pinned (page-locked) host staging buffers make the handful of final
    bulk transfers faster than the pageable `std::vector` storage an
    earlier version copied into directly.
+5. **Tail hand-off to CPU**: past `kGpuTailCutoff` (65536 elements), a
+   level's total work is too small for three more kernel launches' fixed
+   dispatch overhead to pay for itself. Once a level's array shrinks to
+   that size, the GPU loop stops, the array is copied back once, and the
+   remaining (small) levels are computed by the ordinary CPU
+   `pantograph_lift_forward` — the *same* transform, just finishing on
+   the device better suited to a workload that small. `pantograph_lift_
+   inverse` doesn't need to know or care which device produced which
+   level; it just needs `residuals`/`block_ratios`/`block_offsets` present
+   and in order, which this hand-off preserves by simple concatenation.
 
 This mirrors the GPU-resident philosophy from this repo owner's other CUDA
 projects (a GPU-resident CKKS homomorphic-encryption library, and a
@@ -197,14 +223,22 @@ either way. Headline findings from that file:
   cost (~1.2s on this machine) independent of input size — a genuine
   reason a single ad-hoc `--gpu` call on one small file can look far
   slower than the CPU path.
-- Once warm, GPU vs. CPU transform time converges steadily as input size
-  grows: from ~0.01x (128x slower) at 100K elements to ~0.8-0.98x (roughly
-  parity, varying run to run) at 256M elements, the largest size that
-  reliably fits this card's 6GB VRAM. The CPU path was still faster at
-  every size actually tested here — an honest negative result, reported
-  because it's what was measured, not because it's the fun answer. A GPU
-  with more VRAM (to test past ~256M elements) or higher memory bandwidth
-  could plausibly cross over; that is future work, not a claim made here.
+- Comparing a fresh `scissorc` process per measurement (paying its own
+  allocation, and the wake cost if the GPU had idled), GPU vs. CPU time
+  converges steadily as input size grows, from ~0.01x (128x slower) at
+  100K elements to ~0.6-0.8x at 256M elements — the CPU path was still
+  faster at every size tested this way.
+- That one-shot-per-process comparison understates real deployment,
+  though: a service handling many requests runs from one long-lived
+  process, not one process per input. Measuring that directly (`scissorc
+  bench-transform <n> --repeat N`, same warm CUDA context and GPU clock
+  state across calls, reporting steady-state average of calls 2+) tells a
+  materially different story — GPU reaches **~0.98-1.00x of CPU time at
+  16M-256M elements, and outright wins at 64M** in the runs recorded in
+  `GPU_BENCHMARKS.md`. This is genuine parity for a mid-range laptop GPU
+  against a modern CPU on a task CPUs are naturally efficient at (simple,
+  cache-friendly, branch-predictable sequential array passes) — reported
+  as measured, not oversold as a definitive win everywhere.
 - A one-off probe past the practical VRAM ceiling (400M elements) hit a
   genuine CUDA resource error, and the `pantograph_lift_forward_cuda` →
   automatic CPU fallback path handled it transparently — the
@@ -213,13 +247,11 @@ either way. Headline findings from that file:
 
 ## Honest limitations / future work
 
-- **Toroidal-style paths** (where the rod magnitude itself oscillates, not
-  just its direction) aren't well modeled by a single rotation+scale
-  joint, even recalibrated -- not even by the true 3D similarity joint,
-  since the oscillation period here (~3 samples) is far shorter than any
-  reasonable calibration block. A genuine fix needs either a richer
-  per-block model (e.g. a second harmonic term) or accepting that this
-  shape class is out of scope for a "small parameter set" model.
+- **Per-block lag search** (rather than one global lag per file) would
+  help paths whose oscillation period itself drifts over the sequence --
+  currently `compress_geo2d`/`compress_geo3d` pick one lag for the whole
+  file. This is the natural next step if a real-world dataset shows a
+  period that changes partway through.
 - **Interleaved-stream rANS** would let the entropy-coding stage itself
   run in parallel on GPU (unlike the current sequential adaptive range
   coder), closing the loop on an end-to-end GPU-resident codec.

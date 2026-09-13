@@ -163,29 +163,43 @@ bool pantograph_lift_forward_cuda(const std::vector<i32>& input, LiftResult& out
     for (size_t i = 0; i < input.size(); i++) host_padded[i] = input[i];
     for (size_t i = input.size(); i < padded_len; i++) host_padded[i] = input.back();
 
-    // Precompute the whole level structure up front: pair counts, block
-    // counts, and this level's offset into the flat residual/param
-    // buffers. Purely host-side bookkeeping, deterministic from
-    // padded_len, mirroring the same derivation codec.cpp uses on decode.
+    // Precompute the whole level structure up front: pair counts and block
+    // counts for every level, deterministic from padded_len (mirroring the
+    // same derivation codec.cpp uses on decode).
     size_t num_levels = 0;
     for (size_t n = padded_len; n > 1; n /= 2) num_levels++;
 
     std::vector<size_t> level_pairs(num_levels), level_blocks(num_levels);
-    std::vector<size_t> level_resid_off(num_levels), level_param_off(num_levels);
-    size_t total_residuals = 0, total_blocks = 0, max_blocks_any_level = 0;
     {
         size_t half = padded_len / 2;
         for (size_t lvl = 0; lvl < num_levels; lvl++) {
-            size_t nb = (half + kPantographBlockSize - 1) / kPantographBlockSize;
             level_pairs[lvl] = half;
-            level_blocks[lvl] = nb;
-            level_resid_off[lvl] = total_residuals;
-            level_param_off[lvl] = total_blocks;
-            total_residuals += half;
-            total_blocks += nb;
-            if (nb > max_blocks_any_level) max_blocks_any_level = nb;
+            level_blocks[lvl] = (half + kPantographBlockSize - 1) / kPantographBlockSize;
             half /= 2;
         }
+    }
+
+    // Past a certain point, a level's total work is too small for three
+    // more kernel launches' fixed dispatch overhead to pay for itself --
+    // the tail of levels below kGpuTailCutoff elements is handed off to
+    // the CPU path instead (already independently tested), rather than
+    // paying that overhead many times over on levels doing almost no
+    // work. This is a hand-off of *data*, not of the algorithm: the CPU
+    // path recursively runs the identical Pantograph Lift on whatever
+    // array the GPU stopped at, and its levels are simply appended after
+    // the GPU-produced ones.
+    constexpr size_t kGpuTailCutoff = 65536;
+    size_t gpu_levels = 0;
+    while (gpu_levels < num_levels && level_pairs[gpu_levels] * 2 > kGpuTailCutoff) gpu_levels++;
+
+    std::vector<size_t> level_resid_off(gpu_levels), level_param_off(gpu_levels);
+    size_t total_residuals = 0, total_blocks = 0, max_blocks_any_level = 0;
+    for (size_t lvl = 0; lvl < gpu_levels; lvl++) {
+        level_resid_off[lvl] = total_residuals;
+        level_param_off[lvl] = total_blocks;
+        total_residuals += level_pairs[lvl];
+        total_blocks += level_blocks[lvl];
+        if (level_blocks[lvl] > max_blocks_any_level) max_blocks_any_level = level_blocks[lvl];
     }
 
     int* bufA_d = nullptr;
@@ -201,6 +215,9 @@ bool pantograph_lift_forward_cuda(const std::vector<i32>& input, LiftResult& out
     long long* ratios_pinned = nullptr;
     i32* offsets_pinned = nullptr;
     bool ok = false;
+    LiftResult tail; // populated later if gpu_levels < num_levels; declared here
+                     // (before any goto-capable CUDA_OK call) so the jump to
+                     // cuda_fail on an early failure doesn't skip its init.
 
     // A single-element input has num_levels == 0, making several of these
     // sizes 0; cudaMalloc(0) is not reliably well-defined across CUDA
@@ -223,7 +240,7 @@ bool pantograph_lift_forward_cuda(const std::vector<i32>& input, LiftResult& out
     {
         int* cur_d = bufA_d;
         int* next_d = bufB_d;
-        for (size_t lvl = 0; lvl < num_levels; lvl++) {
+        for (size_t lvl = 0; lvl < gpu_levels; lvl++) {
             size_t half = level_pairs[lvl];
             size_t nblocks = level_blocks[lvl];
             long long* ratios_here = ratios_d + level_param_off[lvl];
@@ -250,9 +267,16 @@ bool pantograph_lift_forward_cuda(const std::vector<i32>& input, LiftResult& out
             next_d = tmp;
         }
 
-        i32 base_value = 0;
-        CUDA_OK(cudaMemcpy(&base_value, cur_d, sizeof(int), cudaMemcpyDeviceToHost));
-        out.base.push_back(base_value);
+        if (gpu_levels < num_levels) {
+            size_t tail_size = (gpu_levels > 0) ? level_pairs[gpu_levels - 1] : padded_len;
+            std::vector<i32> tail_host(tail_size);
+            CUDA_OK(cudaMemcpy(tail_host.data(), cur_d, tail_size * sizeof(int), cudaMemcpyDeviceToHost));
+            tail = pantograph_lift_forward(tail_host);
+        } else {
+            i32 base_value = 0;
+            CUDA_OK(cudaMemcpy(&base_value, cur_d, sizeof(int), cudaMemcpyDeviceToHost));
+            out.base.push_back(base_value);
+        }
     }
 
     // Pinned (page-locked) host staging buffers make the final bulk
@@ -265,10 +289,10 @@ bool pantograph_lift_forward_cuda(const std::vector<i32>& input, LiftResult& out
     CUDA_OK(cudaMemcpy(ratios_pinned, ratios_d, total_blocks * sizeof(long long), cudaMemcpyDeviceToHost));
     CUDA_OK(cudaMemcpy(offsets_pinned, offsets_d, total_blocks * sizeof(i32), cudaMemcpyDeviceToHost));
 
-    out.residuals.resize(num_levels);
-    out.block_ratios.resize(num_levels);
-    out.block_offsets.resize(num_levels);
-    for (size_t lvl = 0; lvl < num_levels; lvl++) {
+    out.residuals.resize(gpu_levels);
+    out.block_ratios.resize(gpu_levels);
+    out.block_offsets.resize(gpu_levels);
+    for (size_t lvl = 0; lvl < gpu_levels; lvl++) {
         out.residuals[lvl].assign(residual_pinned + level_resid_off[lvl],
                                    residual_pinned + level_resid_off[lvl] + level_pairs[lvl]);
         out.block_offsets[lvl].assign(offsets_pinned + level_param_off[lvl],
@@ -276,6 +300,17 @@ bool pantograph_lift_forward_cuda(const std::vector<i32>& input, LiftResult& out
         out.block_ratios[lvl].resize(level_blocks[lvl]);
         for (size_t b = 0; b < level_blocks[lvl]; b++)
             out.block_ratios[lvl][b] = (i64)ratios_pinned[level_param_off[lvl] + b];
+    }
+
+    // Append the CPU-computed tail levels (if any) after the GPU ones,
+    // and adopt its base value -- pantograph_lift_inverse doesn't care
+    // which device produced which level, only that residuals/ratios/
+    // offsets/base are present and in the right order, which this is.
+    if (gpu_levels < num_levels) {
+        for (auto& lvl_res : tail.residuals) out.residuals.push_back(std::move(lvl_res));
+        for (auto& lvl_r : tail.block_ratios) out.block_ratios.push_back(std::move(lvl_r));
+        for (auto& lvl_o : tail.block_offsets) out.block_offsets.push_back(std::move(lvl_o));
+        out.base = tail.base;
     }
 
     ok = true;

@@ -16,6 +16,7 @@
 // 3 decimal digits of precision).
 #include "csa/codec.hpp"
 #include "csa/pantograph_lift_cuda.hpp"
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <fstream>
@@ -171,26 +172,56 @@ int cmd_info(const std::string& path) {
 // compress(), so CPU-vs-GPU timing reflects the actual thing the CUDA
 // kernel accelerates rather than being diluted by a stage neither path
 // speeds up.
-int cmd_bench_transform(size_t n, bool gpu) {
+//
+// --repeat N runs N calls in the same process (same warm CUDA context,
+// same driver/GPU clock state) and reports the first call separately from
+// the rest: the first pays whatever one-time wake/context-creation cost
+// the GPU owes (see GPU_BENCHMARKS.md), while calls 2..N show the
+// steady-state per-call cost of this library's actual contract --
+// pantograph_lift_forward_cuda allocates and frees its own device buffers
+// every call, so this still isn't the best case a long-lived service
+// reusing buffers across calls could achieve, but it is what today's API
+// actually delivers under sustained use, measured honestly rather than
+// assumed.
+int cmd_bench_transform(size_t n, bool gpu, int repeat) {
     std::vector<i32> data(n);
     for (size_t i = 0; i < n; i++) {
         data[i] = (i32)(1000.0 * std::sin((double)i * 0.001) + (double)(i % 7));
     }
 
-    auto t0 = std::chrono::steady_clock::now();
-    LiftResult lr;
+    std::vector<double> times_ms;
     bool used_gpu = false;
-    if (gpu) {
-        used_gpu = pantograph_lift_forward_cuda(data, lr);
-        if (!used_gpu) lr = pantograph_lift_forward(data);
-    } else {
-        lr = pantograph_lift_forward(data);
+    for (int rep = 0; rep < repeat; rep++) {
+        auto t0 = std::chrono::steady_clock::now();
+        LiftResult lr;
+        if (gpu) {
+            used_gpu = pantograph_lift_forward_cuda(data, lr);
+            if (!used_gpu) lr = pantograph_lift_forward(data);
+        } else {
+            lr = pantograph_lift_forward(data);
+        }
+        auto t1 = std::chrono::steady_clock::now();
+        times_ms.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
     }
-    auto t1 = std::chrono::steady_clock::now();
-    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
+    if (repeat == 1) {
+        std::cout << "bench-transform: n=" << n << " gpu_requested=" << (gpu ? "yes" : "no")
+                  << " gpu_used=" << (used_gpu ? "yes" : "no") << " time_ms=" << times_ms[0] << "\n";
+        return 0;
+    }
+
+    double rest_sum = 0.0, rest_min = times_ms[1];
+    for (int i = 1; i < repeat; i++) {
+        rest_sum += times_ms[i];
+        rest_min = std::min(rest_min, times_ms[i]);
+    }
+    double rest_avg = rest_sum / (double)(repeat - 1);
     std::cout << "bench-transform: n=" << n << " gpu_requested=" << (gpu ? "yes" : "no")
-              << " gpu_used=" << (used_gpu ? "yes" : "no") << " time_ms=" << ms << "\n";
+              << " gpu_used=" << (used_gpu ? "yes" : "no")
+              << " first_ms=" << times_ms[0]
+              << " rest_avg_ms=" << rest_avg
+              << " rest_min_ms=" << rest_min
+              << " repeat=" << repeat << "\n";
     return 0;
 }
 
@@ -204,7 +235,7 @@ void usage() {
         "  scissorc compress-geo3d <in.xyz> <out> [--scale N]\n"
         "  scissorc decompress-geo3d <in> <out.xyz>\n"
         "  scissorc info <file>\n"
-        "  scissorc bench-transform <n> [--gpu]\n";
+        "  scissorc bench-transform <n> [--gpu] [--repeat N]\n";
 }
 
 } // namespace
@@ -234,8 +265,14 @@ int main(int argc, char** argv) {
             return cmd_info(argv[2]);
         } else if (cmd == "bench-transform" && argc >= 3) {
             size_t n = (size_t)std::stoull(argv[2]);
-            bool gpu = (argc >= 4 && std::string(argv[3]) == "--gpu");
-            return cmd_bench_transform(n, gpu);
+            bool gpu = false;
+            int repeat = 1;
+            for (int i = 3; i < argc; i++) {
+                std::string a = argv[i];
+                if (a == "--gpu") gpu = true;
+                else if (a == "--repeat" && i + 1 < argc) repeat = std::stoi(argv[++i]);
+            }
+            return cmd_bench_transform(n, gpu, repeat);
         }
     } catch (const std::exception& e) {
         std::cerr << "error: " << e.what() << "\n";

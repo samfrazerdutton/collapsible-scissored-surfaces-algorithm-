@@ -129,6 +129,7 @@ void serialize_geo2d(const RodJoint2DResult& r, std::vector<u8>& out) {
     put_u64(out, r.count);
     put_i32(out, r.anchor.x);
     put_i32(out, r.anchor.y);
+    put_u32(out, r.lag);
 
     std::vector<u8> flat;
     for (i64 v : r.block_ratio_re) write_varint(flat, zigzag_encode64(v));
@@ -146,6 +147,7 @@ RodJoint2DResult deserialize_geo2d(const u8* data, size_t size, size_t& pos) {
     r.count = get_u64(data, size, pos);
     r.anchor.x = get_i32(data, size, pos);
     r.anchor.y = get_i32(data, size, pos);
+    r.lag = get_u32(data, size, pos);
 
     u64 raw_len = get_u64(data, size, pos);
     u64 coded_len = get_u64(data, size, pos);
@@ -187,6 +189,7 @@ void serialize_geo3d_sim(const RodJoint3DSimResult& r, std::vector<u8>& out) {
     put_i32(out, r.anchor.x);
     put_i32(out, r.anchor.y);
     put_i32(out, r.anchor.z);
+    put_u32(out, r.lag);
 
     std::vector<u8> flat;
     for (const auto& m : r.block_matrix)
@@ -206,6 +209,7 @@ RodJoint3DSimResult deserialize_geo3d_sim(const u8* data, size_t size, size_t& p
     r.anchor.x = get_i32(data, size, pos);
     r.anchor.y = get_i32(data, size, pos);
     r.anchor.z = get_i32(data, size, pos);
+    r.lag = get_u32(data, size, pos);
 
     u64 raw_len = get_u64(data, size, pos);
     u64 coded_len = get_u64(data, size, pos);
@@ -284,11 +288,23 @@ std::vector<u8> decompress(const std::vector<u8>& blob) {
 }
 
 std::vector<u8> compress_geo2d(const std::vector<Point2i>& points) {
-    RodJoint2DResult r = rod_joint_2d_forward(points);
-    std::vector<u8> out;
-    write_magic_mode(out, Mode::Geo2D);
-    serialize_geo2d(r, out);
-    return out;
+    // Search a small set of candidate lags (rod[i] predicted from
+    // rod[i-lag] instead of always rod[i-1]) and keep whichever actually
+    // encodes smallest -- a path whose curvature oscillates faster than
+    // any calibration block (e.g. a toroidal cross-section's radius) can
+    // need a lag other than 1 to be predictable at all. Each candidate is
+    // a full, cheap encode (points here are a few thousand at most), so
+    // trying kRodJointNumCandidateLags of them and comparing true encoded
+    // size is more honest than a residual-magnitude proxy.
+    std::vector<u8> best;
+    for (u32 lag : kRodJointCandidateLags) {
+        RodJoint2DResult r = rod_joint_2d_forward(points, lag);
+        std::vector<u8> out;
+        write_magic_mode(out, Mode::Geo2D);
+        serialize_geo2d(r, out);
+        if (best.empty() || out.size() < best.size()) best = std::move(out);
+    }
+    return best;
 }
 
 std::vector<Point2i> decompress_geo2d(const std::vector<u8>& blob) {
@@ -307,20 +323,33 @@ std::vector<Point2i> decompress_geo2d(const std::vector<u8>& blob) {
 enum class Geo3DSubMode : u8 { Composition = 0, Similarity3D = 1 };
 
 std::vector<u8> compress_geo3d(const std::vector<Point3i>& points) {
-    RodJoint3DResult comp = rod_joint_3d_forward(points);
-    std::vector<u8> comp_out;
-    write_magic_mode(comp_out, Mode::Geo3D);
-    comp_out.push_back((u8)Geo3DSubMode::Composition);
-    serialize_geo2d(comp.xy, comp_out);
-    serialize_lift(comp.lift_z, comp_out);
+    // Each model also searches candidate lags internally (see
+    // compress_geo2d's comment) before the two models are compared --
+    // a path whose xy-radius or 3D curvature oscillates faster than any
+    // calibration block needs a lag other than 1 to be predictable by
+    // either model at all.
+    std::vector<u8> comp_best;
+    for (u32 lag : kRodJointCandidateLags) {
+        RodJoint3DResult comp = rod_joint_3d_forward(points, lag);
+        std::vector<u8> out;
+        write_magic_mode(out, Mode::Geo3D);
+        out.push_back((u8)Geo3DSubMode::Composition);
+        serialize_geo2d(comp.xy, out);
+        serialize_lift(comp.lift_z, out);
+        if (comp_best.empty() || out.size() < comp_best.size()) comp_best = std::move(out);
+    }
 
-    RodJoint3DSimResult sim = rod_joint_3d_similarity_forward(points);
-    std::vector<u8> sim_out;
-    write_magic_mode(sim_out, Mode::Geo3D);
-    sim_out.push_back((u8)Geo3DSubMode::Similarity3D);
-    serialize_geo3d_sim(sim, sim_out);
+    std::vector<u8> sim_best;
+    for (u32 lag : kRodJointCandidateLags) {
+        RodJoint3DSimResult sim = rod_joint_3d_similarity_forward(points, lag);
+        std::vector<u8> out;
+        write_magic_mode(out, Mode::Geo3D);
+        out.push_back((u8)Geo3DSubMode::Similarity3D);
+        serialize_geo3d_sim(sim, out);
+        if (sim_best.empty() || out.size() < sim_best.size()) sim_best = std::move(out);
+    }
 
-    return (sim_out.size() < comp_out.size()) ? sim_out : comp_out;
+    return (sim_best.size() < comp_best.size()) ? sim_best : comp_best;
 }
 
 std::vector<Point3i> decompress_geo3d(const std::vector<u8>& blob) {

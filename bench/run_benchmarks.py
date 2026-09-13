@@ -192,12 +192,19 @@ def main():
         "pushing helix to beating lzma by ~12x.\n"
     )
     lines.append(
-        "- `toroidal.xyz` is the honest counterexample, and neither model fixes "
-        "it: its (x,y) magnitude itself oscillates (a wobbling radius) roughly "
-        "every 3 samples, far faster than any calibration block (128 rods) can "
-        "track, so lzma's dictionary matching still wins there. That's a real, "
-        "current limitation of a small-per-block-parameter model, not a "
-        "benchmark artifact -- see DESIGN.md.\n"
+        "- `toroidal.xyz` used to be the one honest loss in this table: its "
+        "(x,y) magnitude oscillates (a wobbling radius) roughly every 3 "
+        "samples, far faster than any calibration block (128 rods) predicting "
+        "from the immediately preceding rod could track. The fix wasn't a "
+        "better rotation/scale fit -- it was recognizing that 'predict from "
+        "rod[i-1]' is the wrong assumption for a periodic path. Both Geo3D "
+        "models now search a small set of candidate lags (predict rod[i] from "
+        "rod[i-lag] for lag in {1,2,3,...,32}) and keep whichever actually "
+        "encodes smallest; lag 3 aligns almost exactly with this shape's "
+        "oscillation period, and toroidal now beats lzma outright. The same "
+        "lag search applies to every Rod-Joint encode, which is why spiral and "
+        "helix also ticked up slightly even though lag=1 was already close to "
+        "optimal for them -- see DESIGN.md for the mechanism.\n"
     )
     lines.append(
         "- `random_walk.xy` is the deliberate adversarial case: consecutive rods have "

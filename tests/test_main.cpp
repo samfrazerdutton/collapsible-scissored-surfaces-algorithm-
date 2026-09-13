@@ -408,6 +408,42 @@ static void test_geo3d_codec_autoselect() {
     CHECK(helix_blob.size() > 5);
 }
 
+// Regression guard for the lag-search fix: a toroidal-style path (radius
+// oscillating roughly every 3 rods) is a case a lag=1-only predictor
+// handles poorly no matter how good its rotation/scale fit is -- the real
+// fix was searching a small set of candidate lags and keeping whichever
+// actually encodes smallest. This pins down that the search keeps working,
+// not just that toroidal-like data round-trips.
+static void test_geo3d_lag_search_toroidal() {
+    std::vector<Point3i> toroidal;
+    double R = 800.0, r = 250.0;
+    for (int i = 0; i < 3000; i++) {
+        double u = i * 0.31;
+        double v = i * 2.05;
+        double x = (R + r * std::cos(v)) * std::cos(u);
+        double y = (R + r * std::cos(v)) * std::sin(u);
+        double z = r * std::sin(v);
+        toroidal.push_back({(i32)std::lround(x * 1000), (i32)std::lround(y * 1000), (i32)std::lround(z * 1000)});
+    }
+
+    auto blob = compress_geo3d(toroidal);
+    auto back = decompress_geo3d(blob);
+    CHECK(back.size() == toroidal.size());
+    bool match = true;
+    for (size_t i = 0; i < toroidal.size(); i++)
+        if (back[i].x != toroidal[i].x || back[i].y != toroidal[i].y || back[i].z != toroidal[i].z)
+            match = false;
+    CHECK(match);
+
+    // With lag=1 forced, this shape only compresses to roughly 85% of the
+    // packed-integer raw size (an honest loss against general compressors,
+    // as originally measured). The lag search should do meaningfully
+    // better -- comfortably under 75% -- or this regressed back to lag=1
+    // behavior in practice.
+    size_t raw_packed = toroidal.size() * 3 * sizeof(i32);
+    CHECK(blob.size() < raw_packed * 3 / 4);
+}
+
 int main() {
     test_range_coder();
     test_pantograph_lift();
@@ -416,6 +452,7 @@ int main() {
     test_rod_joint_3d_similarity();
     test_codec();
     test_geo_codec();
+    test_geo3d_lag_search_toroidal();
     test_geo3d_codec_autoselect();
 
     std::printf("%d checks, %d failures\n", g_checks, g_failures);
