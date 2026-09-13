@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net5.0</TargetFramework>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Csa\Csa.csproj" />
+  </ItemGroup>
+
+  <!-- csa.dll must sit next to this project's own executable too:
+       DllImport resolves relative to the running assembly's directory,
+       not the referenced Csa library project's output directory. -->
+  <Target Name="CopyCsaNativeLibrary" AfterTargets="Build">
+    <PropertyGroup>
+      <_CsaLibPath Condition="'$(CSA_LIB_PATH)' != ''">$(CSA_LIB_PATH)</_CsaLibPath>
+      <_CsaLibPath Condition="'$(_CsaLibPath)' == ''">$(MSBuildThisFileDirectory)..\..\..\build\csa.dll</_CsaLibPath>
+    </PropertyGroup>
+    <Copy SourceFiles="$(_CsaLibPath)" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true"
+          Condition="Exists('$(_CsaLibPath)')" />
+  </Target>
+
+</Project>

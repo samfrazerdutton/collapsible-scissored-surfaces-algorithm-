@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net5.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <RootNamespace>Csa</RootNamespace>
+    <!-- The managed assembly can't be named Csa.dll: it would collide
+         case-insensitively with the native csa.dll on Windows once both
+         land in the same output directory (a real bug caught while
+         building this binding: BadImageFormatException, because the
+         native DLL silently overwrote or got loaded in place of the
+         managed one). The namespace stays Csa for ergonomic `using Csa;`. -->
+    <AssemblyName>CsaSharp</AssemblyName>
+  </PropertyGroup>
+
+  <!-- csa.dll is a native dependency built by the C++/CMake side of this
+       repo, not a NuGet package; DllImport only finds it if it's next to
+       the assembly that P/Invokes it (or on PATH), so copy it into the
+       build output the same way bindings/rust/build.rs does for cargo.
+       CSA_LIB_PATH overrides the default ../../../build/csa.dll location,
+       mirroring the Python and Rust bindings' discovery rule. -->
+  <Target Name="CopyCsaNativeLibrary" AfterTargets="Build">
+    <PropertyGroup>
+      <_CsaLibPath Condition="'$(CSA_LIB_PATH)' != ''">$(CSA_LIB_PATH)</_CsaLibPath>
+      <_CsaLibPath Condition="'$(_CsaLibPath)' == ''">$(MSBuildThisFileDirectory)..\..\..\build\csa.dll</_CsaLibPath>
+    </PropertyGroup>
+    <Copy SourceFiles="$(_CsaLibPath)" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true"
+          Condition="Exists('$(_CsaLibPath)')" />
+  </Target>
+
+</Project>

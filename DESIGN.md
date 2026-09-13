@@ -391,6 +391,46 @@ round-trip, 2D and 3D lossy bounded-error checks, error-path handling) and
 runs via `cargo test` against the real library, the same testing
 discipline as the Python and C-ABI test suites.
 
+`bindings/csharp/` (a `Csa` class library plus a `Csa.Tests` console app)
+does the same via P/Invoke. One real bug surfaced building it: the managed
+assembly can't be named `Csa.dll`, because it collides case-insensitively
+with the native `csa.dll` once both land in the same build output
+directory on Windows -- whichever one the loader picked up second would
+either overwrite the other on disk or get loaded in its place, and the
+actual failure mode was a `BadImageFormatException` when the CLR tried to
+read the native DLL's bytes as a managed assembly. Fixed by setting
+`<AssemblyName>CsaSharp</AssemblyName>` (the C# namespace stays `Csa` for
+ergonomic `using Csa;`) -- a namespace and a native library sharing an
+on-disk name is a real, project-specific gotcha worth documenting, not
+just working around silently.
+
+`bindings/go/` is the most different of the four: this environment has no
+C compiler available (no MinGW-w64 gcc; a chocolatey install attempt
+failed on a sandbox permissions error), so `cgo` -- the usual way Go binds
+to a C library -- isn't an option here. Instead it calls into `csa.dll`
+directly via `syscall.LoadDLL`/`Proc.Call`, the same mechanism the Go
+standard library itself uses for arbitrary Windows DLLs (no C compiler or
+static linking against the MSVC-built import library required at all,
+which sidesteps the cross-toolchain MSVC-vs-MinGW `.lib` compatibility
+problems a cgo build would have hit anyway). The one genuinely tricky part
+this technique exposes directly: `csa_buffer` is 16 bytes and returned
+*by value*, and the Microsoft x64 calling convention returns any such
+"non-trivial" struct via a **hidden pointer** passed as an implicit first
+argument (the caller allocates the 16 bytes and passes its address; the
+callee writes `{data, size}` there) -- every buffer-returning call in
+`bindings/go/csa/csa.go` passes that hidden pointer as `args[0]` before
+the function's real arguments. This is exactly the kind of ABI detail a C
+compiler normally handles invisibly; getting it right by hand was
+verified by cross-checking output byte-for-byte against the Rust/C#/Python
+bindings on identical inputs (all four report the same compressed sizes
+on the same test data), not just by the Go tests passing in isolation.
+`go vet` still flags one `uintptr`-to-`unsafe.Pointer` conversion in
+`goStringFromCStr` as a possible misuse -- documented in code as a known,
+reviewed false positive (the address in question is a `syscall.Proc.Call`
+return value pointing into libcsa's C heap, never Go-GC-managed memory in
+the first place, so the moving-GC hazard that rule exists to prevent
+doesn't apply), not a bug.
+
 ## GPU acceleration (`cuda/pantograph_lift_cuda.cu`)
 
 The Pantograph Lift's per-level transform is embarrassingly parallel: given
@@ -547,12 +587,12 @@ smaller call's result).
   composition** (see the lossy-mode section above) -- extending the
   composition's z-axis Pantograph Lift to support quantization too would
   close that gap, at the cost of another lossy code path to maintain.
-- **C#/Go bindings** on top of the same C ABI (`csa_capi.h`) that the
-  Python and Rust bindings already use -- the hard prerequisite (a stable,
-  no-C++-types-crossing-the-boundary interface) now exists; generating
-  each additional language's wrapper is comparatively mechanical
-  (`P/Invoke` for C#, `cgo` for Go) but each is still real, untrivial work
-  that hasn't been done.
+- **A Go build tag for non-Windows platforms** -- `bindings/go/` currently
+  only implements `dll_windows.go` (this environment had no C compiler
+  available to build a portable `cgo` version); a `cgo`-based
+  `dll_unix.go` behind a `//go:build !windows` tag, or a `purego`-based
+  one to stay cgo-free everywhere, would extend it to Linux/macOS's
+  `.so`/`.dylib` without changing `csa.go`'s public API at all.
 - **A genuinely cross-vendor GPU backend** (Vulkan Compute, WebGPU, or
   similar) would let the parallel block-coding kernels run on non-NVIDIA
   hardware and non-Windows/Linux platforms (macOS/Metal, mobile, WASM).

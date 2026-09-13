@@ -9,3 +9,6 @@ bench/_tmp/
 __pycache__/
 bindings/rust/target/
 Cargo.lock
+bindings/csharp/**/bin/
+bindings/csharp/**/obj/
+bindings/go/**/*.exe

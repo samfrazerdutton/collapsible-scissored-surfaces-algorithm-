@@ -57,9 +57,12 @@ unmodified C++ source code, not text written for this project -- and
   `DESIGN.md`).
 - **A stable C ABI** (`include/csa/csa_capi.h`, built as `csa.dll` /
   `libcsa.so` / `libcsa.dylib`) with no C++ types crossing the boundary,
-  plus **Python `ctypes`** (`bindings/python/csa.py`) and **Rust FFI**
-  (`bindings/rust/`) bindings on top of it -- both tested end-to-end
-  against the actual built shared library, not mocked.
+  plus **Python `ctypes`** (`bindings/python/`), **Rust FFI**
+  (`bindings/rust/`), **C# P/Invoke** (`bindings/csharp/`), and **Go**
+  (`bindings/go/`, via `syscall.LoadDLL` -- no C compiler needed)
+  bindings on top of it -- all four tested end-to-end against the actual
+  built shared library, not mocked, and cross-checked against each other
+  (same input, same output size, across all four languages).
 - **CUDA kernel** for the Pantograph Lift's forward transform (genuinely
   parallel: every pair within a decomposition level is independent),
   GPU-resident across the whole multi-level pass (one upload, a handful of
@@ -127,6 +130,12 @@ python -c "import sys; sys.path.insert(0, 'bindings/python'); import csa; print(
 
 # Rust bindings (FFI, on top of the same C ABI)
 cd bindings/rust && cargo test
+
+# C# bindings (P/Invoke, on top of the same C ABI)
+cd bindings/csharp/Csa.Tests && dotnet run
+
+# Go bindings (syscall.LoadDLL, on top of the same C ABI; Windows only for now)
+cd bindings/go/csa && go test ./...
 ```
 
 ## Headline results
@@ -228,6 +237,9 @@ src/              CPU implementation (+ csa_capi.cpp, the C ABI shim)
 cuda/             CUDA kernel (built only if a CUDA compiler is found)
 cli/              scissorc command-line tool
 bindings/python/  ctypes bindings (csa.py) + test_bindings.py, on the C ABI
+bindings/rust/    FFI bindings (extern "C") + cargo test, on the C ABI
+bindings/csharp/  P/Invoke bindings (Csa/) + Csa.Tests console app, on the C ABI
+bindings/go/      syscall.LoadDLL bindings (Windows only) + go test, on the C ABI
 tests/            round-trip test suite (test_main.cpp) + C-ABI test that
                   links the real shared library (test_capi.cpp), no external deps
 bench/            dataset generator + benchmark runner (writes BENCHMARKS.md)
