@@ -27,6 +27,25 @@ size_t match_length(const u8* a, const u8* b, size_t max_len) {
 // instead -- a small amount of lookahead that meaningfully improves ratio
 // over pure greedy longest-match-first, for a bounded amount of extra
 // work (one extra search per position, not a recursive lookahead chain).
+//
+// An experiment tried here and reverted: selecting matches by an
+// estimated encoded-bit cost (bytes covered per bit, favoring a much
+// closer but slightly shorter match over a farther, marginally longer
+// one) instead of pure greedy-longest. It measurably helped on some real
+// data (real source code: ~0.8-0.9% smaller at every speed level; a
+// synthetic numeric CSV use case: ~5.7% smaller) but measurably *hurt*
+// on other realistic data (a synthetic server-log use case: ~7.4%
+// *larger*; JSON telemetry events: ~2.1% larger) -- a real, honest,
+// mixed result, not a net win. The likely cause: the cost estimate is
+// evaluated greedily per candidate with no visibility into how the
+// choice affects the cost of whatever comes *after* it, so on
+// template-like repeated data (e.g. a log line repeating a whole
+// template with only a few fields differing) it can prefer a shorter,
+// cheaper-looking match that forces a worse parse of the remaining bytes
+// -- exactly the class of problem true cost-based *optimal* parsing (a
+// dynamic-programming pass over the whole remaining parse, not a
+// greedy per-candidate score) is built to avoid. See DESIGN.md's future
+// work for that harder, still-unbuilt alternative.
 std::vector<LzToken> lz_parse(const std::vector<u8>& data, int max_chain, size_t nice_length) {
     std::vector<LzToken> tokens;
     size_t n = data.size();

@@ -577,7 +577,34 @@ smaller call's result).
   remaining gap to bz2/lzma on realistic text (see `USE_CASES.md`): the
   current matcher's lookahead is one step (lazy matching), not a full
   search over parse choices weighted by their actual entropy-coded cost,
-  which is what LZMA-class compressors do.
+  which is what LZMA-class compressors do. **A greedy (non-optimal)
+  version of this was actually tried and reverted**: `find_match` and the
+  lazy-deferral decision were changed to select matches by an estimated
+  encoded-bit cost (bytes covered per bit, a cheap integer proxy built
+  from `bucket_encode`'s own bucket math -- see the reverted code's
+  comments, kept in git history) instead of pure greedy-longest, on the
+  theory that a much closer, slightly shorter match often costs fewer
+  bits than a farther, marginally longer one. Measured honestly, it was a
+  real but *mixed* result, not a net win: on the 18MB real-source-code
+  corpus it shrank output by ~0.8-0.9% at every speed level (narrowing
+  the gap to lzma from 13.4% to 12.4%) and on a synthetic numeric-CSV use
+  case by ~5.7%, but on a synthetic server-log use case it made output
+  ~7.4% *larger*, and on JSON telemetry events ~2.1% larger -- while also
+  costing 20-30% more compression time everywhere, since the cost
+  estimate has to be computed for every still-viable chain candidate
+  instead of a cheap length comparison. The likely cause of the
+  regressions: the cost estimate is evaluated greedily, per candidate,
+  with no visibility into how that choice affects the cost of whatever
+  comes *after* it in the parse -- so on template-like repeated data
+  (e.g. a log line repeating a whole template with only a few fields
+  differing), it can prefer a shorter, locally-cheaper-looking match that
+  forces a worse parse of the remaining bytes. This is exactly the
+  failure mode true optimal parsing (a dynamic-programming pass scoring
+  the *whole* remaining parse, not one candidate in isolation) is built
+  to avoid, and why a cost-aware-but-still-greedy heuristic isn't a
+  substitute for it. Reverted rather than kept as an ambiguous, mixed-
+  result default; a real DP-based optimal parser remains the actual
+  future-work item here, not the greedy approximation.
 - **A BWT-based mode** would be the more direct way to challenge bz2
   specifically on ordinary prose, since a large part of bz2's advantage
   there comes from the Burrows-Wheeler Transform rearranging the data
