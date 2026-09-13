@@ -11,10 +11,16 @@
 // Huffman coding.
 #pragma once
 #include "csa/common.hpp"
+#include "csa/lz_matcher.hpp"
 
 namespace csa {
 
-std::vector<u8> lz_encode(const std::vector<u8>& input);
+// max_chain/nice_length are a pure encoder-side speed/ratio knob (see
+// lz_matcher.hpp) -- they don't affect the bitstream format, so decode
+// needs no matching parameter.
+std::vector<u8> lz_encode(const std::vector<u8>& input,
+                          int max_chain = kLzDefaultMaxChain,
+                          size_t nice_length = kLzDefaultNiceLength);
 
 // Reads a blob written by lz_encode starting at data[pos], advances pos
 // past everything it consumed (so callers can embed this in a larger

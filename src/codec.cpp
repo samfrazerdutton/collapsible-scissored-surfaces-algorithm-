@@ -272,7 +272,7 @@ constexpr size_t kAdaptiveSizeThreshold = 100'000;
 constexpr double kAdaptiveLzStrongRatio = 0.35;
 } // namespace
 
-std::vector<u8> compress(const std::vector<u8>& input, bool use_gpu) {
+std::vector<u8> compress(const std::vector<u8>& input, bool use_gpu, int lz_max_chain, size_t lz_nice_length) {
     // RAW candidate.
     std::vector<u8> raw_blob;
     write_magic_mode(raw_blob, Mode::Raw);
@@ -286,7 +286,7 @@ std::vector<u8> compress(const std::vector<u8>& input, bool use_gpu) {
     // is worth trying at all).
     std::vector<u8> lz_blob;
     write_magic_mode(lz_blob, Mode::GeneralLZ);
-    std::vector<u8> lz_payload = lz_encode(input);
+    std::vector<u8> lz_payload = lz_encode(input, lz_max_chain, lz_nice_length);
     lz_blob.insert(lz_blob.end(), lz_payload.begin(), lz_payload.end());
 
     bool skip_pantograph = false;

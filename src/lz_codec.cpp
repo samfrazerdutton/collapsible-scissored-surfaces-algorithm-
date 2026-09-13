@@ -34,7 +34,7 @@ u32 bucket_decode(int bucket, u32 extra_value) {
 
 } // namespace
 
-std::vector<u8> lz_encode(const std::vector<u8>& input) {
+std::vector<u8> lz_encode(const std::vector<u8>& input, int max_chain, size_t nice_length) {
     std::vector<u8> out;
     put_u64(out, (u64)input.size());
 
@@ -44,7 +44,7 @@ std::vector<u8> lz_encode(const std::vector<u8>& input) {
         return out;
     }
 
-    std::vector<LzToken> tokens = lz_parse(input);
+    std::vector<LzToken> tokens = lz_parse(input, max_chain, nice_length);
 
     std::vector<u8> coded;
     RangeEncoder enc(coded);

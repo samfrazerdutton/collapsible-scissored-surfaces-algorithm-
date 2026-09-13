@@ -1,7 +1,7 @@
 // scissorc — command-line front end for the Collapsible Scissored Surfaces
 // compression algorithm.
 //
-//   scissorc compress   <in> <out> [--gpu]
+//   scissorc compress   <in> <out> [--gpu] [--level fast|balanced|high]
 //   scissorc decompress <in> <out>
 //   scissorc compress-geo2d   <in.xy>  <out> [--scale N]
 //   scissorc decompress-geo2d <in> <out.xy>
@@ -15,6 +15,7 @@
 // lossless; --scale controls the quantization step (default 1000, i.e.
 // 3 decimal digits of precision).
 #include "csa/codec.hpp"
+#include "csa/lz_matcher.hpp"
 #include "csa/pantograph_lift_cuda.hpp"
 #include <algorithm>
 #include <chrono>
@@ -86,13 +87,25 @@ void write_geo_header(std::vector<u8>& out, u8 dims, i64 scale) {
     put_u64(out, (u64)scale);
 }
 
-int cmd_compress(const std::string& in, const std::string& out, bool gpu) {
+// The same speed/ratio "level" every production LZ compressor exposes
+// (gzip -1..-9, zstd -1..-22), applied to this codec's LZ match search.
+// See lz_matcher.hpp / REAL_CORPUS_BENCHMARK.md for what these trade off.
+void level_to_lz_params(const std::string& level, int& max_chain, size_t& nice_length) {
+    if (level == "fast") { max_chain = 32; nice_length = 32; }
+    else if (level == "high") { max_chain = 1024; nice_length = 4096; }
+    else { max_chain = kLzDefaultMaxChain; nice_length = kLzDefaultNiceLength; } // "balanced" / default
+}
+
+int cmd_compress(const std::string& in, const std::string& out, bool gpu, const std::string& level) {
     auto data = read_file(in);
-    auto blob = compress(data, gpu);
+    int max_chain;
+    size_t nice_length;
+    level_to_lz_params(level, max_chain, nice_length);
+    auto blob = compress(data, gpu, max_chain, nice_length);
     write_file(out, blob);
     std::cout << "compress: " << data.size() << " -> " << blob.size() << " bytes ("
               << (data.empty() ? 0.0 : 100.0 * (1.0 - (double)blob.size() / (double)data.size()))
-              << "% smaller)" << (gpu ? " [gpu]" : "") << "\n";
+              << "% smaller)" << (gpu ? " [gpu]" : "") << " [level=" << level << "]\n";
     return 0;
 }
 
@@ -194,6 +207,26 @@ int cmd_info(const std::string& path) {
     return 0;
 }
 
+// Diagnostic: isolates lz_parse's match-finding time from lz_encode's
+// entropy-coding time, to find out which stage actually dominates a slow
+// compress() call instead of guessing.
+int cmd_bench_lz(const std::string& path) {
+    auto data = read_file(path);
+    auto t0 = std::chrono::steady_clock::now();
+    auto tokens = lz_parse(data);
+    auto t1 = std::chrono::steady_clock::now();
+    double parse_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+    size_t n_literals = 0, n_matches = 0;
+    for (auto& t : tokens) (t.is_match ? n_matches : n_literals)++;
+
+    std::cout << "bench-lz: input=" << data.size() << " bytes, parse_time="
+              << parse_ms << " ms (" << (data.size() / 1e6 / (parse_ms / 1000.0)) << " MB/s), "
+              << "tokens=" << tokens.size() << " (" << n_literals << " literals, "
+              << n_matches << " matches)\n";
+    return 0;
+}
+
 // Isolates the Pantograph Lift forward transform itself (CPU or GPU) from
 // the CPU-sequential entropy coding stage that always follows it in
 // compress(), so CPU-vs-GPU timing reflects the actual thing the CUDA
@@ -255,7 +288,7 @@ int cmd_bench_transform(size_t n, bool gpu, int repeat) {
 void usage() {
     std::cerr <<
         "usage:\n"
-        "  scissorc compress <in> <out> [--gpu]\n"
+        "  scissorc compress <in> <out> [--gpu] [--level fast|balanced|high]\n"
         "  scissorc decompress <in> <out>\n"
         "  scissorc compress-geo2d <in.xy> <out> [--scale N]\n"
         "  scissorc decompress-geo2d <in> <out.xy>\n"
@@ -273,8 +306,14 @@ int main(int argc, char** argv) {
     std::string cmd = argv[1];
     try {
         if (cmd == "compress" && argc >= 4) {
-            bool gpu = (argc >= 5 && std::string(argv[4]) == "--gpu");
-            return cmd_compress(argv[2], argv[3], gpu);
+            bool gpu = false;
+            std::string level = "balanced";
+            for (int i = 4; i < argc; i++) {
+                std::string a = argv[i];
+                if (a == "--gpu") gpu = true;
+                else if (a == "--level" && i + 1 < argc) level = argv[++i];
+            }
+            return cmd_compress(argv[2], argv[3], gpu, level);
         } else if (cmd == "decompress" && argc >= 4) {
             return cmd_decompress(argv[2], argv[3]);
         } else if (cmd == "compress-geo2d" && argc >= 4) {
@@ -301,6 +340,8 @@ int main(int argc, char** argv) {
             return cmd_decompress_geo3d(argv[2], argv[3]);
         } else if (cmd == "info" && argc >= 3) {
             return cmd_info(argv[2]);
+        } else if (cmd == "bench-lz" && argc >= 3) {
+            return cmd_bench_lz(argv[2]);
         } else if (cmd == "bench-transform" && argc >= 3) {
             size_t n = (size_t)std::stoull(argv[2]);
             bool gpu = false;

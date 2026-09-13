@@ -203,7 +203,34 @@ large part of why bz2 wins on ordinary prose). See `USE_CASES.md` for
 where this actually lands against gzip/bz2/lzma on realistic (not
 maximally repetitive) text, log, and structured-data files -- it beats
 gzip on most of them, and is within reach of bz2/lzma without matching
-them outright.
+them outright. `REAL_CORPUS_BENCHMARK.md` runs the same comparison
+against 18MB of real, unmodified C++ source code (not text written or
+generated for this project) -- the harshest, most credible test in this
+repo, since nobody wrote that data to flatter a particular compressor.
+
+**Speed/ratio levels** (`compress(..., lz_max_chain, lz_nice_length)`,
+`scissorc compress --level fast|balanced|high`): the match search's
+`max_chain` (how many hash-chain candidates to examine per position) and
+`nice_length` (the match length at which the search stops early and
+skips the lazy lookahead entirely, since checking for something even
+better than an already-excellent match is the single most expensive
+thing this matcher does) are a real speed-vs-ratio knob, exactly the
+"level" every production LZ compressor exposes (gzip -1..-9, zstd
+-1..-22). This was not a hypothetical concern: the first version of this
+matcher took **~30s to compress 18MB** of real source code at only 0.6
+MB/s, because highly repetitive real text produces very long hash chains
+that got walked in full, twice per position (once for the current
+position, once for the lazy lookahead), for every match no matter how
+already-excellent it was. Adding the early-exit and tuning the defaults
+against both `REAL_CORPUS_BENCHMARK.md` and `USE_CASES.md` together (not
+just one or the other) brought the default ("balanced") level to ~5s
+(~6x faster) for a ~2% ratio cost; `--level fast` compresses the same
+18MB in ~1.5s -- faster than lzma -9, while still beating both gzip and
+bz2 on size. `--level high` recovers close to the original thorough
+search's ratio (within 13% of lzma) at the original ~30s cost. None of
+this affects the bitstream format -- it's a pure encoder-side search
+parameter, so decoding is identical regardless of which level compressed
+a file.
 
 ## Container format
 

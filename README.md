@@ -14,7 +14,9 @@ dictionary matcher for the kind of redundancy (repeated substrings, not
 predictable samples) that a predictive transform can't touch. See
 `DESIGN.md` for the full technical mapping, `BENCHMARKS.md` for real,
 regenerable compression-ratio measurements, `USE_CASES.md` for how it does
-on realistic (not maximally repetitive) text/log/telemetry files, and
+on realistic (not maximally repetitive) text/log/telemetry files,
+`REAL_CORPUS_BENCHMARK.md` for the harshest test -- 18MB of real,
+unmodified C++ source code, not text written for this project -- and
 `GPU_BENCHMARKS.md` for a dedicated CPU-vs-GPU crossover measurement from
 100K to 256M elements (nothing in any of those files is hand-typed).
 
@@ -37,6 +39,11 @@ on realistic (not maximally repetitive) text/log/telemetry files, and
   repeated-substring redundancy in text/log/structured files that no
   predictive transform can exploit. `compress()` tries this alongside
   Pantograph Lift and raw storage and keeps whichever encodes smallest.
+  Exposes the same speed/ratio "level" every production LZ compressor
+  does (`scissorc compress --level fast|balanced|high`, gzip -1..-9 /
+  zstd -1..-22's tradeoff) -- `fast` beats gzip and bz2 while compressing
+  faster than lzma on real source code; `high` closes to within 13% of
+  lzma's ratio at real cost in time. See `REAL_CORPUS_BENCHMARK.md`.
 - **Adaptive order-1 range coder** -- the entropy-coding backend shared by
   every mode (generalized to arbitrary alphabet sizes for the LZ matcher's
   literal/length/distance streams, not just the original 256-byte case).
@@ -71,9 +78,14 @@ on realistic (not maximally repetitive) text/log/telemetry files, and
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 
-# Round-trip a file
-build/scissorc.exe compress   input.bin  out.csa
+# Round-trip a file (--level fast|balanced|high trades speed for ratio)
+build/scissorc.exe compress   input.bin  out.csa --level balanced
 build/scissorc.exe decompress out.csa    roundtrip.bin
+
+# Build a real (non-synthetic) benchmark corpus from any large local C/C++
+# project, and compare CSA against gzip/bz2/lzma on it at every level
+python bench/build_real_corpus.py /path/to/some/large/cpp/project
+python bench/real_corpus_benchmark.py
 
 # Geometric mode: text file of "x y" (or "x y z") floats, one point per line
 build/scissorc.exe compress-geo2d   track.xy   track.csa
@@ -111,13 +123,21 @@ python -c "import sys; sys.path.insert(0, 'bindings/python'); import csa; print(
 | `gps_track.xy` | noisy real-world-style path | beats lzma by ~1.3x |
 | `toroidal.xyz` | doubly-curved (wobbling radius) | **32% smaller; beats lzma** -- see below for how |
 
-**Realistic use cases** (see `USE_CASES.md` for the full picture, including bz2/lzma comparisons):
+**Realistic use cases** (`--level balanced`, the default; see `USE_CASES.md` for the full picture, including bz2/lzma comparisons):
 
 | dataset | scenario | vs. gzip -9 |
 |---|---|---|
-| server access log | 5,000 synthetic nginx-format lines | **beats gzip** (55.5KB vs 56.9KB) |
-| JSON telemetry events | 5,000 IoT/analytics events | **beats gzip** (70.6KB vs 73.2KB) |
-| sensor CSV export | 20,000 rows, smooth+noisy columns | close to gzip (166.9KB vs 164.4KB) |
+| server access log | 5,000 synthetic nginx-format lines | close to gzip (57.9KB vs 56.9KB) |
+| JSON telemetry events | 5,000 IoT/analytics events | **beats gzip** (72.4KB vs 73.2KB) |
+| sensor CSV export | 20,000 rows, smooth+noisy columns | close to gzip (168.3KB vs 164.4KB) |
+
+**A real, non-synthetic corpus** (18MB of unmodified C++ source code -- see `REAL_CORPUS_BENCHMARK.md`):
+
+| level | size | vs. gzip -9 / bz2 -9 / lzma -9 | compress time |
+|---|---:|---|---:|
+| `--level fast` | 2.04MB | **beats gzip (3.10MB) and bz2 (2.40MB)** | 1.5s (lzma: 4.3s) |
+| `--level balanced` | 1.95MB | beats gzip and bz2 | 5.1s |
+| `--level high` | 1.91MB | within 13% of lzma (1.68MB) | 30.6s |
 
 ## Honesty, not hype
 
@@ -140,11 +160,21 @@ python -c "import sys; sys.path.insert(0, 'bindings/python'); import csa; print(
   repeated thousands of times) the LZ matcher's *unbounded* window beats
   gzip, bz2, *and* lzma outright; that's a real structural edge on very
   long-range repetition specifically, not a claim that CSA beats mature LZ
-  compressors on arbitrary text in general. `USE_CASES.md` tests
-  realistic, non-trivially-repetitive text/log/JSON/CSV instead: CSA beats
-  gzip on most of them and is within reach of (without matching) bz2/lzma,
-  which use more sophisticated parsing and entropy modeling (see
-  `DESIGN.md`'s future work for exactly what's missing).
+  compressors on arbitrary text in general.
+- The harshest, most credible test in this repo is `REAL_CORPUS_BENCHMARK.md`:
+  18MB of real, unmodified C++ source code, not text written or generated
+  for this project. There, `--level fast` beats both gzip and bz2 on size
+  while compressing *faster than lzma*; `--level high` closes to within
+  13% of lzma's ratio at real cost in time (~30s vs lzma's ~4s). Neither
+  level beats lzma outright on this corpus -- real source code has exactly
+  the kind of structure LZMA's optimal parsing and bz2's Burrows-Wheeler
+  Transform are built to exploit, and this codec's lazy-matching LZ +
+  order-1 entropy model currently isn't (see `DESIGN.md`'s future work for
+  exactly what closing that gap would require: optimal parsing, a BWT
+  mode). The first version of this matcher took ~30s to compress that
+  same 18MB at only 0.6 MB/s regardless of level -- a real performance bug
+  (an unbounded lazy-lookahead search on highly repetitive text), found by
+  profiling and fixed, not glossed over.
 - GPU timing is reported honestly, at two different fidelities. Launching
   a fresh process per measurement (which pays its own allocation, and a
   real ~1.2s wake/context-creation cost if this laptop GPU had idled since
@@ -176,8 +206,12 @@ tests/            round-trip test suite (test_main.cpp) + C-ABI test that
 bench/            dataset generator + benchmark runner (writes BENCHMARKS.md)
                   + GPU crossover benchmark (writes GPU_BENCHMARKS.md)
                   + realistic use-case scenarios (writes USE_CASES.md)
-DESIGN.md          full technical design and honest limitations/future work
-BENCHMARKS.md      regenerated by bench/run_benchmarks.py -- not hand-edited
-GPU_BENCHMARKS.md  regenerated by bench/gpu_crossover.py -- not hand-edited
-USE_CASES.md       regenerated by bench/use_cases.py -- not hand-edited
+                  + real (non-synthetic) corpus benchmark
+                    (build_real_corpus.py + real_corpus_benchmark.py,
+                    writes REAL_CORPUS_BENCHMARK.md)
+DESIGN.md               full technical design and honest limitations/future work
+BENCHMARKS.md           regenerated by bench/run_benchmarks.py -- not hand-edited
+GPU_BENCHMARKS.md       regenerated by bench/gpu_crossover.py -- not hand-edited
+USE_CASES.md            regenerated by bench/use_cases.py -- not hand-edited
+REAL_CORPUS_BENCHMARK.md  regenerated by bench/real_corpus_benchmark.py -- not hand-edited
 ```

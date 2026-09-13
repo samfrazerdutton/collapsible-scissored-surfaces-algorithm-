@@ -4,6 +4,7 @@
 // input by more than a small fixed header.
 #pragma once
 #include "csa/common.hpp"
+#include "csa/lz_matcher.hpp"
 #include "csa/rod_joint_transform.hpp"
 #include <vector>
 
@@ -21,7 +22,15 @@ enum class Mode : u8 { Raw = 0, General = 1, Geo2D = 2, Geo3D = 3, GeneralLZ = 4
 // transform runs on the GPU (level-parallel); otherwise it transparently
 // falls back to the CPU implementation. The bitstream is identical either
 // way.
-std::vector<u8> compress(const std::vector<u8>& input, bool use_gpu = false);
+//
+// lz_max_chain/lz_nice_length are a real speed-vs-ratio knob for the LZ
+// candidate's match search (see lz_matcher.hpp), the same tradeoff every
+// production LZ compressor exposes as a "level". They're a pure
+// encoder-side search parameter with no bitstream effect, so decompress()
+// needs no matching parameter.
+std::vector<u8> compress(const std::vector<u8>& input, bool use_gpu = false,
+                          int lz_max_chain = kLzDefaultMaxChain,
+                          size_t lz_nice_length = kLzDefaultNiceLength);
 std::vector<u8> decompress(const std::vector<u8>& blob);
 
 // Literal geometric mode for 2D point sequences (Rod-Joint Transform).
