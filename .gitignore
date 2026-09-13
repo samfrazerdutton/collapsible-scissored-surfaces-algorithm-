@@ -1,0 +1,8 @@
+build/
+bench/datasets/
+bench/_tmp/
+*.obj
+*.exe
+*.lib
+*.pdb
+__pycache__/
