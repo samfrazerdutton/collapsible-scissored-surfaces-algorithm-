@@ -282,16 +282,26 @@ constexpr double kAdaptiveLzStrongRatio = 0.35;
 
 // BWT's suffix-array construction cost scales with input size regardless
 // of whether it ends up winning (unlike the LZ-ratio-based skip above,
-// which is a real signal specifically for Pantograph Lift) -- measured on
-// an 18MB real-source-code corpus, trying it unconditionally cost an
-// extra ~10s at the "fast" level alone without winning at any size, while
-// on realistic few-hundred-KB-to-1MB files (server logs, JSON telemetry,
-// sensor CSV -- see USE_CASES.md) it won convincingly (8-24% smaller than
-// the next-best candidate) for negligible added time. This is a plain
-// size cutoff, not a content-based guess: below it, BWT is always tried
-// (it either wins or it doesn't, cheaply); above it, the cost of trying
-// stops being worth paying for files this size actually measured.
-constexpr size_t kBwtMaxInputSize = 4 * 1024 * 1024;
+// which is a real signal specifically for Pantograph Lift). This cap
+// used to be a tight 4MB, back when bwt_encode_block's suffix array was
+// built via O(n log^2 n) prefix-doubling: trying it unconditionally on
+// an 18MB real-source-code corpus cost an extra ~10s at the "fast" level
+// alone, without winning at any size there (LZ's exact-repeat matching
+// covers that corpus's redundancy better). Since bwt_transform.cpp
+// switched to the linear-time SA-IS construction, the same 18MB corpus
+// now costs only ~1.1-1.2s extra -- roughly the same order of magnitude
+// as the LZ candidate's own cost, not a disproportionate outlier
+// anymore, and the outcome is unchanged (LZ still wins there; BWT simply
+// isn't the right model for that content, independent of how cheaply it
+// can be tried). The cap is raised accordingly rather than removed
+// outright: this codebase has only directly measured SA-IS's real-world
+// cost up to ~18MB, and a generous-but-finite bound is the honest
+// position pending measurement further out, not a claim of unbounded
+// confidence. On realistic few-hundred-KB-to-1MB files (server logs,
+// JSON telemetry, sensor CSV -- see USE_CASES.md), BWT wins convincingly
+// (14-30%+ smaller than the next-best candidate) for negligible added
+// time either way.
+constexpr size_t kBwtMaxInputSize = 64ull * 1024 * 1024;
 } // namespace
 
 std::vector<u8> compress(const std::vector<u8>& input, bool use_gpu, int lz_max_chain, size_t lz_nice_length) {

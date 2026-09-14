@@ -38,7 +38,173 @@ std::vector<int> build_suffix_array(const std::vector<int>& t) {
     return sa;
 }
 
+// SA-IS: Nong/Zhang/Chen's linear-time suffix array construction via
+// induced sorting. `t`'s last element must be a unique value strictly
+// smaller than every other element (the same sentinel convention
+// bwt_encode_block already uses), and `alphabet_size` is one past the
+// largest value that can appear in `t` (valid symbols are
+// 0..alphabet_size-1).
+//
+// Kept alongside the prefix-doubling `build_suffix_array` above rather
+// than replacing it outright: correctness for an algorithm this
+// intricate is trusted through exhaustive cross-validation against that
+// already "banana"-verified implementation (see
+// test_bwt_transform_sais_matches_reference), not just a handful of
+// hand-checked examples -- the same standard this project applies to
+// every other genuinely tricky piece of math in it.
+std::vector<int> build_suffix_array_sais(const std::vector<int>& t, int alphabet_size) {
+    int n = (int)t.size();
+    if (n == 0) return {};
+    if (n == 1) return {0};
+
+    // --- Classify every suffix S-type or L-type. The sentinel position
+    // is S-type by definition; comparing right-to-left from there, a
+    // suffix is S-type if it's lexicographically smaller than the one
+    // immediately after it (or equal in first character and the next
+    // suffix is itself S-type). ---
+    std::vector<u8> is_s(n);
+    is_s[n - 1] = 1;
+    for (int i = n - 2; i >= 0; i--) {
+        if (t[i] < t[i + 1]) is_s[i] = 1;
+        else if (t[i] > t[i + 1]) is_s[i] = 0;
+        else is_s[i] = is_s[i + 1];
+    }
+    // An "LMS" (leftmost S-type) position is S-type with an L-type
+    // predecessor -- position 0 can never be LMS (no predecessor).
+    // Given the sentinel is always S-type and the position before it
+    // always holds a strictly larger real value (hence L-type), the
+    // sentinel's own position is always classified LMS too, with no
+    // special-casing needed anywhere below.
+    auto is_lms = [&](int i) { return i > 0 && is_s[i] != 0 && is_s[i - 1] == 0; };
+
+    std::vector<int> bucket_count(alphabet_size, 0);
+    for (int c : t) bucket_count[c]++;
+    auto bucket_starts = [&]() {
+        std::vector<int> starts(alphabet_size);
+        int sum = 0;
+        for (int c = 0; c < alphabet_size; c++) { starts[c] = sum; sum += bucket_count[c]; }
+        return starts;
+    };
+    auto bucket_ends = [&]() {
+        std::vector<int> ends(alphabet_size);
+        int sum = 0;
+        for (int c = 0; c < alphabet_size; c++) { sum += bucket_count[c]; ends[c] = sum; }
+        return ends;
+    };
+
+    // Places the given LMS positions at the tails of their character
+    // buckets (in the order provided, processed back-to-front so earlier
+    // entries end up earlier within a shared bucket), then induces every
+    // L-type suffix left-to-right and every S-type suffix right-to-left.
+    // Called twice: once with an arbitrary (appearance-order) placement
+    // to discover the LMS suffixes' true relative order, and once more
+    // with that now-correct order to produce the final suffix array.
+    auto induced_sort = [&](const std::vector<int>& lms_order) {
+        std::vector<int> sa(n, -1);
+        std::vector<int> tail = bucket_ends();
+        for (int k = (int)lms_order.size() - 1; k >= 0; k--) {
+            int i = lms_order[k];
+            int c = t[i];
+            tail[c]--;
+            sa[tail[c]] = i;
+        }
+
+        std::vector<int> head = bucket_starts();
+        for (int i = 0; i < n; i++) {
+            if (sa[i] <= 0) continue;
+            int j = sa[i] - 1;
+            if (!is_s[j]) {
+                int c = t[j];
+                sa[head[c]] = j;
+                head[c]++;
+            }
+        }
+
+        tail = bucket_ends();
+        for (int i = n - 1; i >= 0; i--) {
+            if (sa[i] <= 0) continue;
+            int j = sa[i] - 1;
+            if (is_s[j]) {
+                int c = t[j];
+                tail[c]--;
+                sa[tail[c]] = j;
+            }
+        }
+        return sa;
+    };
+
+    std::vector<int> lms_appearance_order;
+    for (int i = 0; i < n; i++)
+        if (is_lms(i)) lms_appearance_order.push_back(i);
+
+    std::vector<int> sa1 = induced_sort(lms_appearance_order);
+
+    std::vector<int> lms_sorted_by_sa1;
+    lms_sorted_by_sa1.reserve(lms_appearance_order.size());
+    for (int i = 0; i < n; i++)
+        if (sa1[i] >= 0 && is_lms(sa1[i])) lms_sorted_by_sa1.push_back(sa1[i]);
+
+    // Two LMS substrings (position to next LMS position, inclusive) are
+    // equal only if they have the same length and identical characters
+    // throughout. The sentinel's own LMS position (length-1 substring,
+    // unique value) can never equal any other, so it's handled by the
+    // same general loop with no special case.
+    auto lms_substrings_equal = [&](int p, int q) {
+        for (int k = 0;; k++) {
+            bool p_end = k > 0 && is_lms(p + k);
+            bool q_end = k > 0 && is_lms(q + k);
+            if (p_end && q_end) return true;
+            if (p_end != q_end) return false;
+            if (t[p + k] != t[q + k]) return false;
+        }
+    };
+
+    std::vector<int> name(n, -1);
+    int num_names = 1;
+    name[lms_sorted_by_sa1[0]] = 0;
+    for (size_t k = 1; k < lms_sorted_by_sa1.size(); k++) {
+        int prev = lms_sorted_by_sa1[k - 1];
+        int curr = lms_sorted_by_sa1[k];
+        if (!lms_substrings_equal(prev, curr)) num_names++;
+        name[curr] = num_names - 1;
+    }
+
+    std::vector<int> lms_final_order;
+    if (num_names == (int)lms_appearance_order.size()) {
+        // Every LMS substring is distinct -- the order already extracted
+        // from the first induced sort is already the correct final
+        // relative order of the LMS suffixes, no recursion needed.
+        lms_final_order = lms_sorted_by_sa1;
+    } else {
+        // Reduce to a string of names (in original LMS appearance order)
+        // and recurse. This reduced string's own last character is
+        // always name 0 -- the original sentinel's LMS position is
+        // always the last one in appearance order, and is always named
+        // 0 (nothing sorts before it) -- exactly the unique-smallest-at-
+        // the-end property this function requires, so no additional
+        // sentinel needs to be appended for the recursive call.
+        int reduced_n = (int)lms_appearance_order.size();
+        std::vector<int> reduced_string(reduced_n);
+        for (int k = 0; k < reduced_n; k++) reduced_string[k] = name[lms_appearance_order[k]];
+
+        std::vector<int> reduced_sa = build_suffix_array_sais(reduced_string, num_names);
+
+        lms_final_order.resize(reduced_n);
+        for (int k = 0; k < reduced_n; k++) lms_final_order[k] = lms_appearance_order[reduced_sa[k]];
+    }
+
+    return induced_sort(lms_final_order);
+}
+
 } // namespace
+
+std::vector<int> bwt_debug_build_suffix_array_reference(const std::vector<int>& t) {
+    return build_suffix_array(t);
+}
+
+std::vector<int> bwt_debug_build_suffix_array_sais(const std::vector<int>& t, int alphabet_size) {
+    return build_suffix_array_sais(t, alphabet_size);
+}
 
 BwtBlockResult bwt_encode_block(const std::vector<u8>& block) {
     BwtBlockResult r;
@@ -52,7 +218,7 @@ BwtBlockResult bwt_encode_block(const std::vector<u8>& block) {
     for (int i = 0; i < n; i++) t[i] = (int)block[i] + 1;
     t[n] = 0;
 
-    std::vector<int> sa = build_suffix_array(t);
+    std::vector<int> sa = build_suffix_array_sais(t, 257);
 
     int m = n + 1;
     r.symbols.resize(m);

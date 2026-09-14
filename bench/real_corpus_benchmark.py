@@ -175,9 +175,11 @@ def main():
             "indentation, common phrases) that LZMA/zstd's optimal-ish parsing and larger match "
             "finders, and bz2's Burrows-Wheeler Transform, are specifically built to exploit, and this "
             "codec's lazy-matching LZ + order-1 entropy model currently isn't. (CSA's BWT mode, which "
-            "wins big on smaller realistic files -- see USE_CASES.md -- is skipped here: this 18MB "
-            "corpus is well above the size where its suffix-array construction cost stops being worth "
-            "paying, see DESIGN.md.) Closing this specific gap needs the other named future work item, "
+            "wins big on smaller realistic files -- see USE_CASES.md -- is genuinely tried here too, "
+            "not skipped: it's cheap enough since switching to a linear-time suffix-array construction "
+            "(see DESIGN.md) to run unconditionally at this size, but it still doesn't win on real "
+            "source code specifically -- LZ's exact-repeat matching simply covers this corpus's "
+            "redundancy better.) Closing this specific gap needs the other named future work item, "
             "optimal cost-based LZ parsing.\n"
         )
     if faster_than_lzma:

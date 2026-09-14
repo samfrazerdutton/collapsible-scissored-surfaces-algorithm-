@@ -48,16 +48,19 @@ unmodified C++ source code, not text written for this project -- and
   zstd -1..-22's tradeoff) -- `fast` beats gzip and bz2 while compressing
   faster than lzma on real source code; `high` closes to within 13% of
   lzma's ratio at real cost in time. See `REAL_CORPUS_BENCHMARK.md`.
-- **BWT + move-to-front mode** -- a real Burrows-Wheeler Transform (block-
-  based suffix-array construction, sentinel-terminated so periodic blocks
-  never need special-casing) feeding a move-to-front pass, a bz2-style
-  RUNA/RUNB zero-run encoding for MTF's dominant rank-0 runs, and the
-  same adaptive entropy coder, targeting bz2's core technique: local
-  byte-context statistics, not exact repeats. `compress()` tries it too
-  (for inputs up to a few MB -- its suffix-array cost isn't worth paying
-  unconditionally on huge files that don't benefit) and it wins outright
-  on realistic server-log, JSON-telemetry, and sensor-CSV data -- adding
-  RUNA/RUNB on top of an already-winning BWT shrank those same outputs by
+- **BWT + move-to-front mode** -- a real Burrows-Wheeler Transform
+  (block-based, sentinel-terminated so periodic blocks never need
+  special-casing, suffix arrays built via SA-IS -- linear-time
+  construction, cross-validated against a simpler reference
+  implementation on 150+ randomized cases before being trusted) feeding
+  a move-to-front pass, a bz2-style RUNA/RUNB zero-run encoding for MTF's
+  dominant rank-0 runs, and the same adaptive entropy coder, targeting
+  bz2's core technique: local byte-context statistics, not exact
+  repeats. `compress()` tries it too (for inputs up to 64MB -- SA-IS
+  made this cheap enough to run unconditionally at real file sizes,
+  measured up to an 18MB corpus) and it wins outright on realistic
+  server-log, JSON-telemetry, and sensor-CSV data -- adding RUNA/RUNB on
+  top of an already-winning BWT shrank those same outputs by
   a further 14-22%, newly beating lzma on the server-log case too. See
   `USE_CASES.md`.
 - **Adaptive order-1 range coder** -- the entropy-coding backend shared by
@@ -87,7 +90,7 @@ unmodified C++ source code, not text written for this project -- and
   `compress()` keeps one per thread automatically. Measured, not assumed:
   ~3.5x faster sustained per-call time at 50K elements, ~1.7x at 2M (see
   `DESIGN.md`).
-- **1381 round-trip correctness checks** (`tests/test_main.cpp` +
+- **1547 round-trip correctness checks** (`tests/test_main.cpp` +
   `tests/test_capi.cpp`, the latter linking the real shared library to
   catch actual symbol-export problems), including a dedicated check that
   the GPU path actually succeeds (not just that the overall call
@@ -175,9 +178,9 @@ cd bindings/go/csa && go test ./...
 
 | level | size | notable comparisons | compress time |
 |---|---:|---|---:|
-| `--level fast` | 2.04MB | **beats gzip (3.10MB), bz2 (2.40MB), zstd -3 (2.93MB)** | 1.5s |
-| `--level balanced` | 1.95MB | **beats brotli -11 (2.09MB)**, still ahead of gzip/bz2/zstd -3 | 5.0s |
-| `--level high` | 1.91MB | within 13% of lzma -9 (1.68MB) -- but **zstd -19 beats it on size *and* speed** (1.71MB in 5.3s vs 30.1s) | 30.1s |
+| `--level fast` | 2.04MB | **beats gzip (3.10MB), bz2 (2.40MB), zstd -3 (2.93MB)** | 2.6s |
+| `--level balanced` | 1.95MB | **beats brotli -11 (2.09MB)**, still ahead of gzip/bz2/zstd -3 | 6.4s |
+| `--level high` | 1.91MB | within 13% of lzma -9 (1.68MB) -- but **zstd -19 beats it on size *and* speed** (1.71MB in 5.2s vs 32.0s) | 32.0s |
 
 ## Honesty, not hype
 
@@ -219,15 +222,16 @@ cd bindings/go/csa && go test ./...
   the textbook trio. `--level fast` beats gzip, bz2, *and* zstd's default
   level; `--level balanced` beats brotli's max level too. But the more
   important, more humbling number: **zstd -19 beats CSA `--level high` on
-  both size *and* speed at once** (1.71MB in 5.3s vs 1.91MB in 30.1s) --
-  not just a better ratio, a better ratio *and* 5.7x faster. That's the
-  honest measure of the gap to a real modern production compressor: the
-  whole speed/ratio curve, not one axis. Real source code has exactly the
-  kind of structure LZMA/zstd's optimal-ish parsing and bz2's
+  both size *and* speed at once** (1.71MB in 5.2s vs 1.91MB in 32.0s) --
+  not just a better ratio, a better ratio *and* over 6x faster. That's
+  the honest measure of the gap to a real modern production compressor:
+  the whole speed/ratio curve, not one axis. Real source code has
+  exactly the kind of structure LZMA/zstd's optimal-ish parsing and bz2's
   Burrows-Wheeler Transform are built to exploit; CSA's own BWT mode
-  (see above) is skipped on a file this size (its suffix-array
-  construction cost isn't worth paying unconditionally -- see
-  `DESIGN.md`), and this codec's lazy-matching LZ + order-1 entropy model
+  (see above) genuinely competes on a file this size too now (not
+  skipped -- SA-IS made that cheap enough), but still doesn't win here:
+  LZ's exact-repeat matching simply covers real source code's redundancy
+  better. This codec's lazy-matching LZ + order-1 entropy model
   currently isn't either (see `DESIGN.md`'s future work for exactly what
   closing that gap would require: optimal cost-based parsing, and the
   kind of performance engineering zstd has had years of). The first

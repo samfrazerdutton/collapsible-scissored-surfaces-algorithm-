@@ -174,7 +174,7 @@ would make entropy coding itself GPU-parallel, but it is also considerably
 easier to get subtly wrong. Given the choice between a flashier entropy
 coder and one that is provably bit-exact under test, correctness won:
 the range coder here is simple enough to reason about completely, and all
-1362 round-trip checks (see `tests/test_main.cpp`) pass, including the
+1528 round-trip checks (see `tests/test_main.cpp`) pass, including the
 CUDA path. Interleaved-stream rANS for GPU-parallel entropy decode is a
 natural next step (see Future Work).
 
@@ -276,14 +276,33 @@ further collapsed by a RUNA/RUNB zero-run encoding (see below) -- which
 the same adaptive range coder (reused as-is, just over a 258-symbol
 alphabet via `FenwickFreqN`) compresses well.
 
-**Block-based, not whole-file.** A real suffix array is at best O(n log
-n) to build, and this implementation deliberately uses the simpler,
-easier-to-verify O(n log^2 n) prefix-doubling ("Manber-Myers") method
-rather than the linear-time SA-IS algorithm -- correctness over
-cleverness for a first working version (see Future Work). That cost is
-why BWT operates on fixed 256KB blocks (`kBwtDefaultBlockSize`)
-independently, the same reason bz2 itself caps its own block size at
-900KB rather than transforming an entire file as one unit.
+**Block-based, not whole-file.** `bwt_encode_block` builds each block's
+suffix array via SA-IS (Nong/Zhang/Chen's linear-time construction by
+induced sorting) -- but even at O(n), BWT operates on fixed 256KB blocks
+(`kBwtDefaultBlockSize`) rather than the whole file at once, the same
+reason bz2 itself caps its own block size at 900KB: smaller, independent
+blocks bound memory and let the transform's local-context clustering
+work over a bounded window rather than needing to hold and index an
+entire multi-hundred-MB file's suffix array at once.
+
+**Linear time, trusted through cross-validation, not just hand-checked
+examples.** SA-IS is intricate enough (LMS-substring classification,
+induced sorting in two passes, a recursive reduction when LMS substrings
+tie) that no amount of hand-checking a small example would be enough to
+trust it directly. This codebase keeps its original, much simpler O(n
+log^2 n) prefix-doubling construction (`build_suffix_array`, "Manber-
+Myers" style: repeated rank-doubling rounds, each an `std::sort` keyed by
+the current `(rank[i], rank[i+k])` pair) specifically as a reference
+implementation, and `test_bwt_sais_matches_reference` cross-validates
+SA-IS against it on ~150+ randomized cases -- deliberately including
+tiny alphabets (which force deep recursion, the likeliest place for a
+subtle bug to hide), fully periodic/constant blocks, and the hand-
+derived `BWT("banana")` case -- before SA-IS was ever trusted to replace
+the reference construction in `bwt_encode_block` itself. Switching paid
+off immediately: the same 312KB `text_repetitive.bin` used in
+`BENCHMARKS.md` compresses in ~25ms now, down from ~174ms with the old
+construction (~7x faster), and trying BWT on the full 18MB real-source-
+code corpus (see below) now costs ~1.1-1.2s instead of ~10s.
 
 **Sentinel-terminated, not raw cyclic rotations.** The classic textbook
 BWT sorts a block's *cyclic rotations* directly, which requires careful
@@ -326,34 +345,43 @@ a block boundary with no real symbol following it in that block.
 **Measured, not assumed, and gated on that measurement.** `compress()`
 tries this as a fourth candidate alongside raw/Pantograph-Lift/LZ. On
 the 18MB real-source-code corpus (`REAL_CORPUS_BENCHMARK.md`), it never
-actually won -- the LZ candidate's exact-repeat matching already covers
-that corpus's redundancy better -- but trying it unconditionally still
-cost roughly 10 extra seconds at the `fast` level alone (suffix-array
-construction cost doesn't care whether the result ends up winning). On
-realistic few-hundred-KB-to-1MB files, though (`USE_CASES.md`'s
-synthetic server-log, JSON-telemetry, and sensor-CSV datasets), it won
-outright every time even before RUNA/RUNB was added; adding it shrank
-those same outputs by a further **14-22%** (605KB server log: 53.4KB ->
-41.8KB; 616KB JSON events: 54.7KB -> 47.3KB; 800KB sensor CSV: 134.5KB ->
-114.8KB), enough to newly beat lzma on the server-log case too, on top
-of the JSON case it already beat. The one honest cost found: a tiny
-(4KB) synthetic file got a few percent *larger* (1,718 -> 1,768 bytes) --
-plausibly the larger 258-symbol alphabet's adaptive model taking
-marginally longer to warm up on a block too short to have many long
-zero-runs to amortize that against. `compress()`'s real-size comparison
-against the other three candidates means this never costs anything
-beyond that specific measured difference; it isn't hidden. Since BWT's
-strength doesn't
-correlate with the LZ-ratio signal the Pantograph Lift skip heuristic
-already uses (it beat an already-strong LZ result by 24% on the JSON
-case), that signal isn't a valid predictor for skipping BWT too. Instead,
-`compress()` uses a plain size cutoff (`kBwtMaxInputSize`, 4MB): below
-it, BWT is always tried since the cost is negligible in absolute terms
-regardless of outcome; above it, the measured cost stopped being worth
-paying for files that size actually measured. This is the same "compare
-real measured behavior, gate on what was actually found" discipline
-applied everywhere else in this codebase, not a tuned constant chosen to
-make a benchmark look good.
+actually wins -- the LZ candidate's exact-repeat matching already covers
+that corpus's redundancy better -- and that outcome hasn't changed since
+switching to SA-IS; what changed is the *cost* of finding that out: back
+when suffix-array construction was O(n log^2 n), trying it unconditionally
+cost roughly 10 extra seconds at the `fast` level alone, purely from
+construction cost that didn't care whether the result would win. With
+SA-IS, that same corpus now costs only ~1.1-1.2s extra -- roughly the
+same order of magnitude as the LZ candidate's own cost, not a
+disproportionate outlier anymore -- so `compress()` now tries BWT on it
+unconditionally rather than skipping it. On realistic few-hundred-KB-
+to-1MB files, though (`USE_CASES.md`'s synthetic server-log, JSON-
+telemetry, and sensor-CSV datasets), it won outright every time even
+before RUNA/RUNB was added; adding RUNA/RUNB shrank those same outputs by
+a further **14-22%** (605KB server log: 53.4KB -> 41.8KB; 616KB JSON
+events: 54.7KB -> 47.3KB; 800KB sensor CSV: 134.5KB -> 114.8KB), enough
+to newly beat lzma on the server-log case too, on top of the JSON case
+it already beat. The one honest cost found: a tiny (4KB) synthetic file
+got a few percent *larger* (1,718 -> 1,768 bytes) -- plausibly the larger
+258-symbol alphabet's adaptive model taking marginally longer to warm up
+on a block too short to have many long zero-runs to amortize that
+against. `compress()`'s real-size comparison against the other three
+candidates means this never costs anything beyond that specific measured
+difference; it isn't hidden.
+
+`compress()` still uses a plain size cutoff (`kBwtMaxInputSize`, raised
+from 4MB to 64MB once SA-IS made the per-byte cost proportionate to the
+other candidates' rather than a disproportionate outlier) rather than
+removing the cap outright: this codebase has only directly measured
+SA-IS's real-world cost up to the 18MB corpus, and a generous-but-finite
+bound is the honest position pending measurement further out, not a
+claim of unbounded confidence. It also still isn't gated on the LZ-ratio
+signal the Pantograph Lift skip heuristic uses, since BWT's strength
+doesn't correlate with it (it beat an already-strong LZ result by 24% on
+the JSON case) -- that signal simply isn't a valid predictor for BWT.
+This is the same "compare real measured behavior, gate on what was
+actually found" discipline applied everywhere else in this codebase, not
+a tuned constant chosen to make a benchmark look good.
 
 ## Container format
 

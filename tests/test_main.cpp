@@ -173,6 +173,77 @@ static void test_bwt_transform() {
     }
 }
 
+// SA-IS (linear-time suffix array construction) is intricate enough that
+// it's trusted through exhaustive cross-validation against the already-
+// verified O(n log^2 n) prefix-doubling implementation, not just a
+// handful of hand-checked examples -- deliberately including tiny
+// alphabets (which force deep recursion, the part of SA-IS most likely
+// to hide a subtle bug) and maximally periodic inputs.
+static void test_bwt_sais_matches_reference() {
+    // The hand-derived "banana" suffix array from this session's BWT
+    // design work, cross-checked against both implementations: symbolic
+    // values b=2, a=1, n=3, with the usual unique-smallest sentinel (0)
+    // appended. Verified by hand: SA = [6, 5, 3, 1, 0, 4, 2].
+    {
+        std::vector<int> t = {2, 1, 3, 1, 3, 1, 0};
+        std::vector<int> expected = {6, 5, 3, 1, 0, 4, 2};
+        CHECK(bwt_debug_build_suffix_array_reference(t) == expected);
+        CHECK(bwt_debug_build_suffix_array_sais(t, 4) == expected);
+    }
+
+    std::mt19937 rng(31415);
+    auto run_case = [&](const std::vector<int>& t, int alphabet_size) {
+        auto ref = bwt_debug_build_suffix_array_reference(t);
+        auto sais = bwt_debug_build_suffix_array_sais(t, alphabet_size);
+        CHECK(ref == sais);
+    };
+
+    // Tiny alphabets over a spread of random lengths: guarantees lots of
+    // repeated LMS substrings, forcing the recursive reduction path
+    // (not just the "all names already distinct, no recursion" path).
+    for (int alphabet_size : {2, 3, 4, 8, 257}) {
+        for (int trial = 0; trial < 30; trial++) {
+            std::uniform_int_distribution<int> len_dist(1, 400);
+            int n = len_dist(rng);
+            std::vector<int> t(n);
+            std::uniform_int_distribution<int> sym_dist(1, alphabet_size - 1);
+            for (int i = 0; i < n - 1; i++) t[i] = sym_dist(rng);
+            t[n - 1] = 0;
+            run_case(t, alphabet_size);
+        }
+    }
+
+    // Larger, realistic-shaped inputs matching bwt_encode_block's actual
+    // convention exactly (real byte values 1..256, sentinel 0).
+    for (int trial = 0; trial < 10; trial++) {
+        std::uniform_int_distribution<int> len_dist(500, 4000);
+        int n = len_dist(rng);
+        std::vector<int> t(n);
+        std::uniform_int_distribution<int> sym_dist(1, 256);
+        for (int i = 0; i < n - 1; i++) t[i] = sym_dist(rng);
+        t[n - 1] = 0;
+        run_case(t, 257);
+    }
+
+    // Maximal recursion stress: a periodic pattern and a fully constant
+    // block (the classic BWT edge case), both over the real alphabet.
+    {
+        std::vector<int> t(2000);
+        for (int i = 0; i < 1999; i++) t[i] = 1 + (i % 3);
+        t[1999] = 0;
+        run_case(t, 257);
+    }
+    {
+        std::vector<int> t(1500, 5);
+        t[1499] = 0;
+        run_case(t, 257);
+    }
+
+    // Degenerate small sizes.
+    run_case({0}, 257);
+    run_case({5, 0}, 257);
+}
+
 static void test_bwt_codec() {
     std::mt19937 rng(2026);
 
@@ -908,6 +979,7 @@ int main() {
     test_lz_matcher();
     test_lz_codec();
     test_bwt_transform();
+    test_bwt_sais_matches_reference();
     test_bwt_codec();
     test_pantograph_lift();
     test_rod_joint_2d();
