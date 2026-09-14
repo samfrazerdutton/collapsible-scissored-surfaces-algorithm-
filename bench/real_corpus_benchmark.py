@@ -46,7 +46,7 @@ CORPUS = os.path.join(ROOT, "bench", "datasets_real", "source_corpus.bin")
 TMP = os.path.join(ROOT, "bench", "_tmp")
 os.makedirs(TMP, exist_ok=True)
 
-MODE_NAMES = {0: "Raw", 1: "Pantograph Lift", 2: "Geo2D", 3: "Geo3D", 4: "LZ dictionary matcher"}
+MODE_NAMES = {0: "Raw", 1: "Pantograph Lift", 2: "Geo2D", 3: "Geo3D", 4: "LZ dictionary matcher", 5: "BWT + move-to-front"}
 LEVELS = ["fast", "balanced", "high"]
 
 

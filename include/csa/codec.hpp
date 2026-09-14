@@ -10,14 +10,18 @@
 
 namespace csa {
 
-enum class Mode : u8 { Raw = 0, General = 1, Geo2D = 2, Geo3D = 3, GeneralLZ = 4 };
+enum class Mode : u8 { Raw = 0, General = 1, Geo2D = 2, Geo3D = 3, GeneralLZ = 4, GeneralBWT = 5 };
 
-// General-purpose byte-stream compression. Three candidates are always
+// General-purpose byte-stream compression. Up to four candidates are
 // tried -- raw storage, the Pantograph Lift (predictive, good on smooth/
-// self-similar numeric data), and an LZ77-style dictionary matcher with
+// self-similar numeric data), an LZ77-style dictionary matcher with
 // adaptive range coding (repeated-substring redundancy, good on text and
-// structured files) -- and whichever encodes smallest wins, so callers
-// never need to guess which model suits their data. When use_gpu is true
+// structured files), and (for inputs up to a few MB; see codec.cpp's
+// kBwtMaxInputSize) a Burrows-Wheeler Transform + move-to-front mode
+// (local byte-context statistics, good on ordinary prose -- the kind of
+// redundancy bz2 targets and the other candidates don't attack directly)
+// -- and whichever encodes smallest wins, so callers never need to guess
+// which model suits their data. When use_gpu is true
 // and a CUDA device is available, the Pantograph Lift candidate's forward
 // transform runs on the GPU (level-parallel); otherwise it transparently
 // falls back to the CPU implementation. The bitstream is identical either

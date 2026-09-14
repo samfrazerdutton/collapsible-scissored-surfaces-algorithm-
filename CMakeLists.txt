@@ -33,6 +33,8 @@ add_library(csa_core STATIC
     src/rod_joint_transform.cpp
     src/lz_matcher.cpp
     src/lz_codec.cpp
+    src/bwt_transform.cpp
+    src/bwt_codec.cpp
     src/codec.cpp
 )
 target_include_directories(csa_core PUBLIC include)

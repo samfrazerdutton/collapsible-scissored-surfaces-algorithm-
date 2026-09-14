@@ -174,7 +174,7 @@ would make entropy coding itself GPU-parallel, but it is also considerably
 easier to get subtly wrong. Given the choice between a flashier entropy
 coder and one that is provably bit-exact under test, correctness won:
 the range coder here is simple enough to reason about completely, and all
-1330 round-trip checks (see `tests/test_main.cpp`) pass, including the
+1360 round-trip checks (see `tests/test_main.cpp`) pass, including the
 CUDA path. Interleaved-stream rANS for GPU-parallel entropy decode is a
 natural next step (see Future Work).
 
@@ -258,6 +258,75 @@ search's ratio (within 13% of lzma) at the original ~30s cost. None of
 this affects the bitstream format -- it's a pure encoder-side search
 parameter, so decoding is identical regardless of which level compressed
 a file.
+
+### 5. BWT + move-to-front (`include/csa/bwt_transform.hpp`, `include/csa/bwt_codec.hpp`)
+
+A third, distinct kind of redundancy from the two above: the Pantograph
+Lift/Rod-Joint transforms are predictive (good when nearby *samples*
+relate by a small rule) and the LZ matcher finds exact repeated
+*substrings* far apart; the Burrows-Wheeler Transform instead exploits
+local *context* statistics -- "this byte tends to follow this preceding
+context" -- without needing an exact repeat at all. This is bz2's core
+technique, and it's a genuinely different lever: BWT permutes the input
+so every byte migrates next to every other occurrence sharing its
+context, turning that statistical tendency into long runs of identical
+or near-identical bytes; a move-to-front pass then turns those runs into
+mostly-small numbers, which the same adaptive range coder (reused as-is,
+just over a 257-symbol alphabet via `FenwickFreqN`) compresses well.
+
+**Block-based, not whole-file.** A real suffix array is at best O(n log
+n) to build, and this implementation deliberately uses the simpler,
+easier-to-verify O(n log^2 n) prefix-doubling ("Manber-Myers") method
+rather than the linear-time SA-IS algorithm -- correctness over
+cleverness for a first working version (see Future Work). That cost is
+why BWT operates on fixed 256KB blocks (`kBwtDefaultBlockSize`)
+independently, the same reason bz2 itself caps its own block size at
+900KB rather than transforming an entire file as one unit.
+
+**Sentinel-terminated, not raw cyclic rotations.** The classic textbook
+BWT sorts a block's *cyclic rotations* directly, which requires careful
+tie-breaking for periodic blocks (e.g. one repeated byte, where many
+rotations are literally identical strings). This implementation instead
+appends one unique sentinel symbol -- smaller than every real byte --
+before building the suffix array, which makes every suffix distinct by
+construction (no periodicity special-casing needed at all), at the cost
+of one extra symbol per block. `BwtBlockResult`'s alphabet is therefore
+257 values (0 = sentinel, 1..256 = original byte + 1), and decoding is
+the standard LF/`next`-mapping inverse: build a `next[]` array from the
+symbol counts, walk it starting from the sentinel's row for exactly
+`block_size` steps, and read off the original bytes. This was derived
+and hand-verified against the classic `BWT("banana")` textbook example
+before being trusted with anything larger --
+`test_bwt_transform` encodes that exact derivation as a permanent
+regression test.
+
+**No dedicated run-length stage.** bz2's real pipeline follows MTF with
+a specialized RUNA/RUNB zero-run encoding before entropy coding; this
+implementation skips that and relies on the adaptive entropy model's own
+skew-handling to capture a real fraction of the same benefit, trading
+some ratio for meaningfully less implementation risk (see Future Work).
+
+**Measured, not assumed, and gated on that measurement.** `compress()`
+tries this as a fourth candidate alongside raw/Pantograph-Lift/LZ. On
+the 18MB real-source-code corpus (`REAL_CORPUS_BENCHMARK.md`), it never
+actually won -- the LZ candidate's exact-repeat matching already covers
+that corpus's redundancy better -- but trying it unconditionally still
+cost roughly 10 extra seconds at the `fast` level alone (suffix-array
+construction cost doesn't care whether the result ends up winning). On
+realistic few-hundred-KB-to-1MB files, though (`USE_CASES.md`'s
+synthetic server-log, JSON-telemetry, and sensor-CSV datasets), it won
+outright every time -- 8-24% smaller than the next-best candidate,
+enough to newly beat lzma on the JSON case. Since BWT's strength doesn't
+correlate with the LZ-ratio signal the Pantograph Lift skip heuristic
+already uses (it beat an already-strong LZ result by 24% on the JSON
+case), that signal isn't a valid predictor for skipping BWT too. Instead,
+`compress()` uses a plain size cutoff (`kBwtMaxInputSize`, 4MB): below
+it, BWT is always tried since the cost is negligible in absolute terms
+regardless of outcome; above it, the measured cost stopped being worth
+paying for files that size actually measured. This is the same "compare
+real measured behavior, gate on what was actually found" discipline
+applied everywhere else in this codebase, not a tuned constant chosen to
+make a benchmark look good.
 
 ## Container format
 
@@ -605,11 +674,17 @@ smaller call's result).
   substitute for it. Reverted rather than kept as an ambiguous, mixed-
   result default; a real DP-based optimal parser remains the actual
   future-work item here, not the greedy approximation.
-- **A BWT-based mode** would be the more direct way to challenge bz2
-  specifically on ordinary prose, since a large part of bz2's advantage
-  there comes from the Burrows-Wheeler Transform rearranging the data
-  into long runs of similar bytes before entropy coding, not from its LZ
-  stage.
+- **BWT mode has no dedicated run-length stage for MTF's zero-runs**
+  (bz2's RUNA/RUNB scheme) -- the adaptive entropy model's own skew-
+  handling captures a real fraction of that benefit already (see the BWT
+  section above), but a proper zero-run encoding would likely close more
+  of the remaining gap to real bz2 on the cases where BWT already wins.
+- **BWT's suffix-array construction is O(n log^2 n) prefix-doubling, not
+  linear-time SA-IS** -- correctness-over-cleverness for a first working
+  version (see the BWT section above), but it's also why BWT mode is
+  capped at a few MB via `kBwtMaxInputSize`; a linear-time construction
+  would remove the reason for that cap entirely, letting BWT compete on
+  large files too instead of being skipped there.
 - **Lossy mode's 3D path only tries the similarity joint, not the xy+z
   composition** (see the lossy-mode section above) -- extending the
   composition's z-axis Pantograph Lift to support quantization too would

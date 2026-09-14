@@ -46,6 +46,15 @@ unmodified C++ source code, not text written for this project -- and
   zstd -1..-22's tradeoff) -- `fast` beats gzip and bz2 while compressing
   faster than lzma on real source code; `high` closes to within 13% of
   lzma's ratio at real cost in time. See `REAL_CORPUS_BENCHMARK.md`.
+- **BWT + move-to-front mode** -- a real Burrows-Wheeler Transform (block-
+  based suffix-array construction, sentinel-terminated so periodic blocks
+  never need special-casing) feeding a move-to-front pass and the same
+  adaptive entropy coder, targeting bz2's core technique: local byte-
+  context statistics, not exact repeats. `compress()` tries it too (for
+  inputs up to a few MB -- its suffix-array cost isn't worth paying
+  unconditionally on huge files that don't benefit) and it wins outright
+  on realistic server-log, JSON-telemetry, and sensor-CSV data, 8-24%
+  smaller than the next-best candidate. See `USE_CASES.md`.
 - **Adaptive order-1 range coder** -- the entropy-coding backend shared by
   every mode (generalized to arbitrary alphabet sizes for the LZ matcher's
   literal/length/distance streams, not just the original 256-byte case).
@@ -73,7 +82,7 @@ unmodified C++ source code, not text written for this project -- and
   `compress()` keeps one per thread automatically. Measured, not assumed:
   ~3.5x faster sustained per-call time at 50K elements, ~1.7x at 2M (see
   `DESIGN.md`).
-- **1349 round-trip correctness checks** (`tests/test_main.cpp` +
+- **1379 round-trip correctness checks** (`tests/test_main.cpp` +
   `tests/test_capi.cpp`, the latter linking the real shared library to
   catch actual symbol-export problems), including a dedicated check that
   the GPU path actually succeeds (not just that the overall call
@@ -183,13 +192,18 @@ cd bindings/go/csa && go test ./...
   aligns almost exactly with `toroidal.xyz`'s oscillation period, turning a
   15%-smaller loss into a 32%-smaller win. See `DESIGN.md` for the
   mechanism.
-- General mode tries three candidates per file now -- raw storage,
-  Pantograph Lift, and a real LZ77-style dictionary matcher -- and keeps
-  whichever encodes smallest. On `text_repetitive.bin` (a single sentence
-  repeated thousands of times) the LZ matcher's *unbounded* window beats
-  gzip, bz2, *and* lzma outright; that's a real structural edge on very
-  long-range repetition specifically, not a claim that CSA beats mature LZ
-  compressors on arbitrary text in general.
+- General mode tries up to four candidates per file now -- raw storage,
+  Pantograph Lift, a real LZ77-style dictionary matcher, and (for inputs
+  up to a few MB) a Burrows-Wheeler Transform + move-to-front mode -- and
+  keeps whichever encodes smallest. On `text_repetitive.bin` (a single
+  sentence repeated thousands of times) the LZ matcher's *unbounded*
+  window beats gzip, bz2, *and* lzma outright; that's a real structural
+  edge on very long-range repetition specifically, not a claim that CSA
+  beats mature LZ compressors on arbitrary text in general. The BWT
+  candidate is the more broadly useful addition: on realistic (not
+  maximally repetitive) server-log, JSON-telemetry, and sensor-CSV data
+  (see `USE_CASES.md`) it wins outright every time, 8-24% smaller than
+  the next-best candidate.
 - The harshest, most credible test in this repo is `REAL_CORPUS_BENCHMARK.md`:
   18MB of real, unmodified C++ source code, not text written or generated
   for this project, benchmarked against gzip/bz2/lzma *and* zstd and

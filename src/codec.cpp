@@ -1,4 +1,5 @@
 #include "csa/codec.hpp"
+#include "csa/bwt_codec.hpp"
 #include "csa/lz_codec.hpp"
 #include "csa/pantograph_lift.hpp"
 #include "csa/pantograph_lift_cuda.hpp"
@@ -278,6 +279,19 @@ constexpr size_t kAdaptiveSizeThreshold = 100'000;
 // this file's actual LZ result, never a guess from a file extension or a
 // sniffed "looks like text" classifier.
 constexpr double kAdaptiveLzStrongRatio = 0.35;
+
+// BWT's suffix-array construction cost scales with input size regardless
+// of whether it ends up winning (unlike the LZ-ratio-based skip above,
+// which is a real signal specifically for Pantograph Lift) -- measured on
+// an 18MB real-source-code corpus, trying it unconditionally cost an
+// extra ~10s at the "fast" level alone without winning at any size, while
+// on realistic few-hundred-KB-to-1MB files (server logs, JSON telemetry,
+// sensor CSV -- see USE_CASES.md) it won convincingly (8-24% smaller than
+// the next-best candidate) for negligible added time. This is a plain
+// size cutoff, not a content-based guess: below it, BWT is always tried
+// (it either wins or it doesn't, cheaply); above it, the cost of trying
+// stops being worth paying for files this size actually measured.
+constexpr size_t kBwtMaxInputSize = 4 * 1024 * 1024;
 } // namespace
 
 std::vector<u8> compress(const std::vector<u8>& input, bool use_gpu, int lz_max_chain, size_t lz_nice_length) {
@@ -303,8 +317,24 @@ std::vector<u8> compress(const std::vector<u8>& input, bool use_gpu, int lz_max_
         skip_pantograph = lz_ratio < kAdaptiveLzStrongRatio;
     }
 
+    // GENERAL-BWT candidate: a different kind of redundancy than the LZ
+    // matcher's exact-repeat matching -- local byte-context statistics,
+    // the kind bz2's Burrows-Wheeler stage targets. Skipped above
+    // kBwtMaxInputSize on a plain size cutoff (see its comment) rather
+    // than the LZ-ratio signal used for Pantograph Lift below: BWT's
+    // strength doesn't correlate with how well LZ already did (it beat an
+    // already-strong LZ result by 24% on one real use case), so that
+    // signal isn't a valid skip predictor for it.
     const std::vector<u8>* best = &raw_blob;
     if (lz_blob.size() < best->size()) best = &lz_blob;
+
+    std::vector<u8> bwt_blob;
+    if (input.size() <= kBwtMaxInputSize) {
+        write_magic_mode(bwt_blob, Mode::GeneralBWT);
+        std::vector<u8> bwt_payload = bwt_encode(input);
+        bwt_blob.insert(bwt_blob.end(), bwt_payload.begin(), bwt_payload.end());
+        if (bwt_blob.size() < best->size()) best = &bwt_blob;
+    }
 
     std::vector<u8> general_blob;
     if (!skip_pantograph) {
@@ -347,6 +377,9 @@ std::vector<u8> decompress(const std::vector<u8>& blob) {
     }
     if (mode == Mode::GeneralLZ) {
         return lz_decode(blob.data(), blob.size(), pos);
+    }
+    if (mode == Mode::GeneralBWT) {
+        return bwt_decode(blob.data(), blob.size(), pos);
     }
     throw std::runtime_error("csa: decompress() called on a geometric-mode stream; use decompress_geo2d/3d");
 }

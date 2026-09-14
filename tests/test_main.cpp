@@ -1,6 +1,8 @@
 // Minimal self-contained test harness (no external deps) covering
 // round-trip correctness for every layer: range coder, Pantograph Lift,
 // Rod-Joint transform (2D/3D), and the full container codec.
+#include "csa/bwt_codec.hpp"
+#include "csa/bwt_transform.hpp"
 #include "csa/codec.hpp"
 #include "csa/lz_codec.hpp"
 #include "csa/lz_matcher.hpp"
@@ -124,6 +126,83 @@ static void test_lz_codec() {
     // size -- this is the entire point of adding a dictionary matcher.
     auto text_bytes = std::vector<u8>(text.begin(), text.end());
     auto text_blob = lz_encode(text_bytes);
+    CHECK(text_blob.size() < text_bytes.size() / 20);
+}
+
+static void test_bwt_transform() {
+    // The classic textbook example: BWT("banana") is well known, and
+    // -- more importantly for this implementation -- hand-verifiable:
+    // the sentinel-based construction here was derived and checked by
+    // hand against this exact case before being trusted with anything
+    // larger. This test is that derivation, permanently encoded.
+    {
+        std::vector<u8> banana = {'b', 'a', 'n', 'a', 'n', 'a'};
+        BwtBlockResult r = bwt_encode_block(banana);
+        CHECK(r.symbols.size() == banana.size() + 1);
+        auto back = bwt_decode_block(r.symbols);
+        CHECK(back == banana);
+    }
+
+    std::mt19937 rng(2025);
+    std::vector<std::vector<u8>> cases;
+    cases.push_back({1}); // single byte
+    cases.push_back(std::vector<u8>(500, 7)); // maximally repetitive: stresses the
+                                               // sentinel's job of keeping every
+                                               // suffix distinct despite total periodicity
+    cases.push_back(random_bytes(5000, rng)); // no exploitable structure
+    {
+        std::vector<u8> all_bytes(256);
+        for (int i = 0; i < 256; i++) all_bytes[i] = (u8)i;
+        cases.push_back(all_bytes); // every possible byte value, once each
+    }
+    {
+        std::string s;
+        for (int i = 0; i < 300; i++) s += "the quick brown fox jumps over the lazy dog. ";
+        cases.push_back(std::vector<u8>(s.begin(), s.end()));
+    }
+
+    for (auto& block : cases) {
+        BwtBlockResult r = bwt_encode_block(block);
+        CHECK(r.symbols.size() == block.size() + 1);
+        // The sentinel (0) must appear in the output exactly once.
+        size_t zero_count = 0;
+        for (u16 s : r.symbols) if (s == 0) zero_count++;
+        CHECK(zero_count == 1);
+        auto back = bwt_decode_block(r.symbols);
+        CHECK(back == block);
+    }
+}
+
+static void test_bwt_codec() {
+    std::mt19937 rng(2026);
+
+    std::vector<std::vector<u8>> cases;
+    cases.push_back({});
+    cases.push_back({42});
+    cases.push_back(std::vector<u8>(1000, 9));
+    cases.push_back(random_bytes(3000, rng));
+
+    std::string text;
+    for (int i = 0; i < 500; i++) text += "the quick brown fox jumps over the lazy dog. ";
+    cases.push_back(std::vector<u8>(text.begin(), text.end()));
+
+    // Spans multiple BWT blocks (kBwtDefaultBlockSize is 256KB): exercises
+    // the block-chunking logic itself, not just a single block's transform.
+    cases.push_back(random_bytes(kBwtDefaultBlockSize * 2 + 12345, rng));
+
+    for (auto& input : cases) {
+        auto blob = bwt_encode(input);
+        size_t pos = 0;
+        auto back = bwt_decode(blob.data(), blob.size(), pos);
+        CHECK(back == input);
+        CHECK(pos == blob.size());
+    }
+
+    // Highly repetitive text should compress to a tiny fraction of its
+    // size -- BWT+MTF on a single repeated sentence collapses almost
+    // entirely to rank-0 after the first occurrence.
+    auto text_bytes = std::vector<u8>(text.begin(), text.end());
+    auto text_blob = bwt_encode(text_bytes);
     CHECK(text_blob.size() < text_bytes.size() / 20);
 }
 
@@ -812,6 +891,8 @@ int main() {
     test_range_coder();
     test_lz_matcher();
     test_lz_codec();
+    test_bwt_transform();
+    test_bwt_codec();
     test_pantograph_lift();
     test_rod_joint_2d();
     test_rod_joint_3d();

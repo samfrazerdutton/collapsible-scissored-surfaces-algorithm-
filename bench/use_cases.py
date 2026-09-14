@@ -30,7 +30,7 @@ SCISSORC = os.path.join(ROOT, "build", "scissorc.exe")
 TMP = os.path.join(ROOT, "bench", "_tmp")
 os.makedirs(TMP, exist_ok=True)
 
-MODE_NAMES = {0: "Raw", 1: "Pantograph Lift", 2: "Geo2D", 3: "Geo3D", 4: "LZ dictionary matcher"}
+MODE_NAMES = {0: "Raw", 1: "Pantograph Lift", 2: "Geo2D", 3: "Geo3D", 4: "LZ dictionary matcher", 5: "BWT + move-to-front"}
 
 
 def run(*args):
@@ -178,7 +178,7 @@ def main():
         "20,000 rows of a smooth-ish temperature signal, noisy humidity, and a "
         "slowly-drifting pressure reading, formatted as CSV text (as most sensor "
         "logging/export pipelines actually produce it, not raw binary floats). This "
-        "is the case where the three-way auto-select actually has a real decision to "
+        "is the case where the four-way auto-select actually has a real decision to "
         "make -- text-as-numbers isn't purely one shape or the other.\n"
     )
     lines.append(f"- CSA auto-selected: **{r3['mode']}**")
@@ -210,7 +210,7 @@ def main():
     lines.append("## Honest summary\n")
     lines.append(
         f"- Auto-selected models in this run: server log -> {r['mode']}, JSON events "
-        f"-> {r2['mode']}, sensor CSV -> {r3['mode']}. The point of trying all three "
+        f"-> {r2['mode']}, sensor CSV -> {r3['mode']}. The point of trying all four "
         "candidates per file isn't that any one of them is best everywhere -- it's "
         "that the codec doesn't need to be told which kind of file it's looking at.\n"
     )
