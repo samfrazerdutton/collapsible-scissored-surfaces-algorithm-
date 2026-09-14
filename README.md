@@ -115,7 +115,14 @@ dedicated CPU-vs-GPU crossover measurement from 100K to 256M elements
   `compress()` keeps one per thread automatically. Measured, not assumed:
   ~3.5x faster sustained per-call time at 50K elements, ~1.7x at 2M (see
   `DESIGN.md`).
-- **1596 round-trip correctness checks** (`tests/test_main.cpp` +
+- **A second, independent GPU measurement** for the Quaternion Joint's
+  per-block calibration search (correctness-verified against the CPU
+  path before any timing was trusted): a wash or a real loss at every
+  real dataset size measured so far (all under 21K poses), but a real,
+  growing win from ~100K elements onward (up to ~4x faster at 10M) --
+  not wired into `compress_pose` since no dataset measured here actually
+  benefits yet. See `DESIGN.md`.
+- **1613 round-trip correctness checks** (`tests/test_main.cpp` +
   `tests/test_capi.cpp`, the latter linking the real shared library to
   catch actual symbol-export problems), including a dedicated check that
   the GPU path actually succeeds (not just that the overall call

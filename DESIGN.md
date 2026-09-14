@@ -956,11 +956,104 @@ specifically to catch the failure mode this design has to avoid (a buffer
 grown for a larger call silently corrupting or truncating a later,
 smaller call's result).
 
+### GPU calibration for the Quaternion Joint (`quaternion_calibration_cuda.cu`)
+
+The Pantograph Lift's GPU path above accelerates a *transform*; the
+Quaternion Joint has no transform to accelerate in the same sense --
+its expensive part is *calibration* (the per-block, per-candidate-lag
+least-squares search), which is embarrassingly parallel across blocks
+(it operates on the true, fully-known quaternion sequence, unlike the
+*encoding* pass that follows, which depends on each block's
+*reconstructed* history and must stay sequential regardless of what
+runs the calibration). This is a genuinely different question from the
+Pantograph Lift's own GPU result above, not an assumption extrapolated
+from it: `quat_calibrate_all_blocks_cuda` computes, for every
+(block, candidate lag) pair, the same closed-form calibrated delta and
+its SSE `pick_block_lag` computes one candidate at a time on the CPU
+(one CUDA thread block per pair, shared-memory tree reduction over up
+to seven running sums, from which both the delta and its exact SSE fall
+out via the standard least-squares identity `SSE_min = sum|b|^2 -
+|acc|^2/sum|a|^2` -- no second data pass needed). Verified bit-for-bit
+(within +-1 in the Q16.16 integer, for floating-point summation-order
+differences between the CPU's sequential accumulation and the GPU's
+tree reduction) against the CPU's own production code path
+(`quaternion_joint_forward`'s forced-lag mode) across 24 blocks x 14
+lags before any timing number below was trusted --
+`tests/test_main.cpp`'s `test_quat_calibration_cuda_matches_cpu`.
+
+**Measured, not assumed** (`bench/quat_calibration_gpu_crossover.cpp`,
+same RTX 2060 Max-Q): calibration alone, isolated from encoding, on real
+dataset sizes and much larger synthetic ones to look for any crossover:
+
+| n (elements) | CPU calibration | GPU calibration | GPU vs CPU | calibration's share of full CPU time |
+|---:|---:|---:|---:|---:|
+| 4,541 (KITTI) | 0.270 ms | 0.815 ms | 3.02x slower | 25.1% |
+| 16,702 (EuRoC) | 1.008 ms | 1.123 ms | 1.11x slower | 24.8% |
+| 20,957 (TUM) | 1.265 ms | 1.187 ms | 0.94x (roughly even) | 25.2% |
+| 100,000 | 6.075 ms | 3.567 ms | 1.70x faster | 24.0% |
+| 1,000,000 | 61.144 ms | 26.848 ms | 2.28x faster | 23.6% |
+| 10,000,000 | 611.114 ms | 149.582 ms | 4.09x faster | 23.8% |
+| 50,000,000 | 3092.657 ms | 980.417 ms | 3.15x faster | 23.5% |
+
+This is a genuinely different result from the Pantograph Lift's, not
+the same story again: at every real dataset size this project has
+actually measured (all under 21K poses), GPU calibration is a wash or a
+real (if modest) loss -- but it shows a real, growing advantage starting
+around 100K elements, well before the Pantograph Lift's own crossover
+territory. The honest caveat is the "calibration's share" column:
+calibration is a stable ~24-25% of total CPU orientation-encoding time
+regardless of scale (both calibration and encoding are O(n), just with
+different constants), so even the best-measured GPU speedup here (4.09x
+at 10M elements) would only cut *total* orientation-encoding time by
+roughly 18-19% -- a real, meaningful improvement at large enough scale,
+not a dramatic one, because the sequential encoding pass this can't
+touch is most of the work either way.
+
+**Not wired into `compress_pose`**: given no real dataset measured in
+this repo shows a clear win (all are under 21K poses, squarely in the
+break-even-or-loss region), integrating this into production would add
+real complexity (device buffer management, the same fallback plumbing
+`CudaLiftSession` needed) for no benefit on the workloads actually
+validated so far. The kernel and its correctness cross-check are real
+and kept, should a future workload at real 100K+-pose scale (e.g.
+aggregating calibration across many long trajectories at once, not one
+file at a time) make it worth integrating.
+
+### Interleaved parallel entropy coding: investigated, not built
+
+The adaptive order-1 range coder every mode in this codebase shares
+(`range_coder.hpp`) is fundamentally sequential: each symbol's encoding
+depends on the *adapted* frequency state left behind by every symbol
+before it, so there is no way to parallelize one continuous range-coded
+stream without changing what gets encoded. The standard technique for
+making entropy coding GPU-parallel is **interleaving**: split the input
+into N independent lanes, run N independent rANS (or range) coders
+side by side (one per GPU thread/warp), and concatenate their outputs
+with a small per-lane length header -- exactly the same "give up a
+little cross-boundary adaptation for real parallelism" tradeoff this
+session's own streaming pose API (see above) already made explicitly
+and measured honestly for a different reason (bounded memory instead of
+GPU parallelism).
+
+This was investigated, not implemented: doing it correctly (rANS's
+renormalization semantics, getting the interleaved byte-stream framing
+right, a real GPU port, and the same honest CPU-vs-GPU crossover
+measurement every other claim in this codebase gets) is a substantial,
+separate undertaking on the order of the Quaternion Joint calibration
+kernel above -- and unlike that kernel, this repo does not yet have a
+validated implementation to report a real number for. Documented here
+as the concrete, correctly-scoped next step (which specific technique,
+which files it touches, what it would need to be validated before any
+number is trusted) rather than left as a vague "GPU entropy coding
+would be nice" aspiration: implement interleaved rANS lanes (a fixed
+lane count, e.g. one per SM), verify each lane's output round-trips
+independently against the existing sequential range coder's ratio on
+the same data (some ratio loss is expected and should be measured, not
+hidden), *then* port to CUDA and measure the crossover the same way
+every other GPU claim in this codebase has been measured.
+
 ## Honest limitations / future work
 
-- **Interleaved-stream rANS** would let the entropy-coding stage itself
-  run in parallel on GPU (unlike the current sequential adaptive range
-  coder), closing the loop on an end-to-end GPU-resident codec.
 - **A CPU-vs-GPU crossover past this GPU's ~256M-element practical VRAM
   ceiling** hasn't been measured (see `GPU_BENCHMARKS.md`) -- testing on a
   GPU with more VRAM, or reducing per-buffer memory (e.g. processing in

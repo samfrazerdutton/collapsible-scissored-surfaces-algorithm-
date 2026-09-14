@@ -9,6 +9,7 @@
 #include "csa/pantograph_lift.hpp"
 #include "csa/pantograph_lift_cuda.hpp"
 #include "csa/pose_stream.hpp"
+#include "csa/quaternion_calibration_cuda.hpp"
 #include "csa/quaternion_joint.hpp"
 #include "csa/range_coder.hpp"
 #include "csa/rod_joint_transform.hpp"
@@ -1411,6 +1412,70 @@ static void test_quaternion_joint_adaptive_blocking() {
                  100.0 * (1.0 - (double)adaptive_bytes / (double)fixed_bytes));
 }
 
+// Validates quat_calibrate_all_blocks_cuda against the CPU's own
+// per-(block, forced-lag) calibration (quaternion_joint_forward's
+// force_lag path) BEFORE any GPU timing claim is trusted -- matching this
+// project's standing rule that a GPU kernel's output is verified against
+// the CPU path first, timed second, never the other way around.
+static void test_quat_calibration_cuda_matches_cpu() {
+    if (!cuda_is_available()) return;
+
+    std::mt19937 rng(5051);
+    std::uniform_real_distribution<double> noise_deg(-3.0, 3.0);
+    std::vector<Quat4i> quats;
+    const double scale = 1 << 20;
+    double qw = 1, qx = 0, qy = 0, qz = 0;
+    for (int i = 0; i < 3000; i++) {
+        quats.push_back(quat_to_i32(qw, qx, qy, qz, scale));
+        double half = ((1.5 + noise_deg(rng)) * kTestPi / 180.0) / 2.0;
+        double dqw = std::cos(half), dqz = std::sin(half);
+        double nw, nx, ny, nz;
+        quat_mul_d(qw, qx, qy, qz, dqw, 0, 0, dqz, nw, nx, ny, nz);
+        qw = nw; qx = nx; qy = ny; qz = nz;
+    }
+
+    size_t n = quats.size() - 1;
+    std::vector<i32> qw_arr(n), qx_arr(n), qy_arr(n), qz_arr(n);
+    for (size_t i = 1; i < quats.size(); i++) {
+        qw_arr[i - 1] = quats[i].w; qx_arr[i - 1] = quats[i].x;
+        qy_arr[i - 1] = quats[i].y; qz_arr[i - 1] = quats[i].z;
+    }
+    std::vector<u32> lags(kRodJointCandidateLags, kRodJointCandidateLags + kRodJointNumCandidateLags);
+
+    std::vector<std::array<i64, 4>> gpu_delta;
+    std::vector<double> gpu_sse;
+    bool ok = quat_calibrate_all_blocks_cuda(qw_arr, qx_arr, qy_arr, qz_arr, kQuatJointBlockSize, lags, gpu_delta, gpu_sse);
+    CHECK(ok);
+    if (!ok) return;
+
+    size_t nblocks = (n + kQuatJointBlockSize - 1) / kQuatJointBlockSize;
+    CHECK(gpu_delta.size() == nblocks * lags.size());
+
+    // Cross-check every (block, lag) pair's calibrated D against the
+    // CPU's own forced-lag path (quaternion_joint_forward(quats, lag)).
+    // Allowing +-1 in the Q16.16 integer for floating-point summation-
+    // order differences between the CPU's sequential accumulation and
+    // the GPU's tree reduction -- not a claim of bit-exact reproduction,
+    // the same tolerance this codebase always allows for calibration
+    // math (only the final integer residual needs to be exact).
+    bool all_match = true;
+    int mismatches = 0;
+    for (size_t lag_idx = 0; lag_idx < lags.size(); lag_idx++) {
+        QuaternionJointResult cpu_r = quaternion_joint_forward(quats, lags[lag_idx]);
+        CHECK(cpu_r.block_delta.size() == nblocks);
+        for (size_t b = 0; b < nblocks; b++) {
+            const auto& cpu_d = cpu_r.block_delta[b];
+            const auto& gpu_d = gpu_delta[b * lags.size() + lag_idx];
+            for (int k = 0; k < 4; k++) {
+                if (std::abs(cpu_d[k] - gpu_d[k]) > 1) { all_match = false; mismatches++; }
+            }
+        }
+    }
+    CHECK(all_match);
+    std::printf("  (Quaternion calibration CUDA: %zu blocks x %zu lags cross-checked against CPU, mismatches=%d)\n",
+                 nblocks, lags.size(), mismatches);
+}
+
 // End-to-end through the public compress_pose/decompress_pose/
 // compress_pose_lossy API: a synthetic 6-DOF pose stream (a drone
 // circling upward while smoothly yawing to track its own heading, plus
@@ -1594,6 +1659,7 @@ int main() {
     test_quaternion_joint_lossy();
     test_rod_joint_3d_adaptive_blocking();
     test_quaternion_joint_adaptive_blocking();
+    test_quat_calibration_cuda_matches_cpu();
     test_pose_codec();
     test_pose_stream();
     test_codec();

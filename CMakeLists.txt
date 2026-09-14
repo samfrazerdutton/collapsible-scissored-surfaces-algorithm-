@@ -46,11 +46,18 @@ if(CSA_HAVE_CUDA)
     set(CMAKE_CUDA_ARCHITECTURES 75) # RTX 20-series (Turing, sm_75); override with -DCMAKE_CUDA_ARCHITECTURES=... on other GPUs
     add_library(csa_cuda STATIC
         cuda/pantograph_lift_cuda.cu
+        cuda/quaternion_calibration_cuda.cu
     )
     target_include_directories(csa_cuda PUBLIC include cuda)
     set_target_properties(csa_cuda PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
     target_compile_definitions(csa_core PUBLIC CSA_HAVE_CUDA=1)
     target_link_libraries(csa_core PUBLIC csa_cuda)
+
+    # Standalone GPU-vs-CPU calibration benchmark (see DESIGN.md) -- not
+    # part of the shipped library, only built when CUDA is available
+    # since it directly measures the CUDA calibration kernel.
+    add_executable(quat_calibration_gpu_crossover bench/quat_calibration_gpu_crossover.cpp)
+    target_link_libraries(quat_calibration_gpu_crossover PRIVATE csa_core)
 else()
     target_sources(csa_core PRIVATE src/pantograph_lift_cuda_stub.cpp)
     target_compile_definitions(csa_core PUBLIC CSA_HAVE_CUDA=0)
