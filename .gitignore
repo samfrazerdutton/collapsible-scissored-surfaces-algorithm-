@@ -2,6 +2,8 @@ build/
 bench/datasets/
 bench/datasets_real/
 bench/_tmp/
+bench/_tmp_geo_bench/
+bench/_thirdparty/
 *.obj
 *.exe
 *.lib
