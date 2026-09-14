@@ -8,6 +8,7 @@
 #include "csa/lz_matcher.hpp"
 #include "csa/pantograph_lift.hpp"
 #include "csa/pantograph_lift_cuda.hpp"
+#include "csa/quaternion_joint.hpp"
 #include "csa/range_coder.hpp"
 #include "csa/rod_joint_transform.hpp"
 #include <algorithm>
@@ -1071,6 +1072,293 @@ static void test_rod_joint_lag_search_period_drift() {
                  100.0 * (1.0 - (double)auto_sum / (double)best_forced_sum));
 }
 
+namespace {
+constexpr double kTestPi = 3.14159265358979323846;
+
+// Hamilton product, unscaled doubles.
+void quat_mul_d(double aw, double ax, double ay, double az, double bw, double bx, double by, double bz,
+                 double& ow, double& ox, double& oy, double& oz) {
+    ow = aw * bw - ax * bx - ay * by - az * bz;
+    ox = aw * bx + ax * bw + ay * bz - az * by;
+    oy = aw * by - ax * bz + ay * bw + az * bx;
+    oz = aw * bz + ax * by - ay * bx + az * bw;
+}
+
+Quat4i quat_to_i32(double w, double x, double y, double z, double scale) {
+    return {(i32)std::lround(w * scale), (i32)std::lround(x * scale), (i32)std::lround(y * scale), (i32)std::lround(z * scale)};
+}
+} // namespace
+
+static void test_quaternion_joint() {
+    const double scale = 1 << 20; // ~6 decimal digits of precision, same order as the GPS-track benchmark's --scale
+
+    // Case 1: constant angular velocity about a fixed axis -- a smoothly
+    // panning head or a drone holding a steady turn rate. This is the
+    // shape class the lag=1 body-frame model is exactly built for: the
+    // per-step delta rotation is the same every step, so a single
+    // calibrated D should predict it almost perfectly.
+    {
+        std::vector<Quat4i> quats;
+        double qw = 1, qx = 0, qy = 0, qz = 0;
+        double half = (1.5 * kTestPi / 180.0) / 2.0; // 1.5 degrees/step about z
+        double dqw = std::cos(half), dqz = std::sin(half);
+        for (int i = 0; i < 2000; i++) {
+            quats.push_back(quat_to_i32(qw, qx, qy, qz, scale));
+            double nw, nx, ny, nz;
+            quat_mul_d(qw, qx, qy, qz, dqw, 0, 0, dqz, nw, nx, ny, nz);
+            qw = nw; qx = nx; qy = ny; qz = nz;
+        }
+
+        QuaternionJointResult r = quaternion_joint_forward(quats);
+        auto back = quaternion_joint_inverse(r);
+        CHECK(back.size() == quats.size());
+        bool match = true;
+        for (size_t i = 0; i < quats.size(); i++)
+            if (back[i].w != quats[i].w || back[i].x != quats[i].x ||
+                back[i].y != quats[i].y || back[i].z != quats[i].z) match = false;
+        CHECK(match);
+
+        // Real compression claim: constant angular velocity should predict
+        // almost exactly, so residuals should be tiny compared to the raw
+        // quaternion component magnitudes (~scale).
+        i64 res_sum = 0;
+        for (i32 v : r.residual_w) res_sum += std::abs(v);
+        for (i32 v : r.residual_x) res_sum += std::abs(v);
+        for (i32 v : r.residual_y) res_sum += std::abs(v);
+        for (i32 v : r.residual_z) res_sum += std::abs(v);
+        double avg_res = (double)res_sum / (double)(4 * (quats.size() - 1));
+        CHECK(avg_res < scale * 0.001); // residuals under ~0.1% of a unit-quaternion component
+        std::printf("  (Quaternion Joint, constant angular velocity: avg |residual|=%.2f, scale=%.0f)\n", avg_res, scale);
+    }
+
+    // Case 2: oscillating angular velocity (a back-and-forth head shake,
+    // period 6 steps) with two distinct periods in the first vs second
+    // half -- the same "no single lag fits the whole file" design as
+    // test_rod_joint_lag_search_period_drift, to check the lag search
+    // benefit carries over to orientation.
+    {
+        std::vector<Quat4i> quats;
+        double qw = 1, qx = 0, qy = 0, qz = 0;
+        for (int i = 0; i < 3000; i++) {
+            quats.push_back(quat_to_i32(qw, qx, qy, qz, scale));
+            double period = (i < 1500) ? 6.0 : 4.0;
+            double amp_deg = 2.0 * std::sin(2.0 * kTestPi * (double)i / period);
+            double half = (amp_deg * kTestPi / 180.0) / 2.0;
+            double dqw = std::cos(half), dqx = std::sin(half);
+            double nw, nx, ny, nz;
+            quat_mul_d(qw, qx, qy, qz, dqw, dqx, 0, 0, nw, nx, ny, nz);
+            qw = nw; qx = nx; qy = ny; qz = nz;
+        }
+
+        i64 best_forced_sum = -1;
+        for (u32 lag : kRodJointCandidateLags) {
+            QuaternionJointResult forced = quaternion_joint_forward(quats, lag);
+            i64 sum = 0;
+            for (i32 v : forced.residual_w) sum += std::abs(v);
+            for (i32 v : forced.residual_x) sum += std::abs(v);
+            for (i32 v : forced.residual_y) sum += std::abs(v);
+            for (i32 v : forced.residual_z) sum += std::abs(v);
+            if (best_forced_sum < 0 || sum < best_forced_sum) best_forced_sum = sum;
+        }
+
+        QuaternionJointResult auto_r = quaternion_joint_forward(quats);
+        i64 auto_sum = 0;
+        for (i32 v : auto_r.residual_w) auto_sum += std::abs(v);
+        for (i32 v : auto_r.residual_x) auto_sum += std::abs(v);
+        for (i32 v : auto_r.residual_y) auto_sum += std::abs(v);
+        for (i32 v : auto_r.residual_z) auto_sum += std::abs(v);
+
+        auto back = quaternion_joint_inverse(auto_r);
+        CHECK(back.size() == quats.size());
+        bool match = true;
+        for (size_t i = 0; i < quats.size(); i++)
+            if (back[i].w != quats[i].w || back[i].x != quats[i].x ||
+                back[i].y != quats[i].y || back[i].z != quats[i].z) match = false;
+        CHECK(match);
+
+        CHECK(auto_sum < best_forced_sum * 3 / 4);
+        std::printf("  (Quaternion Joint lag search: best single-lag residual sum=%lld, per-block auto=%lld, %.1f%% smaller)\n",
+                     (long long)best_forced_sum, (long long)auto_sum,
+                     100.0 * (1.0 - (double)auto_sum / (double)best_forced_sum));
+    }
+
+    // Edge cases.
+    {
+        std::vector<Quat4i> empty;
+        CHECK(quaternion_joint_inverse(quaternion_joint_forward(empty)).empty());
+
+        std::vector<Quat4i> one = {{(i32)scale, 0, 0, 0}};
+        auto back1 = quaternion_joint_inverse(quaternion_joint_forward(one));
+        CHECK(back1.size() == 1 && back1[0].w == one[0].w);
+
+        std::vector<Quat4i> two = {{(i32)scale, 0, 0, 0}, {0, (i32)scale, 0, 0}};
+        auto back2 = quaternion_joint_inverse(quaternion_joint_forward(two));
+        CHECK(back2.size() == 2 && back2[1].x == two[1].x);
+    }
+
+    // Adversarial case: random, structurally inconsistent quaternion-shaped
+    // integers (not even normalized) -- the calibrated model should predict
+    // poorly (large residuals expected), but round-trip must still be exact
+    // regardless, exactly like rod_joint_2d's random_walk case.
+    {
+        std::mt19937 rng(2029);
+        std::uniform_int_distribution<int> d(-(1 << 20), 1 << 20);
+        std::vector<Quat4i> randq;
+        for (int i = 0; i < 500; i++) randq.push_back({d(rng), d(rng), d(rng), d(rng)});
+        auto back = quaternion_joint_inverse(quaternion_joint_forward(randq));
+        CHECK(back.size() == randq.size());
+        bool match = true;
+        for (size_t i = 0; i < randq.size(); i++)
+            if (back[i].w != randq[i].w || back[i].x != randq[i].x ||
+                back[i].y != randq[i].y || back[i].z != randq[i].z) match = false;
+        CHECK(match);
+    }
+}
+
+static void test_quaternion_joint_lossy() {
+    const double scale = 1 << 20;
+    std::vector<Quat4i> quats;
+    double qw = 1, qx = 0, qy = 0, qz = 0;
+    unsigned int seed = 2030;
+    auto next_rand = [&]() { seed = seed * 1664525u + 1013904223u; return (double)(seed >> 8) / (double)(1u << 24); };
+    for (int i = 0; i < 4000; i++) {
+        quats.push_back(quat_to_i32(qw, qx, qy, qz, scale));
+        double deg = 1.0 + (next_rand() - 0.5) * 0.4; // steady turn rate with small noise
+        double half = (deg * kTestPi / 180.0) / 2.0;
+        double dqw = std::cos(half), dqz = std::sin(half);
+        double nw, nx, ny, nz;
+        quat_mul_d(qw, qx, qy, qz, dqw, 0, 0, dqz, nw, nx, ny, nz);
+        qw = nw; qx = nx; qy = ny; qz = nz;
+    }
+
+    // quant_step <= 1 is exactly lossless.
+    {
+        QuaternionJointResult r0 = quaternion_joint_forward(quats, 0, 0, 0);
+        QuaternionJointResult r1 = quaternion_joint_forward(quats, 0, 1, 0);
+        auto back0 = quaternion_joint_inverse(r0);
+        auto back1 = quaternion_joint_inverse(r1);
+        bool match = true;
+        for (size_t i = 0; i < quats.size(); i++) {
+            if (back0[i].w != quats[i].w || back0[i].x != quats[i].x || back0[i].y != quats[i].y || back0[i].z != quats[i].z) match = false;
+            if (back1[i].w != quats[i].w || back1[i].x != quats[i].x || back1[i].y != quats[i].y || back1[i].z != quats[i].z) match = false;
+        }
+        CHECK(match);
+    }
+
+    // Lossy: bounded error, periodic resync limits drift, real compression win.
+    u32 quant_step = 64, resync_interval = 32;
+    QuaternionJointResult lossless = quaternion_joint_forward(quats, 0, 1, 0);
+    QuaternionJointResult lossy = quaternion_joint_forward(quats, 0, quant_step, resync_interval);
+    auto back = quaternion_joint_inverse(lossy);
+    CHECK(back.size() == quats.size());
+
+    i32 max_err = 0;
+    for (size_t i = 0; i < quats.size(); i++)
+        max_err = std::max({max_err, std::abs(quats[i].w - back[i].w), std::abs(quats[i].x - back[i].x),
+                             std::abs(quats[i].y - back[i].y), std::abs(quats[i].z - back[i].z)});
+    // Generous bound: resync_interval steps between exact keyframes, each
+    // step's own quantization error up to quant_step/2, plus headroom for
+    // compounding through the recursive prediction dependency.
+    i32 generous_bound = (i32)quant_step * (i32)resync_interval;
+    CHECK(max_err <= generous_bound);
+
+    i64 lossless_res_sum = 0, lossy_res_sum = 0;
+    for (i32 v : lossless.residual_w) lossless_res_sum += std::abs(v);
+    for (i32 v : lossless.residual_x) lossless_res_sum += std::abs(v);
+    for (i32 v : lossless.residual_y) lossless_res_sum += std::abs(v);
+    for (i32 v : lossless.residual_z) lossless_res_sum += std::abs(v);
+    for (i32 v : lossy.residual_w) lossy_res_sum += std::abs(v);
+    for (i32 v : lossy.residual_x) lossy_res_sum += std::abs(v);
+    for (i32 v : lossy.residual_y) lossy_res_sum += std::abs(v);
+    for (i32 v : lossy.residual_z) lossy_res_sum += std::abs(v);
+    CHECK(lossy_res_sum < lossless_res_sum); // quantized residual indices are genuinely smaller in magnitude
+    std::printf("  (Quaternion Joint lossy: quant_step=%u, max observed error=%d (bound %d), residual magnitude sum %lld -> %lld)\n",
+                 quant_step, max_err, generous_bound, (long long)lossless_res_sum, (long long)lossy_res_sum);
+}
+
+// End-to-end through the public compress_pose/decompress_pose/
+// compress_pose_lossy API: a synthetic 6-DOF pose stream (a drone
+// circling upward while smoothly yawing to track its own heading, plus
+// small realistic per-step noise on both position and orientation) --
+// close to the real GPS-trajectory/pose-tracking shape class both halves
+// of this codec target, not a hand-picked best case for either.
+static void test_pose_codec() {
+    const double qscale = 1 << 20;
+    std::vector<Pose> poses;
+    double qw = 1, qx = 0, qy = 0, qz = 0;
+    unsigned int seed = 2031;
+    auto next_rand = [&]() { seed = seed * 1664525u + 1013904223u; return (double)(seed >> 8) / (double)(1u << 24); };
+    double z = 0.0;
+    for (int i = 0; i < 1500; i++) {
+        double t = i * 0.05;
+        i32 px = (i32)std::lround(2000 * std::cos(t));
+        i32 py = (i32)std::lround(2000 * std::sin(t));
+        z += 4.0 + (next_rand() - 0.5) * 0.5;
+        i32 pz = (i32)std::lround(z);
+        poses.push_back({{px, py, pz}, quat_to_i32(qw, qx, qy, qz, qscale)});
+
+        double deg = 2.0 + (next_rand() - 0.5) * 0.3; // yaw tracking the circular heading, plus noise
+        double half = (deg * kTestPi / 180.0) / 2.0;
+        double dqw = std::cos(half), dqz = std::sin(half);
+        double nw, nx, ny, nz;
+        quat_mul_d(qw, qx, qy, qz, dqw, 0, 0, dqz, nw, nx, ny, nz);
+        qw = nw; qx = nx; qy = ny; qz = nz;
+    }
+
+    // Lossless round trip.
+    std::vector<u8> blob = compress_pose(poses);
+    std::vector<Pose> back = decompress_pose(blob);
+    CHECK(back.size() == poses.size());
+    bool match = true;
+    for (size_t i = 0; i < poses.size(); i++) {
+        const Pose& a = poses[i]; const Pose& b = back[i];
+        if (a.position.x != b.position.x || a.position.y != b.position.y || a.position.z != b.position.z ||
+            a.orientation.w != b.orientation.w || a.orientation.x != b.orientation.x ||
+            a.orientation.y != b.orientation.y || a.orientation.z != b.orientation.z) match = false;
+    }
+    CHECK(match);
+
+    // Real compression win over a fair raw-packed baseline (7 int32s per
+    // pose: x,y,z,qw,qx,qy,qz), the same discipline BENCHMARKS.md uses.
+    size_t raw_packed = poses.size() * 7 * sizeof(i32);
+    CHECK(blob.size() < raw_packed);
+    std::printf("  (Pose codec: %zu poses, raw packed~=%zu bytes -> %zu bytes, %.1f%% smaller)\n",
+                 poses.size(), raw_packed, blob.size(), 100.0 * (1.0 - (double)blob.size() / (double)raw_packed));
+
+    // Lossy: quant_step <= 1 on both halves is exactly compress_pose.
+    std::vector<u8> exact_blob = compress_pose_lossy(poses, 1, 0, 1, 0);
+    std::vector<Pose> exact_back = decompress_pose(exact_blob);
+    bool exact_match = exact_back.size() == poses.size();
+    for (size_t i = 0; exact_match && i < poses.size(); i++) {
+        const Pose& a = poses[i]; const Pose& b = exact_back[i];
+        if (a.position.x != b.position.x || a.position.y != b.position.y || a.position.z != b.position.z ||
+            a.orientation.w != b.orientation.w || a.orientation.x != b.orientation.x ||
+            a.orientation.y != b.orientation.y || a.orientation.z != b.orientation.z) exact_match = false;
+    }
+    CHECK(exact_match);
+
+    // Lossy with real quantization on both halves: bounded error, smaller
+    // than lossless.
+    u32 pos_q = 8, pos_resync = 64, quat_q = 32, quat_resync = 32;
+    std::vector<u8> lossy_blob = compress_pose_lossy(poses, pos_q, pos_resync, quat_q, quat_resync);
+    std::vector<Pose> lossy_back = decompress_pose(lossy_blob);
+    CHECK(lossy_back.size() == poses.size());
+    CHECK(lossy_blob.size() < blob.size());
+
+    i32 max_pos_err = 0, max_quat_err = 0;
+    for (size_t i = 0; i < poses.size(); i++) {
+        const Pose& a = poses[i]; const Pose& b = lossy_back[i];
+        max_pos_err = std::max({max_pos_err, std::abs(a.position.x - b.position.x),
+                                 std::abs(a.position.y - b.position.y), std::abs(a.position.z - b.position.z)});
+        max_quat_err = std::max({max_quat_err, std::abs(a.orientation.w - b.orientation.w),
+                                  std::abs(a.orientation.x - b.orientation.x),
+                                  std::abs(a.orientation.y - b.orientation.y),
+                                  std::abs(a.orientation.z - b.orientation.z)});
+    }
+    std::printf("  (Pose codec lossy: %zu -> %zu bytes, max position error=%d, max orientation-component error=%d)\n",
+                 blob.size(), lossy_blob.size(), max_pos_err, max_quat_err);
+}
+
 int main() {
     test_range_coder();
     test_lz_matcher();
@@ -1085,6 +1373,9 @@ int main() {
     test_rod_joint_3d_similarity();
     test_rod_joint_2d_lossy();
     test_rod_joint_3d_lossy();
+    test_quaternion_joint();
+    test_quaternion_joint_lossy();
+    test_pose_codec();
     test_codec();
     test_codec_adaptive_skip();
     test_geo_codec();

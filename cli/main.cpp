@@ -7,6 +7,8 @@
 //   scissorc decompress-geo2d <in> <out.xy>
 //   scissorc compress-geo3d   <in.xyz> <out> [--scale N]
 //   scissorc decompress-geo3d <in> <out.xyz>
+//   scissorc compress-pose    <in.pose> <out> [--scale N] [--qscale N]
+//   scissorc decompress-pose  <in> <out.pose>
 //   scissorc info <file>
 //
 // Geo-mode point files are plain text, one point per line: "x y" (geo2d)
@@ -14,6 +16,14 @@
 // integers (value * scale, rounded) so the transform stays exact-integer
 // lossless; --scale controls the quantization step (default 1000, i.e.
 // 3 decimal digits of precision).
+//
+// Pose-mode files are 6-DOF samples, one per line: "x y z qw qx qy qz"
+// (position, then a unit quaternion) -- a VR/AR headset or controller
+// track, a drone/robot odometry log, a SLAM camera path. Position uses
+// --scale like geo2d/geo3d; orientation gets its own --qscale (default
+// 1000000 -- quaternion components live in [-1, 1], so --scale's default
+// would leave barely 3 meaningful digits). See quaternion_joint.hpp for
+// the model.
 #include "csa/codec.hpp"
 #include "csa/lz_matcher.hpp"
 #include "csa/pantograph_lift_cuda.hpp"
@@ -227,6 +237,103 @@ int cmd_decompress_geo3d(const std::string& in, const std::string& out) {
     return 0;
 }
 
+// Pose files are plain text, one 6-DOF sample per line: "x y z qw qx qy
+// qz" (position, then a unit quaternion). Position is quantized by
+// --scale like geo2d/geo3d; orientation gets its own --qscale (default
+// much finer -- quaternion components live in [-1, 1], so --scale's
+// default of 1000 would leave barely 3 meaningful digits).
+std::vector<Pose> read_poses(const std::string& path, i64 scale, i64 qscale) {
+    std::ifstream f(path);
+    if (!f) throw std::runtime_error("cannot open input file: " + path);
+    std::vector<Pose> poses;
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.empty()) continue;
+        std::istringstream ss(line);
+        double x, y, z, qw, qx, qy, qz;
+        if (!(ss >> x >> y >> z >> qw >> qx >> qy >> qz)) continue;
+        Pose p;
+        p.position = {(i32)llround(x * (double)scale), (i32)llround(y * (double)scale), (i32)llround(z * (double)scale)};
+        p.orientation = {(i32)llround(qw * (double)qscale), (i32)llround(qx * (double)qscale),
+                          (i32)llround(qy * (double)qscale), (i32)llround(qz * (double)qscale)};
+        poses.push_back(p);
+    }
+    return poses;
+}
+
+void write_pose_header(std::vector<u8>& out, i64 scale, i64 qscale) {
+    for (char c : kGeoMagic) out.push_back((u8)c);
+    out.push_back(7); // dims=7 marks a Pose (position+orientation) file
+    put_u64(out, (u64)scale);
+    put_u64(out, (u64)qscale);
+}
+
+int cmd_compress_pose(const std::string& in, const std::string& out, i64 scale, i64 qscale) {
+    auto poses = read_poses(in, scale, qscale);
+    auto blob = compress_pose(poses);
+    std::vector<u8> file;
+    write_pose_header(file, scale, qscale);
+    file.insert(file.end(), blob.begin(), blob.end());
+    write_file(out, file);
+    size_t raw_estimate = poses.size() * 7 * sizeof(double);
+    std::cout << "compress-pose: " << poses.size() << " poses, raw~=" << raw_estimate
+              << " bytes -> " << file.size() << " bytes\n";
+    return 0;
+}
+
+int cmd_compress_pose_lossy(const std::string& in, const std::string& out, i64 scale, i64 qscale,
+                             u32 pos_quant_step, u32 pos_resync_interval, u32 quat_quant_step, u32 quat_resync_interval) {
+    auto poses = read_poses(in, scale, qscale);
+    auto blob = compress_pose_lossy(poses, pos_quant_step, pos_resync_interval, quat_quant_step, quat_resync_interval);
+    std::vector<u8> file;
+    write_pose_header(file, scale, qscale);
+    file.insert(file.end(), blob.begin(), blob.end());
+    write_file(out, file);
+
+    // Same honesty-over-convenience measured-error reporting as
+    // cmd_compress_geo2d_lossy/cmd_compress_geo3d_lossy.
+    auto decoded = decompress_pose(blob);
+    double max_pos_err = 0.0, max_quat_err = 0.0;
+    for (size_t i = 0; i < poses.size() && i < decoded.size(); i++) {
+        max_pos_err = std::max({max_pos_err,
+            std::abs((double)(poses[i].position.x - decoded[i].position.x)) / (double)scale,
+            std::abs((double)(poses[i].position.y - decoded[i].position.y)) / (double)scale,
+            std::abs((double)(poses[i].position.z - decoded[i].position.z)) / (double)scale});
+        max_quat_err = std::max({max_quat_err,
+            std::abs((double)(poses[i].orientation.w - decoded[i].orientation.w)) / (double)qscale,
+            std::abs((double)(poses[i].orientation.x - decoded[i].orientation.x)) / (double)qscale,
+            std::abs((double)(poses[i].orientation.y - decoded[i].orientation.y)) / (double)qscale,
+            std::abs((double)(poses[i].orientation.z - decoded[i].orientation.z)) / (double)qscale});
+    }
+
+    size_t raw_estimate = poses.size() * 7 * sizeof(double);
+    std::cout << "compress-pose-lossy: " << poses.size() << " poses, raw~=" << raw_estimate
+              << " bytes -> " << file.size() << " bytes, pos_quant=" << pos_quant_step << " pos_resync=" << pos_resync_interval
+              << " quat_quant=" << quat_quant_step << " quat_resync=" << quat_resync_interval
+              << ", measured max position error=" << max_pos_err
+              << " max orientation-component error=" << max_quat_err << " (in original units)\n";
+    return 0;
+}
+
+int cmd_decompress_pose(const std::string& in, const std::string& out) {
+    auto file = read_file(in);
+    if (file.size() < 21 || file[0] != (u8)kGeoMagic[0] || file[4] != 7)
+        throw std::runtime_error("not a pose CSAG file");
+    size_t pos = 5;
+    i64 scale = (i64)get_u64(file.data(), file.size(), pos);
+    i64 qscale = (i64)get_u64(file.data(), file.size(), pos);
+    std::vector<u8> blob(file.begin() + pos, file.end());
+    auto poses = decompress_pose(blob);
+    std::ofstream f(out);
+    f << std::fixed << std::setprecision(6);
+    for (auto& p : poses)
+        f << (p.position.x / (double)scale) << " " << (p.position.y / (double)scale) << " " << (p.position.z / (double)scale) << " "
+          << (p.orientation.w / (double)qscale) << " " << (p.orientation.x / (double)qscale) << " "
+          << (p.orientation.y / (double)qscale) << " " << (p.orientation.z / (double)qscale) << "\n";
+    std::cout << "decompress-pose: " << poses.size() << " poses\n";
+    return 0;
+}
+
 int cmd_info(const std::string& path) {
     auto data = read_file(path);
     std::cout << path << ": " << data.size() << " bytes\n";
@@ -329,6 +436,9 @@ void usage() {
         "  scissorc compress-geo3d <in.xyz> <out> [--scale N]\n"
         "  scissorc decompress-geo3d <in> <out.xyz>\n"
         "  scissorc compress-geo3d-lossy <in.xyz> <out> --quant N --resync N [--scale N]\n"
+        "  scissorc compress-pose <in.pose> <out> [--scale N] [--qscale N]\n"
+        "  scissorc decompress-pose <in> <out.pose>\n"
+        "  scissorc compress-pose-lossy <in.pose> <out> --pos-quant N --pos-resync N --quat-quant N --quat-resync N [--scale N] [--qscale N]\n"
         "  scissorc info <file>\n"
         "  scissorc bench-transform <n> [--gpu] [--session] [--repeat N]\n";
 }
@@ -382,6 +492,30 @@ int main(int argc, char** argv) {
                 else if (a == "--resync") resync_interval = (u32)std::stoul(argv[i + 1]);
             }
             return cmd_compress_geo3d_lossy(argv[2], argv[3], scale, quant_step, resync_interval);
+        } else if (cmd == "compress-pose" && argc >= 4) {
+            i64 scale = 1000, qscale = 1000000;
+            for (int i = 4; i + 1 < argc; i += 2) {
+                std::string a = argv[i];
+                if (a == "--scale") scale = std::stoll(argv[i + 1]);
+                else if (a == "--qscale") qscale = std::stoll(argv[i + 1]);
+            }
+            return cmd_compress_pose(argv[2], argv[3], scale, qscale);
+        } else if (cmd == "decompress-pose" && argc >= 4) {
+            return cmd_decompress_pose(argv[2], argv[3]);
+        } else if (cmd == "compress-pose-lossy" && argc >= 4) {
+            i64 scale = 1000, qscale = 1000000;
+            u32 pos_quant_step = 1, pos_resync_interval = 0, quat_quant_step = 1, quat_resync_interval = 0;
+            for (int i = 4; i + 1 < argc; i += 2) {
+                std::string a = argv[i];
+                if (a == "--scale") scale = std::stoll(argv[i + 1]);
+                else if (a == "--qscale") qscale = std::stoll(argv[i + 1]);
+                else if (a == "--pos-quant") pos_quant_step = (u32)std::stoul(argv[i + 1]);
+                else if (a == "--pos-resync") pos_resync_interval = (u32)std::stoul(argv[i + 1]);
+                else if (a == "--quat-quant") quat_quant_step = (u32)std::stoul(argv[i + 1]);
+                else if (a == "--quat-resync") quat_resync_interval = (u32)std::stoul(argv[i + 1]);
+            }
+            return cmd_compress_pose_lossy(argv[2], argv[3], scale, qscale, pos_quant_step, pos_resync_interval,
+                                            quat_quant_step, quat_resync_interval);
         } else if (cmd == "info" && argc >= 3) {
             return cmd_info(argv[2]);
         } else if (cmd == "bench-lz" && argc >= 3) {

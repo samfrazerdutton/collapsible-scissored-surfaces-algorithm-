@@ -261,6 +261,105 @@ RodJoint3DSimResult deserialize_geo3d_sim(const u8* data, size_t size, size_t& p
     return r;
 }
 
+// Serializes a QuaternionJointResult the same way as the RodJoint*
+// helpers above (header fields, then one range-coded blob holding the
+// per-block lag/delta parameters followed by the w/x/y/z residual
+// streams). No magic/mode header of its own: this is only ever embedded
+// inside a Mode::Pose stream, never independently decoded, so it doesn't
+// need to be self-identifying the way compress_geo2d/3d's top-level blobs
+// are.
+void serialize_quat_joint(const QuaternionJointResult& r, std::vector<u8>& out) {
+    put_u64(out, r.count);
+    put_i32(out, r.anchor.w);
+    put_i32(out, r.anchor.x);
+    put_i32(out, r.anchor.y);
+    put_i32(out, r.anchor.z);
+    put_u32(out, r.quant_step);
+    put_u32(out, r.resync_interval);
+
+    std::vector<u8> flat;
+    for (u32 v : r.block_lag) write_varint(flat, v);
+    for (const auto& d : r.block_delta)
+        for (i64 v : d) write_varint(flat, zigzag_encode64(v));
+    for (i32 v : r.residual_w) write_varint(flat, zigzag_encode32(v));
+    for (i32 v : r.residual_x) write_varint(flat, zigzag_encode32(v));
+    for (i32 v : r.residual_y) write_varint(flat, zigzag_encode32(v));
+    for (i32 v : r.residual_z) write_varint(flat, zigzag_encode32(v));
+    std::vector<u8> coded = range_encode_bytes(flat);
+    put_u64(out, (u64)flat.size());
+    put_u64(out, (u64)coded.size());
+    out.insert(out.end(), coded.begin(), coded.end());
+}
+
+QuaternionJointResult deserialize_quat_joint(const u8* data, size_t size, size_t& pos) {
+    QuaternionJointResult r;
+    r.count = get_u64(data, size, pos);
+    r.anchor.w = get_i32(data, size, pos);
+    r.anchor.x = get_i32(data, size, pos);
+    r.anchor.y = get_i32(data, size, pos);
+    r.anchor.z = get_i32(data, size, pos);
+    r.quant_step = get_u32(data, size, pos);
+    r.resync_interval = get_u32(data, size, pos);
+
+    u64 raw_len = get_u64(data, size, pos);
+    u64 coded_len = get_u64(data, size, pos);
+    if (pos + coded_len > size) throw std::runtime_error("csa: truncated quaternion-joint payload");
+    std::vector<u8> flat = range_decode_bytes(data + pos, (size_t)coded_len, (size_t)raw_len);
+    pos += (size_t)coded_len;
+
+    size_t n = (r.count > 0) ? (size_t)(r.count - 1) : 0;
+    size_t nblocks = (n + kQuatJointBlockSize - 1) / kQuatJointBlockSize;
+    r.block_lag.resize(nblocks);
+    r.block_delta.resize(nblocks);
+    r.residual_w.resize(n);
+    r.residual_x.resize(n);
+    r.residual_y.resize(n);
+    r.residual_z.resize(n);
+    size_t vpos = 0;
+    for (size_t b = 0; b < nblocks; b++)
+        r.block_lag[b] = (u32)read_varint(flat.data(), flat.size(), vpos);
+    for (size_t b = 0; b < nblocks; b++)
+        for (int k = 0; k < 4; k++) {
+            u64 zz = read_varint(flat.data(), flat.size(), vpos);
+            r.block_delta[b][k] = zigzag_decode64(zz);
+        }
+    for (size_t i = 0; i < n; i++) {
+        u64 zz = read_varint(flat.data(), flat.size(), vpos);
+        r.residual_w[i] = zigzag_decode32((u32)zz);
+    }
+    for (size_t i = 0; i < n; i++) {
+        u64 zz = read_varint(flat.data(), flat.size(), vpos);
+        r.residual_x[i] = zigzag_decode32((u32)zz);
+    }
+    for (size_t i = 0; i < n; i++) {
+        u64 zz = read_varint(flat.data(), flat.size(), vpos);
+        r.residual_y[i] = zigzag_decode32((u32)zz);
+    }
+    for (size_t i = 0; i < n; i++) {
+        u64 zz = read_varint(flat.data(), flat.size(), vpos);
+        r.residual_z[i] = zigzag_decode32((u32)zz);
+    }
+    return r;
+}
+
+// Same auto-vs-best-forced-uniform-lag comparison as best_geo2d_encoding,
+// for the Quaternion Joint. Calibration here is a closed form (see
+// quaternion_joint.hpp), not an iterative fit, so trying every candidate
+// lag and comparing actual serialized bytes costs little.
+std::vector<u8> best_quat_encoding(const std::vector<Quat4i>& quats, u32 quant_step, u32 resync_interval) {
+    QuaternionJointResult auto_r = quaternion_joint_forward(quats, /*force_lag=*/0, quant_step, resync_interval);
+    std::vector<u8> best;
+    serialize_quat_joint(auto_r, best);
+
+    for (u32 lag : kRodJointCandidateLags) {
+        QuaternionJointResult r = quaternion_joint_forward(quats, lag, quant_step, resync_interval);
+        std::vector<u8> out;
+        serialize_quat_joint(r, out);
+        if (out.size() < best.size()) best = std::move(out);
+    }
+    return best;
+}
+
 } // namespace
 
 namespace {
@@ -532,6 +631,62 @@ std::vector<Point3i> decompress_geo3d(const std::vector<u8>& blob) {
     r.xy = deserialize_geo2d(blob.data(), blob.size(), pos);
     r.lift_z = deserialize_lift(blob.data(), blob.size(), pos);
     return rod_joint_3d_inverse(r);
+}
+
+// 6-DOF pose stream: position and orientation are unrelated structure (a
+// rotating trajectory vs. a rotation sequence), so they're compressed
+// independently and concatenated -- position as a complete, self-
+// contained compress_geo3d blob (reused verbatim, length-prefixed since
+// it isn't the last thing in the stream), orientation as a
+// serialize_quat_joint payload (not self-contained -- it's only ever
+// read back by decompress_pose immediately after the position sub-blob,
+// so it doesn't need its own length prefix or magic header).
+std::vector<u8> compress_pose(const std::vector<Pose>& poses) {
+    return compress_pose_lossy(poses, 1, 0, 1, 0);
+}
+
+std::vector<u8> compress_pose_lossy(const std::vector<Pose>& poses,
+                                     u32 pos_quant_step, u32 pos_resync_interval,
+                                     u32 quat_quant_step, u32 quat_resync_interval) {
+    std::vector<Point3i> positions(poses.size());
+    std::vector<Quat4i> orientations(poses.size());
+    for (size_t i = 0; i < poses.size(); i++) {
+        positions[i] = poses[i].position;
+        orientations[i] = poses[i].orientation;
+    }
+
+    std::vector<u8> pos_blob = (pos_quant_step <= 1)
+        ? compress_geo3d(positions)
+        : compress_geo3d_lossy(positions, pos_quant_step, pos_resync_interval);
+    std::vector<u8> quat_blob = best_quat_encoding(orientations, quat_quant_step, quat_resync_interval);
+
+    std::vector<u8> out;
+    write_magic_mode(out, Mode::Pose);
+    put_u64(out, (u64)pos_blob.size());
+    out.insert(out.end(), pos_blob.begin(), pos_blob.end());
+    out.insert(out.end(), quat_blob.begin(), quat_blob.end());
+    return out;
+}
+
+std::vector<Pose> decompress_pose(const std::vector<u8>& blob) {
+    size_t pos = 0;
+    Mode mode = read_magic_mode(blob.data(), blob.size(), pos);
+    if (mode != Mode::Pose) throw std::runtime_error("csa: not a Pose stream");
+
+    u64 pos_blob_len = get_u64(blob.data(), blob.size(), pos);
+    if (pos + pos_blob_len > blob.size()) throw std::runtime_error("csa: truncated pose position sub-blob");
+    std::vector<u8> pos_blob(blob.begin() + pos, blob.begin() + pos + (size_t)pos_blob_len);
+    pos += (size_t)pos_blob_len;
+    std::vector<Point3i> positions = decompress_geo3d(pos_blob);
+
+    QuaternionJointResult qr = deserialize_quat_joint(blob.data(), blob.size(), pos);
+    std::vector<Quat4i> orientations = quaternion_joint_inverse(qr);
+
+    if (positions.size() != orientations.size())
+        throw std::runtime_error("csa: pose stream position/orientation count mismatch");
+    std::vector<Pose> poses(positions.size());
+    for (size_t i = 0; i < positions.size(); i++) poses[i] = {positions[i], orientations[i]};
+    return poses;
 }
 
 } // namespace csa

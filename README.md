@@ -37,6 +37,16 @@ unmodified C++ source code, not text written for this project -- and
   per file automatically (a 2D rotation joint on (x,y) + affine fit on z,
   and a true 3D similarity joint fit via Horn's closed-form quaternion
   method) and keep whichever encodes smaller.
+- **Quaternion Joint** -- the same calibrated-prediction idea applied to
+  *orientation*: a 6-DOF pose stream (VR/AR head/controller tracking,
+  drone/robot odometry, SLAM camera paths) predicts each quaternion from
+  an earlier one via a per-block calibrated "delta rotation," applied by
+  right-multiplication to match how real gyroscope/IMU-integrated
+  orientation actually accumulates. Calibration has an unusually clean
+  closed form (no eigensolver needed, unlike the 3D similarity joint) --
+  see `DESIGN.md`. `compress_pose`/`compress-pose` combine this with
+  Geo3D position into one 6-DOF container; a synthetic drone-circling
+  pose stream compresses 83.3% smaller than raw-packed, losslessly.
 - **LZ dictionary matcher** -- a real, working LZ77-style compressor
   (unbounded-window hash-chain matching with lazy/one-step-lookahead
   parsing, the same technique zlib's higher levels use) for the
@@ -94,7 +104,7 @@ unmodified C++ source code, not text written for this project -- and
   `compress()` keeps one per thread automatically. Measured, not assumed:
   ~3.5x faster sustained per-call time at 50K elements, ~1.7x at 2M (see
   `DESIGN.md`).
-- **1547 round-trip correctness checks** (`tests/test_main.cpp` +
+- **1580 round-trip correctness checks** (`tests/test_main.cpp` +
   `tests/test_capi.cpp`, the latter linking the real shared library to
   catch actual symbol-export problems), including a dedicated check that
   the GPU path actually succeeds (not just that the overall call
@@ -144,6 +154,10 @@ python bench/use_cases.py
 # Lossy geometric mode: quantized residuals, bounded error, real ratio gain
 build/scissorc.exe compress-geo2d-lossy track.xy track_lossy.csa --quant 20 --resync 64
 build/scissorc.exe compress-geo3d-lossy track.xyz track_lossy.csa --quant 20 --resync 64
+
+# 6-DOF pose stream (position + orientation): "x y z qw qx qy qz" per line
+build/scissorc.exe compress-pose pose.pose pose.csa
+build/scissorc.exe compress-pose-lossy pose.pose pose_lossy.csa --pos-quant 8 --pos-resync 64 --quat-quant 32 --quat-resync 32
 
 # Python bindings (ctypes, on top of the C ABI in include/csa/csa_capi.h)
 python bindings/python/test_bindings.py

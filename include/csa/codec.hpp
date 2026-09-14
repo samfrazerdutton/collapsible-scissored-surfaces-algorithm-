@@ -5,12 +5,13 @@
 #pragma once
 #include "csa/common.hpp"
 #include "csa/lz_matcher.hpp"
+#include "csa/quaternion_joint.hpp"
 #include "csa/rod_joint_transform.hpp"
 #include <vector>
 
 namespace csa {
 
-enum class Mode : u8 { Raw = 0, General = 1, Geo2D = 2, Geo3D = 3, GeneralLZ = 4, GeneralBWT = 5 };
+enum class Mode : u8 { Raw = 0, General = 1, Geo2D = 2, Geo3D = 3, GeneralLZ = 4, GeneralBWT = 5, Pose = 6 };
 
 // General-purpose byte-stream compression. Up to four candidates are
 // tried -- raw storage, the Pantograph Lift (predictive, good on smooth/
@@ -56,13 +57,30 @@ std::vector<u8> compress_geo2d_lossy(const std::vector<Point2i>& points, u32 qua
 std::vector<u8> compress_geo3d(const std::vector<Point3i>& points);
 std::vector<Point3i> decompress_geo3d(const std::vector<u8>& blob);
 
-// Lossy variant, same design as compress_geo2d_lossy. Only tries the true
-// 3D similarity joint (the composition's z-axis Pantograph Lift doesn't
-// have a lossy mode yet -- see DESIGN.md's future work), so it can lose
-// to compress_geo3d on shapes the composition model would have won on;
-// that tradeoff is deliberate, documented, and only matters when
-// quant_step > 1 actually engages lossy mode. quant_step <= 1 is exactly
-// compress_geo3d (lossless, full auto-select).
+// Lossy variant, same design as compress_geo2d_lossy. Tries both the
+// composition and the true 3D similarity joint (the composition's z-axis
+// Pantograph Lift supports quantization too -- see DESIGN.md) and keeps
+// whichever encodes smaller, the same full auto-select compress_geo3d
+// already does losslessly. quant_step <= 1 is exactly compress_geo3d
+// (lossless, full auto-select).
 std::vector<u8> compress_geo3d_lossy(const std::vector<Point3i>& points, u32 quant_step, u32 resync_interval);
+
+// 6-DOF pose stream (position + orientation, e.g. VR/AR tracking, drone/
+// robot odometry, SLAM camera paths): position goes through the same
+// Geo3D auto-select as compress_geo3d, orientation through the
+// Quaternion Joint (see quaternion_joint.hpp) -- independent models for
+// independent structure, sharing one container.
+std::vector<u8> compress_pose(const std::vector<Pose>& poses);
+std::vector<Pose> decompress_pose(const std::vector<u8>& blob);
+
+// Lossy variant: pos_quant_step/pos_resync_interval reach compress_geo3d_lossy's
+// existing lossy position support directly; quat_quant_step/
+// quat_resync_interval are the analogous knobs for the Quaternion Joint
+// (see QuaternionJointResult's own comment for the closed-loop design and
+// what resync_interval bounds here). Either quant_step <= 1 is exactly
+// lossless for that half.
+std::vector<u8> compress_pose_lossy(const std::vector<Pose>& poses,
+                                     u32 pos_quant_step, u32 pos_resync_interval,
+                                     u32 quat_quant_step, u32 quat_resync_interval);
 
 } // namespace csa

@@ -395,6 +395,8 @@ One shared bitstream, `include/csa/codec.hpp`:
 - `Mode::GeneralLZ` -- the LZ dictionary matcher over a byte stream.
 - `Mode::GeneralBWT` -- the BWT + move-to-front mode over a byte stream.
 - `Mode::Geo2D` / `Mode::Geo3D` -- Rod-Joint Transform over point streams.
+- `Mode::Pose` -- 6-DOF pose streams (position via Geo3D + orientation via
+  the Quaternion Joint); see its own section below.
 
 `compress()` tries `Raw`/`General`/`GeneralLZ`/`GeneralBWT` for any
 byte-stream input and keeps whichever encodes smallest (`GeneralBWT` is
@@ -612,6 +614,102 @@ loader shape, different ABI convention) is proof the overall design
 works, but this is the one part of the codebase resting on review rather
 than measurement, and it should be treated that way until someone runs
 it on real Linux/macOS hardware.
+
+## Quaternion Joint and 6-DOF pose streams (`quaternion_joint.hpp`/`.cpp`)
+
+Everything above models *position* sequences. A real 6-DOF pose stream
+(a VR/AR headset or controller track, a drone or robot's odometry, a SLAM
+camera path) also has an *orientation* half -- a unit quaternion per
+sample -- and `REAL_GEO_BENCHMARK.md`'s finding (Rod-Joint's calibrated-
+rotation model genuinely fits continuous paths, just not LiDAR-style
+point clouds) is exactly the reasoning that motivated building an
+orientation-domain analogue: real tracking data has *locally consistent
+angular velocity* (a smoothly turning head, a drone banking through a
+turn) the same way real GPS/vehicle paths have locally consistent
+direction+speed, so the same "calibrate a small transform per block,
+predict from reconstructed history" idea should transfer.
+
+The model: predict `Q[i]` from an earlier `Q[i-lag]` via a single
+calibrated "delta" quaternion `D`, applied by **right** multiplication --
+`Q_pred[i] = Q[i-lag] (x) D` -- recalibrated per block exactly like Rod-
+Joint's ratio/matrix. Right-multiplication is a deliberate choice, not
+arbitrary: real gyroscope/IMU-integrated orientation accumulates rotation
+in the object's own body frame (`Q[i] = Q[i-1] (x) dq_body`), so `D`
+approximates that block's characteristic per-lag-step body-frame delta.
+(Left-multiplication would instead model rotation about a fixed *world*
+axis -- the less common case for something like a head or drone actually
+turning.)
+
+Calibrating `D` turned out to have an unusually clean closed form,
+simpler than the 3D position joint's Horn's-method eigenvector iteration
+(`calibrate_3d_block`): right-multiplication by a quaternion `a` is a
+*linear* map of the other operand (`a (x) D = R(a) * D` for a 4x4 matrix
+`R(a)` built from `a`'s components), and quaternion multiplication is
+norm-multiplicative (`|p (x) q| = |p||q|` for *every* `p, q`, not just
+unit ones) -- together these mean `R(a)^T R(a) = |a|^2 * I`, which
+collapses the usual least-squares normal-equations matrix down to a
+*scalar* multiple of the identity for any number of calibration pairs:
+
+```
+D = ( sum_i R(a_i)^T b_i ) / ( sum_i |a_i|^2 )
+```
+
+No matrix inversion or iteration needed, for any candidate lag -- which
+makes lag search (reusing `kRodJointCandidateLags`, the exact same
+mechanism and period-drift benefit already proven for position rods on
+the toroidal path) essentially free per candidate. On a synthetic
+oscillating-angular-velocity test case (two different periods, first vs.
+second half of the sequence -- the orientation analogue of
+`test_rod_joint_lag_search_period_drift`), per-block auto search beat the
+best single whole-file lag by **79.5%** less residual magnitude, even
+better than the 71% position rods achieved on the analogous shape.
+
+Unlike position (where *rods*, not points, get predicted, and
+reconstructed rods must be summed back into an absolute point), `Q[i]`
+*is* the absolute state already -- there's no accumulation step. What
+still needs care under lossy quantization is the same compounding-error
+shape every other lossy mode in this codebase handles: `Q_pred[i]`
+depends on the *reconstructed* `Q[i-lag]` (closed-loop DPCM), so a
+quantization error at `i-lag` can propagate forward through every later
+prediction that depends on it. `resync_interval` bounds this exactly like
+Rod-Joint's own: every `resync_interval`-th quaternion is stored exactly.
+`quant_step <= 1` is exactly lossless, the same unification every other
+lossy mode here uses.
+
+What this deliberately does not do: model smoothly *accelerating*
+angular velocity within one calibration block (only per-block
+recalibration handles that, same compromise as everywhere else in this
+codebase), or use quaternion exponentiation/SLERP to compose a multi-step
+prediction -- `D` is fit directly against whatever `(Q[i-lag], Q[i])`
+pairs actually occur, which is well-posed regardless of whether real
+angular velocity was exactly constant over that gap; it just won't
+compress as well if it wasn't.
+
+`codec.cpp`'s `compress_pose`/`decompress_pose`/`compress_pose_lossy`
+combine this with the existing Geo3D position auto-select into one
+container (`Mode::Pose`): position and orientation are compressed
+independently (unrelated structure -- a rotating trajectory vs. a
+rotation sequence) and concatenated, position as a complete self-
+contained `compress_geo3d` blob (length-prefixed, since it isn't last),
+orientation as a `serialize_quat_joint` payload (not self-contained --
+only ever read back immediately after the position sub-blob, so it needs
+no magic header of its own). `scissorc compress-pose`/`decompress-pose`/
+`compress-pose-lossy` expose it from the CLI, reading/writing plain-text
+"x y z qw qx qy qz" lines; `tests/test_main.cpp`'s `test_quaternion_joint`/
+`test_quaternion_joint_lossy`/`test_pose_codec` check round-trip
+correctness (including an adversarial random-quaternion case), the lag-
+search claim above, bounded lossy error, and a real compression win on a
+synthetic drone-circling-while-yawing pose stream (**83.3%** smaller than
+a fair raw-packed baseline, lossless; a further **42%** smaller in lossy
+mode with modest bounded error).
+
+**Not yet done**: this is validated on synthetic data only (the same
+honest-caveat pattern as everything new in this codebase before real-
+world validation) -- the natural next step, following `REAL_GEO_BENCHMARK.md`'s
+precedent, is a real head-to-head against actual 6-DOF pose/motion data
+(e.g. EuRoC MAV, TUM RGB-D, or KITTI odometry ground-truth poses) and
+whatever specialized competitor exists for that domain, not just a
+synthetic-shape claim.
 
 ## GPU acceleration (`cuda/pantograph_lift_cuda.cu`)
 
@@ -841,6 +939,19 @@ smaller call's result).
   incremental addition to the existing CUDA path, and is out of scope for
   what a single-repository research project can responsibly claim to have
   built alongside everything else here.
+- **`compress_pose`/`decompress_pose` aren't wired through the C ABI yet**
+  -- `csa_capi.cpp`/`csa_capi.h` and all four language bindings currently
+  only expose `compress`/`compress_geo2d`/`compress_geo3d` (+ their lossy
+  variants). Extending the C ABI to a `Pose`-array-of-structs marshaling
+  convention and adding the corresponding wrapper in each binding is
+  straightforward (same shape as the existing geo3d wiring) but not yet
+  done.
+- **The Quaternion Joint / Pose codec is validated on synthetic data
+  only** -- see its own section above. A real head-to-head against actual
+  6-DOF tracking data (EuRoC MAV, TUM RGB-D, KITTI odometry ground truth)
+  and whatever specialized competitor exists for that domain, following
+  `REAL_GEO_BENCHMARK.md`'s precedent, is the natural next step before
+  claiming this is more than a promising synthetic result.
 
 ## Build gotcha: adding a new `__global__` kernel
 
