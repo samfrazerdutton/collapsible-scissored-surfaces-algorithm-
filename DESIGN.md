@@ -707,13 +707,22 @@ same way as the existing geo2d/geo3d functions (interleaved int32, 7 per
 pose), and all four language bindings (Python/Rust/C#/Go) wrap them the
 same way they wrap `compress_geo3d`.
 
-**Not yet done**: this is validated on synthetic data only (the same
-honest-caveat pattern as everything new in this codebase before real-
-world validation) -- the natural next step, following `REAL_GEO_BENCHMARK.md`'s
-precedent, is a real head-to-head against actual 6-DOF pose/motion data
-(e.g. EuRoC MAV, TUM RGB-D, or KITTI odometry ground-truth poses) and
-whatever specialized competitor exists for that domain, not just a
-synthetic-shape claim.
+**Real-data validation** (`REAL_POSE_BENCHMARK.md`): three real ground-
+truth 6-DOF trajectories -- EuRoC MAV Vicon Room 1 "02" (a real drone
+flight, 16,702 poses), TUM RGB-D freiburg2/desk (a real handheld camera,
+20,957 poses), and KITTI odometry sequence 00 (a real car driving through
+Karlsruhe, 4,541 poses, rotation matrices converted to quaternions and
+independently verified to ~1e-7 reconstruction accuracy). `compress_pose`
+beats lzma -9 (the strongest general-purpose reference tested) on **all
+three**: 30.6% smaller on the drone flight, 4.8% smaller on the handheld
+camera, 4.8% smaller on the vehicle drive -- largest on the smoothest
+motion, smallest on the least smooth, exactly as the calibrated-rotation
+model predicts. Orientation is the *larger* half of the compressed size
+on all three (51-60%), not a minor add-on. No specialized 6-DOF pose
+competitor exists yet to test against (unlike LASzip for LiDAR), so this
+result says CSA beats general-purpose compression on real tracking data,
+not that it beats a best-in-class specialized codec that doesn't exist
+yet.
 
 ## GPU acceleration (`cuda/pantograph_lift_cuda.cu`)
 
@@ -943,11 +952,12 @@ smaller call's result).
   incremental addition to the existing CUDA path, and is out of scope for
   what a single-repository research project can responsibly claim to have
   built alongside everything else here.
-- **The Quaternion Joint / Pose codec's real-data validation** -- see its
-  own section above for the synthetic-only result and what a real
-  head-to-head (EuRoC MAV, TUM RGB-D, KITTI odometry ground truth, plus
-  whatever specialized competitor exists for that domain) would need to
-  look like, following `REAL_GEO_BENCHMARK.md`'s precedent.
+- **A specialized 6-DOF pose competitor to benchmark against** --
+  `REAL_POSE_BENCHMARK.md` could only compare `compress_pose` against
+  general-purpose compressors because no dominant specialized codec for
+  this domain exists yet (unlike LASzip for LiDAR or Google's polyline
+  format for 2D GPS traces); if one emerges, that would be the more
+  demanding comparison to run.
 
 ## Build gotcha: adding a new `__global__` kernel
 

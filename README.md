@@ -17,10 +17,13 @@ own. See
 `DESIGN.md` for the full technical mapping, `BENCHMARKS.md` for real,
 regenerable compression-ratio measurements, `USE_CASES.md` for how it does
 on realistic (not maximally repetitive) text/log/telemetry files,
-`REAL_CORPUS_BENCHMARK.md` for the harshest test -- 18MB of real,
-unmodified C++ source code, not text written for this project -- and
-`GPU_BENCHMARKS.md` for a dedicated CPU-vs-GPU crossover measurement from
-100K to 256M elements (nothing in any of those files is hand-typed).
+`REAL_CORPUS_BENCHMARK.md` for the harshest general-purpose test -- 18MB
+of real, unmodified C++ source code, not text written for this project --
+`REAL_GEO_BENCHMARK.md` and `REAL_POSE_BENCHMARK.md` for the geometric/
+6-DOF modes against real specialized competitors and real ground-truth
+tracking data (not synthetic shapes), and `GPU_BENCHMARKS.md` for a
+dedicated CPU-vs-GPU crossover measurement from 100K to 256M elements
+(nothing in any of those files is hand-typed).
 
 ## What's actually here
 
@@ -45,8 +48,10 @@ unmodified C++ source code, not text written for this project -- and
   orientation actually accumulates. Calibration has an unusually clean
   closed form (no eigensolver needed, unlike the 3D similarity joint) --
   see `DESIGN.md`. `compress_pose`/`compress-pose` combine this with
-  Geo3D position into one 6-DOF container; a synthetic drone-circling
-  pose stream compresses 83.3% smaller than raw-packed, losslessly.
+  Geo3D position into one 6-DOF container. Validated on three real
+  ground-truth trajectories (a drone flight, a handheld camera, a car
+  driving through Karlsruhe) -- beats lzma -9 on all three (4.8-30.6%
+  smaller). See `REAL_POSE_BENCHMARK.md`.
 - **LZ dictionary matcher** -- a real, working LZ77-style compressor
   (unbounded-window hash-chain matching with lazy/one-step-lookahead
   parsing, the same technique zlib's higher levels use) for the
