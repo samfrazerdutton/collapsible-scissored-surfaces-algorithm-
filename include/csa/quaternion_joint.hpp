@@ -90,6 +90,11 @@ struct QuaternionJointResult {
     u64 count = 0;             // number of quaternions
     u32 quant_step = 1;        // 1 == lossless
     u32 resync_interval = 0;   // 0 == no periodic exact resync
+    // Empty (the default): blocks are the fixed kQuatJointBlockSize
+    // scheme. Non-empty: explicit per-block lengths (summing to
+    // count-1) -- see quaternion_joint_forward_adaptive() and
+    // adaptive_partition.hpp.
+    std::vector<u32> block_len;
     std::vector<u32> block_lag;                 // per block: Q[i] predicted from Q[i-block_lag[blk]]
     std::vector<std::array<i64, 4>> block_delta; // per block, Q16.16 (w,x,y,z)
     std::vector<i32> residual_w, residual_x, residual_y, residual_z; // size count-1 each
@@ -101,6 +106,16 @@ struct QuaternionJointResult {
 // uniformly across every block instead.
 QuaternionJointResult quaternion_joint_forward(const std::vector<Quat4i>& quats, u32 force_lag = 0,
                                                 u32 quant_step = 1, u32 resync_interval = 0);
+
+// Variable-resolution alternative to the fixed-block forward() above --
+// same rationale and mechanism as
+// rod_joint_3d_similarity_forward_adaptive (see adaptive_partition.hpp):
+// bottom-up greedy merging of min_block-sized chunks where doing so
+// doesn't cost much prediction accuracy, instead of always using
+// kQuatJointBlockSize.
+QuaternionJointResult quaternion_joint_forward_adaptive(const std::vector<Quat4i>& quats,
+                                                         u32 quant_step = 1, u32 resync_interval = 0,
+                                                         size_t min_block = 16, double merge_ratio = 1.3);
 std::vector<Quat4i> quaternion_joint_inverse(const QuaternionJointResult& r);
 
 // A single 6-DOF pose sample (position + orientation), the unit a real

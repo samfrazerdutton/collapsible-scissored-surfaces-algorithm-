@@ -724,6 +724,51 @@ result says CSA beats general-purpose compression on real tracking data,
 not that it beats a best-in-class specialized codec that doesn't exist
 yet.
 
+### Adaptive-resolution block calibration (`adaptive_partition.hpp`)
+
+Measuring where `compress_pose`'s bytes actually go on the three real
+datasets above (`bench/pose_breakdown_tool.cpp`, a diagnostic, not part
+of the shipped codec) found two things that reshaped this work: per-block
+calibration-parameter overhead was under 5% of compressed size
+everywhere (so a hierarchical scheme aimed at shrinking *that* -- the
+literal reading of "make the geometric transforms as recursively
+multi-scale as the Pantograph Lift already is" -- wouldn't have paid
+off), but per-block *residual* energy varied a lot within a single file
+(coefficient of variation up to ~5.8 on real data) -- a fixed block size
+was forcing one calibration resolution onto stretches that are actually
+very different in how predictable they are.
+
+`adaptive_partition.hpp` targets that directly: a bottom-up greedy merge
+that starts at maximal resolution (every `min_block` samples its own
+block) and extends the current block by one more chunk at a time,
+keeping the merge only if forcing the new chunk to share the combined
+calibration doesn't cost much accuracy specifically *on that chunk*
+(not diluted by however much easy history has already accumulated --
+an earlier version of this compared against the whole accumulated
+block's total SSE and collapsed everything into one giant block as a
+result, since one bad chunk's cost becomes negligible against an
+ever-growing accumulated total; see the header comment for the full
+postmortem). `rod_joint_3d_similarity_forward_adaptive`/
+`quaternion_joint_forward_adaptive` apply this to the 3D similarity
+joint and the Quaternion Joint respectively; `codec.cpp`'s
+`best_geo3d_similarity_encoding`/`best_quat_encoding` try it alongside
+every existing fixed-block candidate and keep whichever actually
+serializes smaller, so it can only ever help or tie, never regress.
+
+Real, measured effect on the same three real datasets (re-running
+`bench/real_pose_benchmark.py` after adding this): EuRoC (drone flight)
+improved from 160,151 to 146,999 bytes (its lzma -9 margin widened from
+30.6% to 36.3%), KITTI (vehicle driving) improved from 74,590 to 72,093
+bytes (4.8% to 8.0% margin over lzma -9), and TUM (handheld camera)
+barely moved (212,295 to 212,162 bytes) -- despite TUM having the
+*highest* measured residual-energy CV of the three. That's a real,
+somewhat counterintuitive result worth stating plainly rather than
+smoothing over: high block-to-block variability doesn't automatically
+mean adaptive resolution can exploit it, if the variability comes from
+motion that's just uniformly hard to predict (a handheld camera's
+constant small jitter) rather than distinct easy/hard *regimes* the way
+EuRoC's stabilized flight and KITTI's mostly-straight driving both have.
+
 ## GPU acceleration (`cuda/pantograph_lift_cuda.cu`)
 
 The Pantograph Lift's per-level transform is embarrassingly parallel: given

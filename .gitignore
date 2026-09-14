@@ -3,6 +3,7 @@ bench/datasets/
 bench/datasets_real/
 bench/_tmp/
 bench/_tmp_geo_bench/
+bench/_tmp_pose_bench/
 bench/_thirdparty/
 *.obj
 *.exe

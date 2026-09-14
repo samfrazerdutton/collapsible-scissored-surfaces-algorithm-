@@ -1,4 +1,5 @@
 #include "csa/quaternion_joint.hpp"
+#include "csa/adaptive_partition.hpp"
 #include <algorithm>
 #include <cmath>
 
@@ -110,6 +111,72 @@ u32 pick_block_lag(const std::vector<i32>& qw, const std::vector<i32>& qx,
     return best_lag;
 }
 
+// Shared inner loop for quaternion_joint_forward/_forward_adaptive:
+// predicts and encodes Q[start+1..end] (in the qw/qx/qy/qz index space,
+// i.e. indices [start,end) there) using a calibrated (lag, D), updating
+// reconstructed history and residuals -- exactly the fixed-block
+// forward's original loop body, factored out so the adaptive variant
+// shares it instead of duplicating the prediction math.
+void encode_block_quat(const std::vector<i32>& qw, const std::vector<i32>& qx, const std::vector<i32>& qy,
+                        const std::vector<i32>& qz, size_t start, size_t end, u32 lag, const std::array<i64, 4>& d,
+                        u32 quant_step, u32 resync_interval,
+                        std::vector<i32>& rec_w, std::vector<i32>& rec_x, std::vector<i32>& rec_y, std::vector<i32>& rec_z,
+                        std::vector<i32>& residual_w, std::vector<i32>& residual_x,
+                        std::vector<i32>& residual_y, std::vector<i32>& residual_z) {
+    for (size_t i = start; i < end; i++) {
+        i32 aw = (i >= lag) ? rec_w[i - lag] : 0;
+        i32 ax = (i >= lag) ? rec_x[i - lag] : 0;
+        i32 ay = (i >= lag) ? rec_y[i - lag] : 0;
+        i32 az = (i >= lag) ? rec_z[i - lag] : 0;
+        i32 pw, px, py, pz;
+        quat_right_mul_round(aw, ax, ay, az, d, pw, px, py, pz);
+
+        bool is_resync = (resync_interval > 0) && (((i + 1) % resync_interval) == 0);
+        u32 q_here = is_resync ? 1 : quant_step;
+
+        i64 raw_dw = (i64)qw[i] - pw;
+        i64 raw_dx = (i64)qx[i] - px;
+        i64 raw_dy = (i64)qy[i] - py;
+        i64 raw_dz = (i64)qz[i] - pz;
+
+        i64 rw = quant_round_div(raw_dw, (i64)q_here);
+        i64 rx = quant_round_div(raw_dx, (i64)q_here);
+        i64 ry = quant_round_div(raw_dy, (i64)q_here);
+        i64 rz = quant_round_div(raw_dz, (i64)q_here);
+        residual_w[i] = (i32)rw;
+        residual_x[i] = (i32)rx;
+        residual_y[i] = (i32)ry;
+        residual_z[i] = (i32)rz;
+
+        rec_w[i] = (i32)(pw + rw * (i64)q_here);
+        rec_x[i] = (i32)(px + rx * (i64)q_here);
+        rec_y[i] = (i32)(py + ry * (i64)q_here);
+        rec_z[i] = (i32)(pz + rz * (i64)q_here);
+    }
+}
+
+struct QuatBlockCalib { u32 lag; std::array<i64, 4> d; };
+
+std::pair<QuatBlockCalib, double> calibrate_and_score_quat(const std::vector<i32>& qw, const std::vector<i32>& qx,
+                                                            const std::vector<i32>& qy, const std::vector<i32>& qz,
+                                                            size_t start, size_t end) {
+    std::array<i64, 4> d{};
+    u32 lag = pick_block_lag(qw, qx, qy, qz, start, end, /*force_lag=*/0, d);
+    double sse = block_predict_sse(qw, qx, qy, qz, start, end, lag, d);
+    return {QuatBlockCalib{lag, d}, sse};
+}
+
+std::vector<u32> block_index_from_lengths(size_t n, const std::vector<u32>& block_len) {
+    std::vector<u32> idx(n);
+    size_t pos = 0;
+    for (size_t b = 0; b < block_len.size(); b++) {
+        size_t end = std::min(n, pos + (size_t)block_len[b]);
+        for (size_t i = pos; i < end; i++) idx[i] = (u32)b;
+        pos = end;
+    }
+    return idx;
+}
+
 } // namespace
 
 QuaternionJointResult quaternion_joint_forward(const std::vector<Quat4i>& quats, u32 force_lag,
@@ -159,37 +226,53 @@ QuaternionJointResult quaternion_joint_forward(const std::vector<Quat4i>& quats,
         u32 lag = pick_block_lag(qw, qx, qy, qz, start, end, force_lag, d);
         r.block_lag[blk] = lag;
         r.block_delta[blk] = d;
+        encode_block_quat(qw, qx, qy, qz, start, end, lag, d, r.quant_step, r.resync_interval,
+                           rec_w, rec_x, rec_y, rec_z, r.residual_w, r.residual_x, r.residual_y, r.residual_z);
+    }
+    return r;
+}
 
-        for (size_t i = start; i < end; i++) {
-            i32 aw = (i >= lag) ? rec_w[i - lag] : 0;
-            i32 ax = (i >= lag) ? rec_x[i - lag] : 0;
-            i32 ay = (i >= lag) ? rec_y[i - lag] : 0;
-            i32 az = (i >= lag) ? rec_z[i - lag] : 0;
-            i32 pw, px, py, pz;
-            quat_right_mul_round(aw, ax, ay, az, d, pw, px, py, pz);
+QuaternionJointResult quaternion_joint_forward_adaptive(const std::vector<Quat4i>& quats,
+                                                         u32 quant_step, u32 resync_interval,
+                                                         size_t min_block, double merge_ratio) {
+    QuaternionJointResult r;
+    r.count = quats.size();
+    if (quats.empty()) return r;
+    r.anchor = quats[0];
+    r.quant_step = (quant_step == 0) ? 1 : quant_step;
+    r.resync_interval = resync_interval;
+    size_t m = quats.size();
+    if (m < 2) return r;
 
-            bool is_resync = (r.resync_interval > 0) && (((i + 1) % r.resync_interval) == 0);
-            u32 q_here = is_resync ? 1 : r.quant_step;
+    size_t n = m - 1;
+    std::vector<i32> qw(n), qx(n), qy(n), qz(n);
+    for (size_t i = 1; i < m; i++) {
+        qw[i - 1] = quats[i].w;
+        qx[i - 1] = quats[i].x;
+        qy[i - 1] = quats[i].y;
+        qz[i - 1] = quats[i].z;
+    }
+    std::vector<i32> rec_w(n), rec_x(n), rec_y(n), rec_z(n);
 
-            i64 raw_dw = (i64)qw[i] - pw;
-            i64 raw_dx = (i64)qx[i] - px;
-            i64 raw_dy = (i64)qy[i] - py;
-            i64 raw_dz = (i64)qz[i] - pz;
+    auto blocks = adaptive_partition<QuatBlockCalib>(n, min_block, merge_ratio,
+        [&](size_t start, size_t end) { return calibrate_and_score_quat(qw, qx, qy, qz, start, end); },
+        [&](size_t start, size_t end, const QuatBlockCalib& c) { return block_predict_sse(qw, qx, qy, qz, start, end, c.lag, c.d); });
 
-            i64 rw = quant_round_div(raw_dw, (i64)q_here);
-            i64 rx = quant_round_div(raw_dx, (i64)q_here);
-            i64 ry = quant_round_div(raw_dy, (i64)q_here);
-            i64 rz = quant_round_div(raw_dz, (i64)q_here);
-            r.residual_w[i] = (i32)rw;
-            r.residual_x[i] = (i32)rx;
-            r.residual_y[i] = (i32)ry;
-            r.residual_z[i] = (i32)rz;
+    r.block_len.resize(blocks.size());
+    r.block_lag.resize(blocks.size());
+    r.block_delta.resize(blocks.size());
+    r.residual_w.resize(n);
+    r.residual_x.resize(n);
+    r.residual_y.resize(n);
+    r.residual_z.resize(n);
 
-            rec_w[i] = (i32)(pw + rw * (i64)q_here);
-            rec_x[i] = (i32)(px + rx * (i64)q_here);
-            rec_y[i] = (i32)(py + ry * (i64)q_here);
-            rec_z[i] = (i32)(pz + rz * (i64)q_here);
-        }
+    for (size_t b = 0; b < blocks.size(); b++) {
+        r.block_len[b] = (u32)(blocks[b].end - blocks[b].start);
+        r.block_lag[b] = blocks[b].calib.lag;
+        r.block_delta[b] = blocks[b].calib.d;
+        encode_block_quat(qw, qx, qy, qz, blocks[b].start, blocks[b].end, blocks[b].calib.lag, blocks[b].calib.d,
+                           r.quant_step, r.resync_interval, rec_w, rec_x, rec_y, rec_z,
+                           r.residual_w, r.residual_x, r.residual_y, r.residual_z);
     }
     return r;
 }
@@ -204,9 +287,11 @@ std::vector<Quat4i> quaternion_joint_inverse(const QuaternionJointResult& r) {
     size_t n = (size_t)r.count - 1;
     u32 quant_step = (r.quant_step == 0) ? 1 : r.quant_step;
     std::vector<i32> rec_w(n), rec_x(n), rec_y(n), rec_z(n);
+    std::vector<u32> block_of;
+    if (!r.block_len.empty()) block_of = block_index_from_lengths(n, r.block_len);
 
     for (size_t i = 0; i < n; i++) {
-        size_t blk = i / kQuatJointBlockSize;
+        size_t blk = r.block_len.empty() ? (i / kQuatJointBlockSize) : (size_t)block_of[i];
         u32 lag = r.block_lag[blk];
         const std::array<i64, 4>& d = r.block_delta[blk];
         i32 aw = (i >= lag) ? rec_w[i - lag] : 0;

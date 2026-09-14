@@ -172,6 +172,13 @@ struct RodJoint3DSimResult {
     u64 count = 0;
     u32 quant_step = 1;                // 1 == lossless
     u32 resync_interval = 0;           // 0 == no periodic exact resync
+    // Empty (the default): blocks are the fixed kRodJoint3DBlockSize
+    // scheme. Non-empty: explicit per-block lengths (summing to
+    // count-1), overriding the fixed scheme -- see
+    // rod_joint_3d_similarity_forward_adaptive() and
+    // adaptive_partition.hpp for why and when this is used. Either way,
+    // block_lag/block_matrix have one entry per actual block.
+    std::vector<u32> block_len;
     std::vector<u32> block_lag;       // per block: rod[i] predicted from rod[i-block_lag[blk]]
     std::vector<std::array<i64, 9>> block_matrix; // per block, row-major 3x3, Q16.16
     std::vector<i32> residual_x, residual_y, residual_z; // size count-1 each; quantized index when quant_step > 1
@@ -181,6 +188,18 @@ struct RodJoint3DSimResult {
 // nonzero value forces that lag uniformly (see rod_joint_2d_forward).
 RodJoint3DSimResult rod_joint_3d_similarity_forward(const std::vector<Point3i>& points, u32 force_lag = 0,
                                                      u32 quant_step = 1, u32 resync_interval = 0);
+
+// Variable-resolution alternative to the fixed-block forward() above:
+// bottom-up greedy merging of min_block-sized chunks where doing so
+// doesn't cost much prediction accuracy (see adaptive_partition.hpp),
+// instead of always using kRodJoint3DBlockSize. Always searches
+// kRodJointCandidateLags per block (no force_lag option -- adaptive mode
+// is about resolution, not lag). min_block/merge_ratio tune the
+// segmentation; the defaults are the ones measured against real tracking
+// data.
+RodJoint3DSimResult rod_joint_3d_similarity_forward_adaptive(const std::vector<Point3i>& points,
+                                                              u32 quant_step = 1, u32 resync_interval = 0,
+                                                              size_t min_block = 16, double merge_ratio = 2.0);
 std::vector<Point3i> rod_joint_3d_similarity_inverse(const RodJoint3DSimResult& r);
 
 // Same per-coordinate error bound as rod_joint_2d_error_bound() (the

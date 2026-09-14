@@ -1072,6 +1072,93 @@ static void test_rod_joint_lag_search_period_drift() {
                  100.0 * (1.0 - (double)auto_sum / (double)best_forced_sum));
 }
 
+// Mirrors codec.cpp's serialize_geo3d_sim/serialize_quat_joint's parameter+
+// residual payload (minus the small fixed header fields, which are
+// roughly equal either way) closely enough to fairly compare fixed-block
+// vs. adaptive-block real compressed size -- block_len contributes zero
+// bytes when empty (the fixed-block case), and its real cost when
+// non-empty (the adaptive case), exactly like production would pay.
+static size_t measure_rodjoint3dsim_bytes(const RodJoint3DSimResult& r) {
+    std::vector<u8> flat;
+    for (u32 v : r.block_len) write_varint(flat, v);
+    for (u32 v : r.block_lag) write_varint(flat, v);
+    for (const auto& m : r.block_matrix)
+        for (i64 v : m) write_varint(flat, zigzag_encode64(v));
+    for (i32 v : r.residual_x) write_varint(flat, zigzag_encode32(v));
+    for (i32 v : r.residual_y) write_varint(flat, zigzag_encode32(v));
+    for (i32 v : r.residual_z) write_varint(flat, zigzag_encode32(v));
+    return range_encode_bytes(flat).size();
+}
+
+static size_t measure_quatjoint_bytes(const QuaternionJointResult& r) {
+    std::vector<u8> flat;
+    for (u32 v : r.block_len) write_varint(flat, v);
+    for (u32 v : r.block_lag) write_varint(flat, v);
+    for (const auto& d : r.block_delta)
+        for (i64 v : d) write_varint(flat, zigzag_encode64(v));
+    for (i32 v : r.residual_w) write_varint(flat, zigzag_encode32(v));
+    for (i32 v : r.residual_x) write_varint(flat, zigzag_encode32(v));
+    for (i32 v : r.residual_y) write_varint(flat, zigzag_encode32(v));
+    for (i32 v : r.residual_z) write_varint(flat, zigzag_encode32(v));
+    return range_encode_bytes(flat).size();
+}
+
+// A path deliberately alternating a very smooth, easily-predicted stretch
+// (constant rotation+scale, exactly what the 3x3 joint models) with a
+// jittery, hard-to-predict burst (large random noise), repeated several
+// times -- so any single *fixed* block size straddles regime transitions
+// somewhere. This is the position analogue of
+// test_rod_joint_lag_search_period_drift, but targeting block
+// *resolution* instead of *lag*: adaptive_partition should keep blocks
+// large through the smooth stretches (few parameters needed) and shrink
+// them through the jittery bursts (fresh calibration needed more often),
+// which a fixed size can't do simultaneously.
+static void test_rod_joint_3d_adaptive_blocking() {
+    std::mt19937 rng(2032);
+    std::uniform_int_distribution<int> jitter(-40, 40);
+    std::vector<Point3i> path;
+    double x = 200, y = 0, z = 0;
+    double dx = 6, dy = 4, dz = 1;
+    double ax = 1.0 / std::sqrt(3.0), ay = ax, az = ax;
+    double theta = 0.04, ct = std::cos(theta), st = std::sin(theta);
+    for (int rep = 0; rep < 8; rep++) {
+        for (int i = 0; i < 300; i++) {
+            path.push_back({(i32)std::lround(x), (i32)std::lround(y), (i32)std::lround(z)});
+            double dot = dx * ax + dy * ay + dz * az;
+            double cx = ay * dz - az * dy, cy = az * dx - ax * dz, cz = ax * dy - ay * dx;
+            double ndx = dx * ct + cx * st + ax * dot * (1 - ct);
+            double ndy = dy * ct + cy * st + ay * dot * (1 - ct);
+            double ndz = dz * ct + cz * st + az * dot * (1 - ct);
+            dx = ndx; dy = ndy; dz = ndz;
+            x += dx; y += dy; z += dz;
+        }
+        for (int i = 0; i < 60; i++) {
+            x += dx + jitter(rng); y += dy + jitter(rng); z += dz + jitter(rng);
+            path.push_back({(i32)std::lround(x), (i32)std::lround(y), (i32)std::lround(z)});
+        }
+    }
+
+    RodJoint3DSimResult fixed_r = rod_joint_3d_similarity_forward(path);
+    RodJoint3DSimResult adaptive_r = rod_joint_3d_similarity_forward_adaptive(path);
+
+    auto back = rod_joint_3d_similarity_inverse(adaptive_r);
+    CHECK(back.size() == path.size());
+    bool match = true;
+    for (size_t i = 0; i < path.size(); i++)
+        if (back[i].x != path[i].x || back[i].y != path[i].y || back[i].z != path[i].z) match = false;
+    CHECK(match);
+
+    size_t fixed_bytes = measure_rodjoint3dsim_bytes(fixed_r);
+    size_t adaptive_bytes = measure_rodjoint3dsim_bytes(adaptive_r);
+    CHECK(adaptive_bytes < fixed_bytes);
+    std::printf("  (Rod-Joint 3D adaptive blocking: fixed=%zu blocks/%zu bytes, adaptive=%zu blocks/%zu bytes, %.1f%% smaller)\n",
+                 fixed_r.block_lag.size(), fixed_bytes, adaptive_r.block_lag.size(), adaptive_bytes,
+                 100.0 * (1.0 - (double)adaptive_bytes / (double)fixed_bytes));
+}
+
+// Orientation analogue: alternate constant-angular-velocity stretches
+// with jittery bursts in the delta rotation.
+
 namespace {
 constexpr double kTestPi = 3.14159265358979323846;
 
@@ -1276,6 +1363,53 @@ static void test_quaternion_joint_lossy() {
                  quant_step, max_err, generous_bound, (long long)lossless_res_sum, (long long)lossy_res_sum);
 }
 
+// Orientation analogue of test_rod_joint_3d_adaptive_blocking: alternate
+// constant-angular-velocity stretches with jittery bursts in the delta
+// rotation.
+static void test_quaternion_joint_adaptive_blocking() {
+    std::mt19937 rng(2033);
+    std::uniform_real_distribution<double> jitter_deg(-4.0, 4.0);
+    std::vector<Quat4i> quats;
+    const double scale = 1 << 20;
+    double qw = 1, qx = 0, qy = 0, qz = 0;
+    for (int rep = 0; rep < 8; rep++) {
+        for (int i = 0; i < 300; i++) {
+            quats.push_back(quat_to_i32(qw, qx, qy, qz, scale));
+            double half = (1.5 * kTestPi / 180.0) / 2.0;
+            double dqw = std::cos(half), dqz = std::sin(half);
+            double nw, nx, ny, nz;
+            quat_mul_d(qw, qx, qy, qz, dqw, 0, 0, dqz, nw, nx, ny, nz);
+            qw = nw; qx = nx; qy = ny; qz = nz;
+        }
+        for (int i = 0; i < 60; i++) {
+            quats.push_back(quat_to_i32(qw, qx, qy, qz, scale));
+            double half = (jitter_deg(rng) * kTestPi / 180.0) / 2.0;
+            double dqw = std::cos(half), dqz = std::sin(half);
+            double nw, nx, ny, nz;
+            quat_mul_d(qw, qx, qy, qz, dqw, 0, 0, dqz, nw, nx, ny, nz);
+            qw = nw; qx = nx; qy = ny; qz = nz;
+        }
+    }
+
+    QuaternionJointResult fixed_r = quaternion_joint_forward(quats);
+    QuaternionJointResult adaptive_r = quaternion_joint_forward_adaptive(quats);
+
+    auto back = quaternion_joint_inverse(adaptive_r);
+    CHECK(back.size() == quats.size());
+    bool match = true;
+    for (size_t i = 0; i < quats.size(); i++)
+        if (back[i].w != quats[i].w || back[i].x != quats[i].x ||
+            back[i].y != quats[i].y || back[i].z != quats[i].z) match = false;
+    CHECK(match);
+
+    size_t fixed_bytes = measure_quatjoint_bytes(fixed_r);
+    size_t adaptive_bytes = measure_quatjoint_bytes(adaptive_r);
+    CHECK(adaptive_bytes < fixed_bytes);
+    std::printf("  (Quaternion Joint adaptive blocking: fixed=%zu blocks/%zu bytes, adaptive=%zu blocks/%zu bytes, %.1f%% smaller)\n",
+                 fixed_r.block_lag.size(), fixed_bytes, adaptive_r.block_lag.size(), adaptive_bytes,
+                 100.0 * (1.0 - (double)adaptive_bytes / (double)fixed_bytes));
+}
+
 // End-to-end through the public compress_pose/decompress_pose/
 // compress_pose_lossy API: a synthetic 6-DOF pose stream (a drone
 // circling upward while smoothly yawing to track its own heading, plus
@@ -1375,6 +1509,8 @@ int main() {
     test_rod_joint_3d_lossy();
     test_quaternion_joint();
     test_quaternion_joint_lossy();
+    test_rod_joint_3d_adaptive_blocking();
+    test_quaternion_joint_adaptive_blocking();
     test_pose_codec();
     test_codec();
     test_codec_adaptive_skip();

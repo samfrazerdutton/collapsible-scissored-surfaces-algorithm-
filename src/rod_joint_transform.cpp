@@ -1,4 +1,5 @@
 #include "csa/rod_joint_transform.hpp"
+#include "csa/adaptive_partition.hpp"
 #include <algorithm>
 #include <cmath>
 
@@ -232,6 +233,75 @@ u32 pick_block_lag_3d(const std::vector<i32>& ex, const std::vector<i32>& ey, co
     return best_lag;
 }
 
+// Shared inner loop for rod_joint_3d_similarity_forward/_forward_adaptive:
+// encodes rods [start,end) using a calibrated (lag, M), updating
+// reconstructed history and residuals. Factored out so the fixed-block
+// and adaptive-block forward functions share exactly one implementation
+// of the actual per-rod prediction math.
+void encode_block_3d(const std::vector<i32>& ex, const std::vector<i32>& ey, const std::vector<i32>& ez,
+                      const std::vector<Point3i>& points, size_t start, size_t end, u32 lag,
+                      const std::array<i64, 9>& M, u32 quant_step, u32 resync_interval,
+                      std::vector<i32>& rec_ex, std::vector<i32>& rec_ey, std::vector<i32>& rec_ez,
+                      std::vector<i32>& residual_x, std::vector<i32>& residual_y, std::vector<i32>& residual_z,
+                      i64& rec_px, i64& rec_py, i64& rec_pz) {
+    for (size_t i = start; i < end; i++) {
+        i32 prev_x = (i >= lag) ? rec_ex[i - lag] : 0;
+        i32 prev_y = (i >= lag) ? rec_ey[i - lag] : 0;
+        i32 prev_z = (i >= lag) ? rec_ez[i - lag] : 0;
+        i32 px, py, pz;
+        mat3_mul_round(M, prev_x, prev_y, prev_z, px, py, pz);
+
+        bool is_resync = (resync_interval > 0) && (((i + 1) % resync_interval) == 0);
+        u32 q_here = is_resync ? 1 : quant_step;
+
+        i64 target_dx = is_resync ? ((i64)points[i + 1].x - rec_px) : (i64)ex[i];
+        i64 target_dy = is_resync ? ((i64)points[i + 1].y - rec_py) : (i64)ey[i];
+        i64 target_dz = is_resync ? ((i64)points[i + 1].z - rec_pz) : (i64)ez[i];
+        i64 raw_dx = target_dx - px;
+        i64 raw_dy = target_dy - py;
+        i64 raw_dz = target_dz - pz;
+
+        i64 qx = quant_round_div(raw_dx, (i64)q_here);
+        i64 qy = quant_round_div(raw_dy, (i64)q_here);
+        i64 qz = quant_round_div(raw_dz, (i64)q_here);
+        residual_x[i] = (i32)qx;
+        residual_y[i] = (i32)qy;
+        residual_z[i] = (i32)qz;
+
+        rec_ex[i] = (i32)(px + qx * (i64)q_here);
+        rec_ey[i] = (i32)(py + qy * (i64)q_here);
+        rec_ez[i] = (i32)(pz + qz * (i64)q_here);
+        rec_px += rec_ex[i];
+        rec_py += rec_ey[i];
+        rec_pz += rec_ez[i];
+    }
+}
+
+// Calibration bundled with its own achieved SSE, for adaptive_partition's
+// CalibFn contract (see adaptive_partition.hpp).
+struct SimBlockCalib { u32 lag; std::array<i64, 9> M; };
+
+std::pair<SimBlockCalib, double> calibrate_and_score_3d(const std::vector<i32>& ex, const std::vector<i32>& ey,
+                                                          const std::vector<i32>& ez, size_t start, size_t end) {
+    std::array<i64, 9> M{};
+    u32 lag = pick_block_lag_3d(ex, ey, ez, start, end, /*force_lag=*/0, M);
+    double sse = block_predict_sse_3d(ex, ey, ez, start, end, lag, M);
+    return {SimBlockCalib{lag, M}, sse};
+}
+
+// Builds a per-sample block-index lookup from explicit block lengths
+// (used by rod_joint_3d_similarity_inverse when r.block_len is non-empty).
+std::vector<u32> block_index_from_lengths(size_t n, const std::vector<u32>& block_len) {
+    std::vector<u32> idx(n);
+    size_t pos = 0;
+    for (size_t b = 0; b < block_len.size(); b++) {
+        size_t end = std::min(n, pos + (size_t)block_len[b]);
+        for (size_t i = pos; i < end; i++) idx[i] = (u32)b;
+        pos = end;
+    }
+    return idx;
+}
+
 } // namespace
 
 RodJoint2DResult rod_joint_2d_forward(const std::vector<Point2i>& points, u32 force_lag,
@@ -413,38 +483,52 @@ RodJoint3DSimResult rod_joint_3d_similarity_forward(const std::vector<Point3i>& 
         u32 lag = pick_block_lag_3d(ex, ey, ez, start, end, force_lag, M);
         r.block_lag[blk] = lag;
         r.block_matrix[blk] = M;
+        encode_block_3d(ex, ey, ez, points, start, end, lag, M, r.quant_step, r.resync_interval,
+                         rec_ex, rec_ey, rec_ez, r.residual_x, r.residual_y, r.residual_z, rec_px, rec_py, rec_pz);
+    }
+    return r;
+}
 
-        for (size_t i = start; i < end; i++) {
-            i32 prev_x = (i >= lag) ? rec_ex[i - lag] : 0;
-            i32 prev_y = (i >= lag) ? rec_ey[i - lag] : 0;
-            i32 prev_z = (i >= lag) ? rec_ez[i - lag] : 0;
-            i32 px, py, pz;
-            mat3_mul_round(M, prev_x, prev_y, prev_z, px, py, pz);
+RodJoint3DSimResult rod_joint_3d_similarity_forward_adaptive(const std::vector<Point3i>& points, u32 quant_step,
+                                                              u32 resync_interval, size_t min_block, double merge_ratio) {
+    RodJoint3DSimResult r;
+    r.count = points.size();
+    if (points.empty()) return r;
+    r.anchor = points[0];
+    r.quant_step = (quant_step == 0) ? 1 : quant_step;
+    r.resync_interval = resync_interval;
+    size_t m = points.size();
+    if (m < 2) return r;
 
-            bool is_resync = (r.resync_interval > 0) && (((i + 1) % r.resync_interval) == 0);
-            u32 q_here = is_resync ? 1 : r.quant_step;
+    std::vector<i32> ex(m - 1), ey(m - 1), ez(m - 1);
+    for (size_t i = 1; i < m; i++) {
+        ex[i - 1] = points[i].x - points[i - 1].x;
+        ey[i - 1] = points[i].y - points[i - 1].y;
+        ez[i - 1] = points[i].z - points[i - 1].z;
+    }
+    size_t nrods = m - 1;
 
-            i64 target_dx = is_resync ? ((i64)points[i + 1].x - rec_px) : (i64)ex[i];
-            i64 target_dy = is_resync ? ((i64)points[i + 1].y - rec_py) : (i64)ey[i];
-            i64 target_dz = is_resync ? ((i64)points[i + 1].z - rec_pz) : (i64)ez[i];
-            i64 raw_dx = target_dx - px;
-            i64 raw_dy = target_dy - py;
-            i64 raw_dz = target_dz - pz;
+    auto blocks = adaptive_partition<SimBlockCalib>(nrods, min_block, merge_ratio,
+        [&](size_t start, size_t end) { return calibrate_and_score_3d(ex, ey, ez, start, end); },
+        [&](size_t start, size_t end, const SimBlockCalib& c) { return block_predict_sse_3d(ex, ey, ez, start, end, c.lag, c.M); });
 
-            i64 qx = quant_round_div(raw_dx, (i64)q_here);
-            i64 qy = quant_round_div(raw_dy, (i64)q_here);
-            i64 qz = quant_round_div(raw_dz, (i64)q_here);
-            r.residual_x[i] = (i32)qx;
-            r.residual_y[i] = (i32)qy;
-            r.residual_z[i] = (i32)qz;
+    r.block_len.resize(blocks.size());
+    r.block_lag.resize(blocks.size());
+    r.block_matrix.resize(blocks.size());
+    r.residual_x.resize(nrods);
+    r.residual_y.resize(nrods);
+    r.residual_z.resize(nrods);
 
-            rec_ex[i] = (i32)(px + qx * (i64)q_here);
-            rec_ey[i] = (i32)(py + qy * (i64)q_here);
-            rec_ez[i] = (i32)(pz + qz * (i64)q_here);
-            rec_px += rec_ex[i];
-            rec_py += rec_ey[i];
-            rec_pz += rec_ez[i];
-        }
+    std::vector<i32> rec_ex(nrods), rec_ey(nrods), rec_ez(nrods);
+    i64 rec_px = points[0].x, rec_py = points[0].y, rec_pz = points[0].z;
+
+    for (size_t b = 0; b < blocks.size(); b++) {
+        r.block_len[b] = (u32)(blocks[b].end - blocks[b].start);
+        r.block_lag[b] = blocks[b].calib.lag;
+        r.block_matrix[b] = blocks[b].calib.M;
+        encode_block_3d(ex, ey, ez, points, blocks[b].start, blocks[b].end, blocks[b].calib.lag, blocks[b].calib.M,
+                         r.quant_step, r.resync_interval, rec_ex, rec_ey, rec_ez,
+                         r.residual_x, r.residual_y, r.residual_z, rec_px, rec_py, rec_pz);
     }
     return r;
 }
@@ -459,8 +543,10 @@ std::vector<Point3i> rod_joint_3d_similarity_inverse(const RodJoint3DSimResult& 
     size_t nrods = (size_t)r.count - 1;
     u32 quant_step = (r.quant_step == 0) ? 1 : r.quant_step;
     std::vector<i32> rec_ex(nrods), rec_ey(nrods), rec_ez(nrods);
+    std::vector<u32> block_of;
+    if (!r.block_len.empty()) block_of = block_index_from_lengths(nrods, r.block_len);
     for (size_t i = 0; i < nrods; i++) {
-        size_t blk = i / kRodJoint3DBlockSize;
+        size_t blk = r.block_len.empty() ? (i / kRodJoint3DBlockSize) : (size_t)block_of[i];
         u32 lag = r.block_lag[blk];
         const std::array<i64, 9>& M = r.block_matrix[blk];
         i32 prev_x = (i >= lag) ? rec_ex[i - lag] : 0;

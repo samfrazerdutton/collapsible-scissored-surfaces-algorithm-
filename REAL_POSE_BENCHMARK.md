@@ -72,11 +72,11 @@ representative setting (`--pos-quant 8 --pos-resync 64 --quat-quant 32
 | gzip -9 | 365,071 | 21.9% smaller |
 | bz2 -9 | 350,970 | 25.0% smaller |
 | lzma -9 | 230,840 | 50.6% smaller |
-| **CSA `compress-pose`** | **160,151** | **65.8% smaller** |
-| CSA `compress-pose-lossy` | 65,504 | 86.0% smaller (max pos err 9.4e-5, max orientation-component err 1.6e-5) |
+| **CSA `compress-pose`** | **146,999** | **68.6% smaller** |
+| CSA `compress-pose-lossy` | 65,514 | 86.0% smaller (max pos err 9.4e-5, max orientation-component err 1.6e-5) |
 
 Position-only (`compress-geo3d` on the same points): 63,399 bytes.
-Orientation's share of the full pose blob: 96,752 bytes.
+Orientation's share of the full pose blob: 83,600 bytes.
 
 ### TUM fr2/desk (20,957 real poses, handheld camera)
 
@@ -86,10 +86,10 @@ Orientation's share of the full pose blob: 96,752 bytes.
 | gzip -9 | 324,979 | 44.6% smaller |
 | bz2 -9 | 309,731 | 47.2% smaller |
 | lzma -9 | 223,080 | 62.0% smaller |
-| **CSA `compress-pose`** | **212,295** | **63.8% smaller** |
-| CSA `compress-pose-lossy` | 135,322 | 76.9% smaller (max pos err 7.4e-5, max orientation-component err 1.6e-5) |
+| **CSA `compress-pose`** | **212,162** | **63.8% smaller** |
+| CSA `compress-pose-lossy` | 134,956 | 77.0% smaller (max pos err 7.4e-5, max orientation-component err 1.6e-5) |
 
-Position-only: 90,271 bytes. Orientation's share: 122,024 bytes.
+Position-only: 90,276 bytes. Orientation's share: 121,886 bytes.
 
 ### KITTI odometry 00 (4,541 real poses, vehicle driving)
 
@@ -99,49 +99,66 @@ Position-only: 90,271 bytes. Orientation's share: 122,024 bytes.
 | gzip -9 | 107,288 | 15.6% smaller |
 | bz2 -9 | 109,382 | 14.0% smaller |
 | lzma -9 | 78,332 | 38.4% smaller |
-| **CSA `compress-pose`** | **74,590** | **41.3% smaller** |
-| CSA `compress-pose-lossy` | 51,618 | 59.4% smaller (max pos err 7.7e-5, max orientation-component err 1.6e-5) |
+| **CSA `compress-pose`** | **72,093** | **43.3% smaller** |
+| CSA `compress-pose-lossy` | 50,127 | 60.6% smaller (max pos err 7.7e-5, max orientation-component err 1.6e-5) |
 
-Position-only: 36,264 bytes. Orientation's share: 38,326 bytes.
+Position-only: 36,269 bytes. Orientation's share: 35,824 bytes.
 
 ## Honest verdict
 
 - **CSA beats lzma -9 -- the strongest general-purpose reference tested
   -- on all three real trajectories**, not just the one it was designed
-  around: 30.6% smaller on the drone flight, 4.8% smaller on the
-  handheld camera, 4.8% smaller on the vehicle drive. This is a real,
+  around: 36.3% smaller on the drone flight, 4.9% smaller on the
+  handheld camera, 8.0% smaller on the vehicle drive. This is a real,
   consistent (if not equally large) win across three genuinely different
   kinds of real 6-DOF motion, not a single cherry-picked case -- the
   closest this project has come to validating the "less-contested niche"
-  bet plainly.
+  bet plainly. (These margins include adaptive-resolution block
+  calibration -- see DESIGN.md's own section on it -- which widened the
+  EuRoC and KITTI margins from an initial 30.6%/4.8% without it; the TUM
+  margin barely moved, 4.8% to 4.9%.)
 
 - **The win is largest on the smoothest motion and smallest on the least
   smooth**, exactly as the model predicts. The EuRoC drone flight (a
   motion-capture-tracked MAV under stabilized flight control) is the
-  smoothest of the three and gets the biggest win (30.6% over lzma). The
-  handheld camera and vehicle drive both involve more irregular
-  acceleration/turning (a human hand's jitter; a car's stop-and-go city
-  driving) and both land at a smaller, near-identical 4.8% -- consistent
-  with the calibrated-rotation model's core assumption (*locally*
-  consistent angular velocity/direction) degrading gracefully rather than
-  catastrophically as real motion gets less smooth, not a cliff-edge
-  failure.
+  smoothest of the three and gets the biggest win. The handheld camera
+  and vehicle drive both involve more irregular acceleration/turning (a
+  human hand's jitter; a car's stop-and-go city driving) and land at
+  smaller margins -- consistent with the calibrated-rotation model's core
+  assumption (*locally* consistent angular velocity/direction) degrading
+  gracefully rather than catastrophically as real motion gets less
+  smooth, not a cliff-edge failure.
 
 - **Orientation is not a minor add-on -- it's the larger half of the
-  compressed size on all three datasets** (60.4% on EuRoC, 57.5% on TUM,
-  51.4% on KITTI), starting from a 57.1%-of-raw-bytes share (16 of 28
+  compressed size on all three datasets** (56.9% on EuRoC, 57.5% on TUM,
+  49.7% on KITTI), starting from a 57.1%-of-raw-bytes share (16 of 28
   bytes per pose) on all three. Its *compression efficiency* relative to
-  that raw share is mixed, not uniformly better or worse: on EuRoC and TUM
-  (the drone flight and handheld camera -- both continuously reorienting)
-  orientation compresses slightly *less* efficiently than position (63.8%
-  and 63.6% of its own raw bytes removed, vs. position's 68.4% and 64.1%);
-  on KITTI (the vehicle drive, where heading barely changes for long
-  straight stretches) orientation compresses *better* than position
-  (47.3% of its raw bytes removed vs. position's 33.5%). Either way,
-  orientation is consistently a substantial fraction of the total cost,
-  not a rounding error next to position -- confirming the Quaternion
-  Joint was addressing a real part of the problem, whichever direction
-  its relative efficiency happens to land on for a given motion type.
+  that raw share is mixed, not uniformly better or worse: on EuRoC
+  orientation now compresses *slightly better* than position (68.7% of
+  its own raw bytes removed vs. position's 68.4%, since adaptive
+  blocking helped orientation specifically -- see below); on TUM it's
+  still marginally behind position (63.7% vs. 64.1%); on KITTI (the
+  vehicle drive, where heading barely changes for long straight
+  stretches) orientation compresses substantially better than position
+  (50.7% vs. 33.4%). Either way, orientation is consistently a
+  substantial fraction of the total cost, not a rounding error next to
+  position -- confirming the Quaternion Joint was addressing a real part
+  of the problem, whichever direction its relative efficiency happens to
+  land on for a given motion type.
+
+- **Adaptive-resolution block calibration's real contribution came
+  almost entirely from orientation, not position.** Position-only bytes
+  were essentially unchanged on all three datasets (63,399 / 90,271→90,276
+  / 36,264→36,269 -- noise-level movement, since EuRoC's position uses the
+  xy+z composition model, which adaptive blocking wasn't applied to, and
+  TUM/KITTI's 3D similarity joint saw negligible real improvement from
+  it). The Quaternion Joint's orientation share is where the real
+  reduction happened: 96,752→83,600 bytes on EuRoC (a 13.6% cut) and
+  38,326→35,824 on KITTI (6.5%), with TUM's 122,024→121,886 barely moving.
+  This is a genuinely useful, real result, but a narrower one than "helps
+  6-DOF pose compression broadly" -- so far it's specifically "helps the
+  Quaternion Joint on motion with distinct easy/hard regimes," not yet
+  shown to help the position side on this data.
 
 - **No specialized competitor exists to lose to here** (see the intro) --
   unlike the LiDAR-vs-LASzip result, this file can't report "loses

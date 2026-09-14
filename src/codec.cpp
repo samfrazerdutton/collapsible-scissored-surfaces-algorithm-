@@ -192,9 +192,13 @@ RodJoint2DResult deserialize_geo2d(const u8* data, size_t size, size_t& pos) {
     return r;
 }
 
-// Serializes a RodJoint3DSimResult: header fields, then a single range-coded
-// blob holding the per-block 3x3 matrices followed by the x/y/z residual
-// streams (same rationale as the other serialize_* helpers).
+// Serializes a RodJoint3DSimResult: header fields (including nblocks and
+// an is-adaptive flag, since block boundaries are no longer always a
+// deterministic function of count -- see block_len's comment in
+// rod_joint_transform.hpp), then a single range-coded blob holding
+// block_len (only when adaptive), the per-block 3x3 matrices, and the
+// x/y/z residual streams (same rationale as the other serialize_*
+// helpers).
 void serialize_geo3d_sim(const RodJoint3DSimResult& r, std::vector<u8>& out) {
     put_u64(out, r.count);
     put_i32(out, r.anchor.x);
@@ -202,8 +206,11 @@ void serialize_geo3d_sim(const RodJoint3DSimResult& r, std::vector<u8>& out) {
     put_i32(out, r.anchor.z);
     put_u32(out, r.quant_step);
     put_u32(out, r.resync_interval);
+    put_u32(out, (u32)r.block_lag.size());
+    out.push_back(r.block_len.empty() ? (u8)0 : (u8)1);
 
     std::vector<u8> flat;
+    for (u32 v : r.block_len) write_varint(flat, v);
     for (u32 v : r.block_lag) write_varint(flat, v);
     for (const auto& m : r.block_matrix)
         for (i64 v : m) write_varint(flat, zigzag_encode64(v));
@@ -224,6 +231,9 @@ RodJoint3DSimResult deserialize_geo3d_sim(const u8* data, size_t size, size_t& p
     r.anchor.z = get_i32(data, size, pos);
     r.quant_step = get_u32(data, size, pos);
     r.resync_interval = get_u32(data, size, pos);
+    u32 nblocks = get_u32(data, size, pos);
+    if (pos >= size) throw std::runtime_error("csa: truncated geo3d-sim adaptive flag");
+    bool is_adaptive = data[pos++] != 0;
 
     u64 raw_len = get_u64(data, size, pos);
     u64 coded_len = get_u64(data, size, pos);
@@ -232,13 +242,17 @@ RodJoint3DSimResult deserialize_geo3d_sim(const u8* data, size_t size, size_t& p
     pos += (size_t)coded_len;
 
     size_t n = (r.count > 0) ? (size_t)(r.count - 1) : 0;
-    size_t nblocks = (n + kRodJoint3DBlockSize - 1) / kRodJoint3DBlockSize;
     r.block_lag.resize(nblocks);
     r.block_matrix.resize(nblocks);
     r.residual_x.resize(n);
     r.residual_y.resize(n);
     r.residual_z.resize(n);
     size_t vpos = 0;
+    if (is_adaptive) {
+        r.block_len.resize(nblocks);
+        for (size_t b = 0; b < nblocks; b++)
+            r.block_len[b] = (u32)read_varint(flat.data(), flat.size(), vpos);
+    }
     for (size_t b = 0; b < nblocks; b++)
         r.block_lag[b] = (u32)read_varint(flat.data(), flat.size(), vpos);
     for (size_t b = 0; b < nblocks; b++)
@@ -276,8 +290,11 @@ void serialize_quat_joint(const QuaternionJointResult& r, std::vector<u8>& out) 
     put_i32(out, r.anchor.z);
     put_u32(out, r.quant_step);
     put_u32(out, r.resync_interval);
+    put_u32(out, (u32)r.block_lag.size());
+    out.push_back(r.block_len.empty() ? (u8)0 : (u8)1);
 
     std::vector<u8> flat;
+    for (u32 v : r.block_len) write_varint(flat, v);
     for (u32 v : r.block_lag) write_varint(flat, v);
     for (const auto& d : r.block_delta)
         for (i64 v : d) write_varint(flat, zigzag_encode64(v));
@@ -300,6 +317,9 @@ QuaternionJointResult deserialize_quat_joint(const u8* data, size_t size, size_t
     r.anchor.z = get_i32(data, size, pos);
     r.quant_step = get_u32(data, size, pos);
     r.resync_interval = get_u32(data, size, pos);
+    u32 nblocks = get_u32(data, size, pos);
+    if (pos >= size) throw std::runtime_error("csa: truncated quaternion-joint adaptive flag");
+    bool is_adaptive = data[pos++] != 0;
 
     u64 raw_len = get_u64(data, size, pos);
     u64 coded_len = get_u64(data, size, pos);
@@ -308,7 +328,6 @@ QuaternionJointResult deserialize_quat_joint(const u8* data, size_t size, size_t
     pos += (size_t)coded_len;
 
     size_t n = (r.count > 0) ? (size_t)(r.count - 1) : 0;
-    size_t nblocks = (n + kQuatJointBlockSize - 1) / kQuatJointBlockSize;
     r.block_lag.resize(nblocks);
     r.block_delta.resize(nblocks);
     r.residual_w.resize(n);
@@ -316,6 +335,11 @@ QuaternionJointResult deserialize_quat_joint(const u8* data, size_t size, size_t
     r.residual_y.resize(n);
     r.residual_z.resize(n);
     size_t vpos = 0;
+    if (is_adaptive) {
+        r.block_len.resize(nblocks);
+        for (size_t b = 0; b < nblocks; b++)
+            r.block_len[b] = (u32)read_varint(flat.data(), flat.size(), vpos);
+    }
     for (size_t b = 0; b < nblocks; b++)
         r.block_lag[b] = (u32)read_varint(flat.data(), flat.size(), vpos);
     for (size_t b = 0; b < nblocks; b++)
@@ -357,6 +381,17 @@ std::vector<u8> best_quat_encoding(const std::vector<Quat4i>& quats, u32 quant_s
         serialize_quat_joint(r, out);
         if (out.size() < best.size()) best = std::move(out);
     }
+
+    // Variable-resolution alternative (see adaptive_partition.hpp):
+    // measured to help on real 6-DOF tracking data (REAL_POSE_BENCHMARK.md),
+    // but only kept here if it actually serializes smaller than every
+    // fixed-block candidate above -- same "compare real bytes, never trust
+    // a proxy for the final decision" discipline as the lag search itself.
+    QuaternionJointResult adaptive_r = quaternion_joint_forward_adaptive(quats, quant_step, resync_interval);
+    std::vector<u8> adaptive_out;
+    serialize_quat_joint(adaptive_r, adaptive_out);
+    if (adaptive_out.size() < best.size()) best = std::move(adaptive_out);
+
     return best;
 }
 
@@ -595,6 +630,18 @@ std::vector<u8> best_geo3d_similarity_encoding(const std::vector<Point3i>& point
         serialize_geo3d_sim(sim, out);
         if (out.size() < best.size()) best = std::move(out);
     }
+
+    // Variable-resolution alternative (see adaptive_partition.hpp),
+    // measured to help on real 6-DOF tracking data
+    // (REAL_POSE_BENCHMARK.md) -- kept only if it actually beats every
+    // fixed-block candidate above by real serialized bytes.
+    RodJoint3DSimResult adaptive_sim = rod_joint_3d_similarity_forward_adaptive(points, quant_step, resync_interval);
+    std::vector<u8> adaptive_out;
+    write_magic_mode(adaptive_out, Mode::Geo3D);
+    adaptive_out.push_back((u8)Geo3DSubMode::Similarity3D);
+    serialize_geo3d_sim(adaptive_sim, adaptive_out);
+    if (adaptive_out.size() < best.size()) best = std::move(adaptive_out);
+
     return best;
 }
 
