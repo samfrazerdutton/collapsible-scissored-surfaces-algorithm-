@@ -174,7 +174,7 @@ would make entropy coding itself GPU-parallel, but it is also considerably
 easier to get subtly wrong. Given the choice between a flashier entropy
 coder and one that is provably bit-exact under test, correctness won:
 the range coder here is simple enough to reason about completely, and all
-1360 round-trip checks (see `tests/test_main.cpp`) pass, including the
+1362 round-trip checks (see `tests/test_main.cpp`) pass, including the
 CUDA path. Interleaved-stream rANS for GPU-parallel entropy decode is a
 natural next step (see Future Work).
 
@@ -271,8 +271,10 @@ technique, and it's a genuinely different lever: BWT permutes the input
 so every byte migrates next to every other occurrence sharing its
 context, turning that statistical tendency into long runs of identical
 or near-identical bytes; a move-to-front pass then turns those runs into
-mostly-small numbers, which the same adaptive range coder (reused as-is,
-just over a 257-symbol alphabet via `FenwickFreqN`) compresses well.
+mostly-small numbers -- runs of the resulting all-dominant rank-0 are
+further collapsed by a RUNA/RUNB zero-run encoding (see below) -- which
+the same adaptive range coder (reused as-is, just over a 258-symbol
+alphabet via `FenwickFreqN`) compresses well.
 
 **Block-based, not whole-file.** A real suffix array is at best O(n log
 n) to build, and this implementation deliberately uses the simpler,
@@ -300,11 +302,26 @@ before being trusted with anything larger --
 `test_bwt_transform` encodes that exact derivation as a permanent
 regression test.
 
-**No dedicated run-length stage.** bz2's real pipeline follows MTF with
-a specialized RUNA/RUNB zero-run encoding before entropy coding; this
-implementation skips that and relies on the adaptive entropy model's own
-skew-handling to capture a real fraction of the same benefit, trading
-some ratio for meaningfully less implementation risk (see Future Work).
+**RUNA/RUNB zero-run encoding.** bz2's real pipeline follows MTF with a
+specialized zero-run encoding, and this implementation now has one too:
+MTF's rank-0 symbol dominates its output on BWT-clustered data (every
+byte matching the most-recently-seen one produces rank 0), so a run of N
+consecutive zeros is replaced by O(log N) reserved-symbol tokens instead
+of N individual rank-0 symbols through the entropy coder. The run length
+is encoded in bijective base-2 (digit set {1, 2}, least-significant
+digit first: repeatedly take `d = ((N-1) mod 2) + 1`, emit RUNA for d=1
+or RUNB for d=2, then `N = (N-d)/2`, until N reaches 0) -- a bijection,
+so every N >= 1 has exactly one such digit sequence and decoding
+(`N = sum(d_i * 2^i)`) is unambiguous. This adds two reserved symbols to
+the alphabet (RUNA=0, RUNB=1) and shifts every nonzero MTF rank up by
+one to make room (258 symbols total, up from 257). Verified with the
+same rigor as the transform itself: hand-derived and checked against
+worked examples before trusting it, then measured. The decoder can't
+just loop a fixed number of times per block anymore (a run compresses
+multiple ranks into one entropy symbol), so it decodes one RLE symbol at
+a time and expands runs as they're recognized until the block's known
+rank count is reached -- including the case where a run ends exactly at
+a block boundary with no real symbol following it in that block.
 
 **Measured, not assumed, and gated on that measurement.** `compress()`
 tries this as a fourth candidate alongside raw/Pantograph-Lift/LZ. On
@@ -315,8 +332,18 @@ cost roughly 10 extra seconds at the `fast` level alone (suffix-array
 construction cost doesn't care whether the result ends up winning). On
 realistic few-hundred-KB-to-1MB files, though (`USE_CASES.md`'s
 synthetic server-log, JSON-telemetry, and sensor-CSV datasets), it won
-outright every time -- 8-24% smaller than the next-best candidate,
-enough to newly beat lzma on the JSON case. Since BWT's strength doesn't
+outright every time even before RUNA/RUNB was added; adding it shrank
+those same outputs by a further **14-22%** (605KB server log: 53.4KB ->
+41.8KB; 616KB JSON events: 54.7KB -> 47.3KB; 800KB sensor CSV: 134.5KB ->
+114.8KB), enough to newly beat lzma on the server-log case too, on top
+of the JSON case it already beat. The one honest cost found: a tiny
+(4KB) synthetic file got a few percent *larger* (1,718 -> 1,768 bytes) --
+plausibly the larger 258-symbol alphabet's adaptive model taking
+marginally longer to warm up on a block too short to have many long
+zero-runs to amortize that against. `compress()`'s real-size comparison
+against the other three candidates means this never costs anything
+beyond that specific measured difference; it isn't hidden. Since BWT's
+strength doesn't
 correlate with the LZ-ratio signal the Pantograph Lift skip heuristic
 already uses (it beat an already-strong LZ result by 24% on the JSON
 case), that signal isn't a valid predictor for skipping BWT too. Instead,
@@ -704,17 +731,6 @@ smaller call's result).
   substitute for it. Reverted rather than kept as an ambiguous, mixed-
   result default; a real DP-based optimal parser remains the actual
   future-work item here, not the greedy approximation.
-- **BWT mode has no dedicated run-length stage for MTF's zero-runs**
-  (bz2's RUNA/RUNB scheme) -- the adaptive entropy model's own skew-
-  handling captures a real fraction of that benefit already (see the BWT
-  section above), but a proper zero-run encoding would likely close more
-  of the remaining gap to real bz2 on the cases where BWT already wins.
-- **BWT's suffix-array construction is O(n log^2 n) prefix-doubling, not
-  linear-time SA-IS** -- correctness-over-cleverness for a first working
-  version (see the BWT section above), but it's also why BWT mode is
-  capped at a few MB via `kBwtMaxInputSize`; a linear-time construction
-  would remove the reason for that cap entirely, letting BWT compete on
-  large files too instead of being skipped there.
 - **Lossy mode's 3D path only tries the similarity joint, not the xy+z
   composition** (see the lossy-mode section above) -- extending the
   composition's z-axis Pantograph Lift to support quantization too would

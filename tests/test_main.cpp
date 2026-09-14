@@ -190,6 +190,22 @@ static void test_bwt_codec() {
     // the block-chunking logic itself, not just a single block's transform.
     cases.push_back(random_bytes(kBwtDefaultBlockSize * 2 + 12345, rng));
 
+    // Forces the RUNA/RUNB zero-run decoder's trickiest case: a run of
+    // MTF rank-0 that extends all the way to the exact end of a block,
+    // with no real (non-run) symbol following it in that block at all --
+    // the decoder has to recognize "the pending run alone already
+    // reaches this block's known length" without trying to read another
+    // entropy symbol first (which would otherwise consume the start of
+    // the next block's stream). A full random block followed by a
+    // second block that's entirely one repeated byte guarantees the
+    // second block's MTF output ends in a single giant zero-run.
+    {
+        auto boundary_case = random_bytes(kBwtDefaultBlockSize, rng);
+        auto tail = std::vector<u8>(5000, (u8)'Z');
+        boundary_case.insert(boundary_case.end(), tail.begin(), tail.end());
+        cases.push_back(boundary_case);
+    }
+
     for (auto& input : cases) {
         auto blob = bwt_encode(input);
         size_t pos = 0;

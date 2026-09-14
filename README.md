@@ -50,13 +50,16 @@ unmodified C++ source code, not text written for this project -- and
   lzma's ratio at real cost in time. See `REAL_CORPUS_BENCHMARK.md`.
 - **BWT + move-to-front mode** -- a real Burrows-Wheeler Transform (block-
   based suffix-array construction, sentinel-terminated so periodic blocks
-  never need special-casing) feeding a move-to-front pass and the same
-  adaptive entropy coder, targeting bz2's core technique: local byte-
-  context statistics, not exact repeats. `compress()` tries it too (for
-  inputs up to a few MB -- its suffix-array cost isn't worth paying
+  never need special-casing) feeding a move-to-front pass, a bz2-style
+  RUNA/RUNB zero-run encoding for MTF's dominant rank-0 runs, and the
+  same adaptive entropy coder, targeting bz2's core technique: local
+  byte-context statistics, not exact repeats. `compress()` tries it too
+  (for inputs up to a few MB -- its suffix-array cost isn't worth paying
   unconditionally on huge files that don't benefit) and it wins outright
-  on realistic server-log, JSON-telemetry, and sensor-CSV data, 8-24%
-  smaller than the next-best candidate. See `USE_CASES.md`.
+  on realistic server-log, JSON-telemetry, and sensor-CSV data -- adding
+  RUNA/RUNB on top of an already-winning BWT shrank those same outputs by
+  a further 14-22%, newly beating lzma on the server-log case too. See
+  `USE_CASES.md`.
 - **Adaptive order-1 range coder** -- the entropy-coding backend shared by
   every mode (generalized to arbitrary alphabet sizes for the LZ matcher's
   literal/length/distance streams, not just the original 256-byte case).
@@ -84,7 +87,7 @@ unmodified C++ source code, not text written for this project -- and
   `compress()` keeps one per thread automatically. Measured, not assumed:
   ~3.5x faster sustained per-call time at 50K elements, ~1.7x at 2M (see
   `DESIGN.md`).
-- **1379 round-trip correctness checks** (`tests/test_main.cpp` +
+- **1381 round-trip correctness checks** (`tests/test_main.cpp` +
   `tests/test_capi.cpp`, the latter linking the real shared library to
   catch actual symbol-export problems), including a dedicated check that
   the GPU path actually succeeds (not just that the overall call
@@ -164,9 +167,9 @@ cd bindings/go/csa && go test ./...
 
 | dataset | scenario | auto-selected | vs. gzip -9 | vs. bz2 -9 | vs. lzma -9 |
 |---|---|---|---|---|---|
-| server access log | 5,000 synthetic nginx-format lines | BWT + move-to-front | **beats** (53.4KB vs 56.9KB) | loses (38.0KB) | loses, close (51.8KB) |
-| JSON telemetry events | 5,000 IoT/analytics events | BWT + move-to-front | **beats big** (54.7KB vs 73.2KB) | loses (43.3KB) | **beats** (58.0KB) |
-| sensor CSV export | 20,000 rows, smooth+noisy columns | BWT + move-to-front | **beats** (134.5KB vs 164.4KB) | loses (113.4KB) | loses (93.8KB) |
+| server access log | 5,000 synthetic nginx-format lines | BWT + move-to-front | **beats** (41.8KB vs 56.9KB) | loses (38.0KB) | **beats** (51.8KB) |
+| JSON telemetry events | 5,000 IoT/analytics events | BWT + move-to-front | **beats big** (47.3KB vs 73.2KB) | loses, close (43.3KB) | **beats** (58.0KB) |
+| sensor CSV export | 20,000 rows, smooth+noisy columns | BWT + move-to-front | **beats** (114.8KB vs 164.4KB) | loses, very close (113.4KB) | loses (93.8KB) |
 
 **A real, non-synthetic corpus** (18MB of unmodified C++ source code, vs. real market compressors -- see `REAL_CORPUS_BENCHMARK.md`):
 
@@ -204,8 +207,11 @@ cd bindings/go/csa && go test ./...
   beats mature LZ compressors on arbitrary text in general. The BWT
   candidate is the more broadly useful addition: on realistic (not
   maximally repetitive) server-log, JSON-telemetry, and sensor-CSV data
-  (see `USE_CASES.md`) it wins outright every time, 8-24% smaller than
-  the next-best candidate.
+  (see `USE_CASES.md`) it wins outright every time, and a bz2-style
+  RUNA/RUNB zero-run encoding on top of BWT's own move-to-front output
+  shrank those same wins by a further 14-22%, newly beating lzma on the
+  server-log case (it already beat lzma on the JSON case before RUNA/RUNB
+  was added).
 - The harshest, most credible test in this repo is `REAL_CORPUS_BENCHMARK.md`:
   18MB of real, unmodified C++ source code, not text written or generated
   for this project, benchmarked against gzip/bz2/lzma *and* zstd and
