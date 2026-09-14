@@ -160,6 +160,21 @@ Position-only: 36,269 bytes. Orientation's share: 35,824 bytes.
   Quaternion Joint on motion with distinct easy/hard regimes," not yet
   shown to help the position side on this data.
 
+- **A follow-up cross-modal coupling attempt was tried on this same KITTI
+  data and reverted** -- a real, measured negative result, documented in
+  full in DESIGN.md's future-work section rather than dropped quietly.
+  Rotating a canonical forward axis by KITTI's own ground-truth
+  quaternions and comparing to the actual direction of travel showed a
+  genuinely tight coupling (median ~1.3 degrees misalignment). A
+  predictor built on that coupling won decisively on a synthetic
+  adversarial test designed around the hypothesis, but showed *no*
+  improvement on this real KITTI data -- diagnosed as a precision
+  mismatch, not a correlation problem: deriving orientation from already-
+  quantized position deltas is fundamentally coarser than the orientation
+  stream's own achievable precision, so continuity-based prediction (the
+  existing lag-based Quaternion Joint) still wins even though the
+  directional correlation is real.
+
 - **No specialized competitor exists to lose to here** (see the intro) --
   unlike the LiDAR-vs-LASzip result, this file can't report "loses
   decisively to the real specialized competitor" because there isn't one

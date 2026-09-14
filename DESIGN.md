@@ -990,6 +990,53 @@ smaller call's result).
      rather than a static empirical proxy -- remains the honest
      future-work item here; both of these attempts were real, careful
      tries at it, not strawmen, and neither paid off.
+- **Cross-modal position-orientation coupling** (predicting a vehicle's
+  orientation from its direction of travel, instead of from its own
+  earlier orientation) was tried and reverted -- a real, carefully-
+  measured negative result, not a strawman. The motivating measurement
+  was real: rotating the canonical forward axis by KITTI's own ground-
+  truth quaternions and comparing to the actual direction of travel
+  (from consecutive reconstructed positions) gave a median misalignment
+  of ~1.3 degrees -- a genuinely tight coupling, confirmed independently
+  (not just asserted) by testing multiple candidate forward-axis
+  conventions against the raw data before trusting the result. Built on
+  that: `reference_quat_from_rod`, the "shortest arc" quaternion from a
+  canonical axis to a position rod's direction (an unnormalized version
+  first, revised to a fixed-magnitude-normalized version after measuring
+  that an unnormalized reference's magnitude tracking the vehicle's own
+  varying speed was actively hurting the fit -- a real bug caught and
+  fixed during development, not a footnote), and a new predictor,
+  `quaternion_joint_forward_velocity_referenced`, using the *same*
+  closed-form right-multiplication calibration the lag-based Quaternion
+  Joint already uses, just against this externally-supplied reference
+  instead of an earlier orientation sample. Wired into `compress_pose` as
+  a third candidate (alongside the existing lag-based and adaptive-block
+  Quaternion Joint encodings), kept only if it actually won on real bytes
+  -- the same never-regress discipline as every other candidate in this
+  codebase.
+  It measured decisively *better* than the lag-based model on a
+  synthetic adversarial case built to test the hypothesis directly
+  (erratic steering, defeating the lag-based model's "locally consistent
+  angular velocity" assumption while keeping orientation tightly coupled
+  to direction of travel: 73.3% smaller residual). But on real KITTI data
+  -- the exact dataset the ~1.3-degree measurement came from -- it showed
+  no improvement at all, losing to the lag-based model by roughly 12x in
+  residual magnitude. Diagnosed, not just observed: `reference_quat_from_rod`
+  derives its signal from *already-quantized* position deltas (`--scale
+  1e6` in `REAL_POSE_BENCHMARK.md`), and when a vehicle isn't actively
+  turning, consecutive integer rods round to the *identical* direction
+  for several samples in a row even though the true orientation keeps
+  changing smoothly and continuously underneath (Vicon/RTK-grade
+  precision, much finer than the position stream's own quantization
+  floor) -- so the derived reference is a coarse staircase next to a
+  smooth signal, and a single per-block calibrated delta can't bridge
+  that gap. The real ~1.3-degree directional correlation is genuine; the
+  bottleneck turned out to be *achievable precision*, not correlation
+  strength, and continuity-based (lag) prediction simply has access to
+  far more precision (the previous orientation sample, not a position-
+  derived proxy) than this predictor ever could. Reverted in full rather
+  than kept as a correctly-implemented feature that only helps on
+  synthetic data.
 - **A genuinely cross-vendor GPU backend** (Vulkan Compute, WebGPU, or
   similar) would let the parallel block-coding kernels run on non-NVIDIA
   hardware and non-Windows/Linux platforms (macOS/Metal, mobile, WASM).
