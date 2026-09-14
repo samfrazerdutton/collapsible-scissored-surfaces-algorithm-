@@ -26,9 +26,10 @@ import time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCISSORC = os.path.join(ROOT, "build", "scissorc.exe")
 
-PATTERN = re.compile(r"gpu_used=(\w+) time_ms=([\d.]+)")
+GPU_USED_PATTERN = re.compile(r"gpu_used=(\w+)")
+TIME_MS_PATTERN = re.compile(r"\btime_ms=([\d.]+)")
 REPEAT_PATTERN = re.compile(
-    r"gpu_used=(\w+) first_ms=([\d.]+) rest_avg_ms=([\d.]+) rest_min_ms=([\d.]+)"
+    r"first_ms=([\d.]+) rest_avg_ms=([\d.]+) rest_min_ms=([\d.]+)"
 )
 
 
@@ -39,10 +40,14 @@ def run_bench(n, gpu):
     r = subprocess.run(args, capture_output=True, text=True)
     if r.returncode != 0:
         raise RuntimeError(f"bench-transform failed: {r.stderr}")
-    m = PATTERN.search(r.stdout)
-    if not m:
+    # Fields are matched independently (not as one fixed-order block) so
+    # this survives cli/main.cpp adding new fields (e.g. `mode=...`)
+    # between gpu_used and time_ms.
+    gm = GPU_USED_PATTERN.search(r.stdout)
+    tm = TIME_MS_PATTERN.search(r.stdout)
+    if not gm or not tm:
         raise RuntimeError(f"unexpected output: {r.stdout}")
-    return m.group(1) == "yes", float(m.group(2))
+    return gm.group(1) == "yes", float(tm.group(1))
 
 
 def run_bench_repeat(n, gpu, repeat):
@@ -55,10 +60,11 @@ def run_bench_repeat(n, gpu, repeat):
     r = subprocess.run(args, capture_output=True, text=True)
     if r.returncode != 0:
         raise RuntimeError(f"bench-transform failed: {r.stderr}")
+    gm = GPU_USED_PATTERN.search(r.stdout)
     m = REPEAT_PATTERN.search(r.stdout)
-    if not m:
+    if not gm or not m:
         raise RuntimeError(f"unexpected output: {r.stdout}")
-    return m.group(1) == "yes", float(m.group(2)), float(m.group(3)), float(m.group(4))
+    return gm.group(1) == "yes", float(m.group(1)), float(m.group(2)), float(m.group(3))
 
 
 def best_of(n, gpu, repeats):
@@ -89,22 +95,80 @@ def main():
     )
 
     # --- Cold-start cost, measured explicitly and separately. ---
-    print("Letting the GPU idle down before measuring cold-start cost...")
-    time.sleep(8)
+    # A fixed sleep isn't a reliable way to force the GPU into its idle
+    # power state -- confirmed the hard way: a run right after other GPU
+    # work on this same machine left the driver/clocks still warm well
+    # past an 8s sleep, silently turning the "cold start" measurement into
+    # another warm one. Poll nvidia-smi's reported P-state instead of
+    # assuming a fixed delay is enough, and say plainly if it never
+    # settled, rather than reporting a number that looks like a cold-start
+    # measurement but isn't one.
+    print("Waiting for the GPU to reach its idle power state before measuring cold-start cost...")
+    reached_idle = False
+    idle_wait_s = 0.0
+    for _ in range(30):
+        time.sleep(1)
+        idle_wait_s += 1
+        try:
+            r = subprocess.run(
+                ["nvidia-smi", "--query-gpu=pstate", "--format=csv,noheader"],
+                capture_output=True, text=True, timeout=5,
+            )
+            pstate = r.stdout.strip()
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pstate = ""
+        if pstate in ("P8", "P9", "P10", "P11", "P12"): # low-power idle states
+            reached_idle = True
+            break
     cold_gpu_used, cold_ms = run_bench(1_000_000, True)
     warm_gpu_used, warm_ms = run_bench(1_000_000, True)
 
+    # A genuine cold-start wake/context-creation cost has been observed on
+    # this machine before (~1.2s), but is clearly not what got measured
+    # whenever cold_ms comes back small even after nvidia-smi confirms an
+    # idle P-state -- meaning that P-state isn't a reliable proxy for
+    # whatever actually causes the wake cost (possibly a one-time
+    # first-CUDA-call-per-driver-session cost rather than a per-idle-
+    # period one). Reporting both outcomes honestly rather than asserting
+    # a number this run didn't actually reproduce.
+    genuine_cold_start = reached_idle and cold_ms > 500.0
     lines.append("## One-time GPU wake / context-creation cost\n")
-    lines.append(
-        "This laptop GPU idles down to a low-power state (`nvidia-smi` shows P8, ~4W) "
-        "when unused. The first CUDA call after ~8s idle pays a real, fixed cost to "
-        "wake it and create a context -- independent of input size. This is not a bug "
-        "and not amortizable within a single one-shot CLI process; it is the reason a "
-        "single `scissorc compress --gpu` on one small file can look far slower than "
-        "the CPU path, while back-to-back GPU calls (a batch/service workload) do not "
-        "pay this cost repeatedly.\n"
-    )
-    lines.append(f"- First GPU call after idling: **{cold_ms:.1f} ms** (n=1,000,000, gpu_used={cold_gpu_used})")
+    if genuine_cold_start:
+        lines.append(
+            "This laptop GPU idles down to a low-power state (`nvidia-smi` confirmed "
+            f"P-state reached after {idle_wait_s:.0f}s of no GPU activity) when unused. "
+            "The first CUDA call after that pays a real, fixed cost to wake it and "
+            "create a context -- independent of input size. This is not a bug and not "
+            "amortizable within a single one-shot CLI process; it is the reason a "
+            "single `scissorc compress --gpu` on one small file can look far slower "
+            "than the CPU path, while back-to-back GPU calls (a batch/service "
+            "workload) do not pay this cost repeatedly.\n"
+        )
+        lines.append(f"- First GPU call after idling: **{cold_ms:.1f} ms** (n=1,000,000, gpu_used={cold_gpu_used})")
+    elif reached_idle:
+        lines.append(
+            f"`nvidia-smi` confirmed the GPU reached a low-power P-state after "
+            f"{idle_wait_s:.0f}s of no GPU activity, but the first CUDA call "
+            f"afterward measured only **{cold_ms:.1f} ms** -- not the ~1.2s one-time "
+            "wake/context-creation cost observed on this same machine in earlier runs "
+            "of this script. That P-state evidently isn't a reliable proxy for "
+            "whatever actually causes the larger cost (plausibly a one-time "
+            "first-CUDA-call-per-driver-session cost, not a per-idle-period one); "
+            "this run simply didn't reproduce it. Reported honestly rather than "
+            "re-asserting the older number as if this run had confirmed it.\n"
+        )
+    else:
+        lines.append(
+            "**This run's GPU did not settle into an idle power state within 30s** "
+            "(likely still warm from other GPU activity on this machine moments "
+            "earlier) -- `nvidia-smi` never reported a low-power P-state, so the "
+            "number below is a *warm* first call, not a genuine cold-start "
+            "measurement, and should not be read as one. A real one-time wake cost "
+            "of roughly a second has been measured on this same machine in other "
+            "runs of this script (see git history of this file) when the GPU had "
+            "actually idled down first.\n"
+        )
+        lines.append(f"- First GPU call this run (GPU state uncertain, see above): **{cold_ms:.1f} ms** (n=1,000,000, gpu_used={cold_gpu_used})")
     lines.append(f"- Immediately following GPU call (same process launch pattern, GPU already awake): **{warm_ms:.1f} ms**\n")
 
     # --- Warm sustained throughput across sizes. ---
@@ -195,14 +259,26 @@ def main():
             "more SMs, may cross over; that is not claimed here because it was not "
             "measured here.\n"
         )
-    lines.append(
-        "- The one-time wake cost above means a single ad-hoc `scissorc compress "
-        "--gpu` on one file is very likely a net loss versus the CPU path -- the GPU "
-        "path only makes sense for sustained/batch use where many calls amortize one "
-        "wake-up, which is exactly the pattern this repo owner's other GPU-resident "
-        "projects (CKKS homomorphic encryption, LiDAR preprocessing) are built "
-        "around.\n"
-    )
+    if genuine_cold_start:
+        lines.append(
+            "- The one-time wake cost above means a single ad-hoc `scissorc compress "
+            "--gpu` on one file is very likely a net loss versus the CPU path -- the "
+            "GPU path only makes sense for sustained/batch use where many calls "
+            "amortize one wake-up, which is exactly the pattern this repo owner's "
+            "other GPU-resident projects (CKKS homomorphic encryption, LiDAR "
+            "preprocessing) are built around.\n"
+        )
+    else:
+        lines.append(
+            "- This run didn't reproduce the one-time wake cost (see above), so it "
+            "can't speak to the single-ad-hoc-call case directly this time -- but the "
+            "one-shot-per-process table's own small-size rows (100K-4M elements, "
+            "already GPU-vs-CPU losses even without any wake cost added) still make "
+            "the same practical point: the GPU path is built for sustained/batch use, "
+            "not a single ad-hoc `scissorc compress --gpu` call, which is exactly the "
+            "pattern this repo owner's other GPU-resident projects (CKKS homomorphic "
+            "encryption, LiDAR preprocessing) are built around.\n"
+        )
 
     lines.append(
         "- There is a practical upper size limit on this GPU: a one-off probe at "

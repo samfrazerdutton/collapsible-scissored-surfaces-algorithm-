@@ -19,7 +19,7 @@ regenerates the full structure (the deployed surface) exactly, built by a
 local rule applied repeatedly. This repo takes that idea at face value and
 implements it as an actual lossless compression codec, not a metaphor.
 
-## Two transforms, one entropy backend
+## Four models, one entropy backend
 
 ### 1. Pantograph Lift (`include/csa/pantograph_lift.hpp`)
 
@@ -338,12 +338,15 @@ One shared bitstream, `include/csa/codec.hpp`:
   small fixed overhead.
 - `Mode::General` -- Pantograph Lift over a byte stream.
 - `Mode::GeneralLZ` -- the LZ dictionary matcher over a byte stream.
+- `Mode::GeneralBWT` -- the BWT + move-to-front mode over a byte stream.
 - `Mode::Geo2D` / `Mode::Geo3D` -- Rod-Joint Transform over point streams.
 
-`compress()` tries `Raw`/`General`/`GeneralLZ` for any byte-stream input
-and keeps whichever encodes smallest, so callers never need to know in
-advance whether their data is more "smooth/predictive" or more
-"repeated-substring" in nature.
+`compress()` tries `Raw`/`General`/`GeneralLZ`/`GeneralBWT` for any
+byte-stream input and keeps whichever encodes smallest (`GeneralBWT` is
+skipped above `kBwtMaxInputSize`; see its own section below), so callers
+never need to know in advance whether their data is more
+"smooth/predictive", "repeated-substring", or "local-context-statistics"
+in nature.
 
 ### Adaptive heuristic: skipping Pantograph Lift on measured evidence
 
@@ -551,29 +554,43 @@ measure honestly rather than assume the GPU path wins.
 transform-only CPU-vs-GPU crossover measurement on this machine (an RTX
 2060 Max-Q laptop GPU), isolating the forward transform from the
 CPU-sequential entropy coding stage that follows it and runs identically
-either way. Headline findings from that file:
+either way. `bench/gpu_crossover.py` measures three distinct things and
+keeps them separate rather than conflating them; headline findings from
+its latest run:
 
-- This laptop GPU idles down to a low-power state between uses, and the
-  first CUDA call after idling pays a real, fixed wake/context-creation
-  cost (~1.2s on this machine) independent of input size — a genuine
-  reason a single ad-hoc `--gpu` call on one small file can look far
-  slower than the CPU path.
-- Comparing a fresh `scissorc` process per measurement (paying its own
-  allocation, and the wake cost if the GPU had idled), GPU vs. CPU time
-  converges steadily as input size grows, from ~0.01x (128x slower) at
-  100K elements to ~0.6-0.8x at 256M elements — the CPU path was still
-  faster at every size tested this way.
-- That one-shot-per-process comparison understates real deployment,
-  though: a service handling many requests runs from one long-lived
-  process, not one process per input. Measuring that directly (`scissorc
-  bench-transform <n> --repeat N`, same warm CUDA context and GPU clock
-  state across calls, reporting steady-state average of calls 2+) tells a
-  materially different story — GPU reaches **~0.98-1.00x of CPU time at
-  16M-256M elements, and outright wins at 64M** in the runs recorded in
-  `GPU_BENCHMARKS.md`. This is genuine parity for a mid-range laptop GPU
-  against a modern CPU on a task CPUs are naturally efficient at (simple,
-  cache-friendly, branch-predictable sequential array passes) — reported
-  as measured, not oversold as a definitive win everywhere.
+- **The one-time GPU wake/context-creation cost.** This laptop GPU idles
+  down to a low-power state between uses, and an earlier run of this
+  script measured a real, fixed ~1.2s cost on the first CUDA call after
+  idling, independent of input size. That specific number hasn't been
+  reliably reproducible since, though: the script now polls `nvidia-smi`
+  for the GPU's actual reported P-state rather than assuming a fixed
+  sleep is long enough (a real gap in the earlier version, caught when a
+  fixed 8s sleep once silently measured an already-warm call and called
+  it "cold"), but even after confirming the GPU reached its idle
+  P-state, the first call afterward has since measured only ~10ms. The
+  P-state evidently isn't a reliable proxy for whatever actually causes
+  the larger cost — plausibly a one-time per-driver-session cost rather
+  than a per-idle-period one, which would need lower-level instrumentation
+  than this script has to actually confirm. `GPU_BENCHMARKS.md` reports
+  whichever outcome each run actually measured, honestly, rather than
+  re-asserting the older number as settled.
+- **Warm, back-to-back per-process throughput** (best of 3 fresh
+  `scissorc` processes per size, GPU already awake from the prior call):
+  ~0.25x at 100K elements, climbing to ~0.86-1.00x by 4M-16M elements,
+  and sitting at ~0.99x (essentially parity, within run-to-run noise) at
+  64M-256M in the latest run.
+- **Sustained throughput within one long-lived process** (`scissorc
+  bench-transform <n> --repeat N`, the realistic shape of a batch/service
+  workload, reporting the steady-state average of calls 2+): a materially
+  more favorable picture, reaching **~0.98-1.05x of CPU time at
+  16M-256M elements**, an outright GPU win at 64M and 256M in the latest
+  run. This is genuine near-parity-to-a-slight-win for a mid-range laptop
+  GPU against a modern CPU on a task CPUs are naturally efficient at
+  (simple, cache-friendly, branch-predictable sequential array passes) —
+  reported as measured, not oversold as a definitive win everywhere, and
+  not identical run to run (the exact crossover point moves by a few
+  percent between runs, consistent with ordinary system noise at this
+  margin).
 - A one-off probe past the practical VRAM ceiling (400M elements) hit a
   genuine CUDA resource error, and the `pantograph_lift_forward_cuda` →
   automatic CPU fallback path handled it transparently — the
@@ -642,6 +659,19 @@ smaller call's result).
   GPU with more VRAM, or reducing per-buffer memory (e.g. processing in
   chunks instead of one padded_len-sized allocation), would extend the
   measurement further.
+- **The ~1.2s one-time GPU wake/context-creation cost hasn't been
+  reliably reproducible** since it was first recorded -- `bench/
+  gpu_crossover.py` now polls `nvidia-smi`'s reported P-state instead of
+  assuming a fixed sleep is enough (an earlier version's fixed 8s sleep
+  silently measured a warm call once and called it "cold"), but even
+  after confirming the GPU reached its idle P-state, repeated runs since
+  measured only ~10ms for the first call afterward -- not the ~1.2s
+  originally observed. `GPU_BENCHMARKS.md` reports this honestly each
+  run rather than re-asserting the older number. The likely explanation:
+  the real cost is a one-time per-driver-session thing (paid once after
+  a fresh driver load / system boot), not a per-idle-period one, which
+  would need instrumentation below what a benchmark script driving
+  `nvidia-smi` and `scissorc` can observe to actually confirm.
 - **Optimal (cost-based) LZ parsing** would likely close more of the
   remaining gap to bz2/lzma on realistic text (see `USE_CASES.md`): the
   current matcher's lookahead is one step (lazy matching), not a full

@@ -139,7 +139,7 @@ def main():
                   "measurement from this run on this machine (RTX 2060, CUDA 13.2) -- "
                   "nothing here is hand-typed or estimated.\n")
 
-    lines.append("## General mode (Pantograph Lift) vs. standard compressors\n")
+    lines.append("## General mode (auto-selected candidate) vs. standard compressors\n")
     lines.append("| dataset | raw bytes | CSA | vs raw | gzip -9 | bz2 -9 | lzma -9 | round-trip |")
     lines.append("|---|---:|---:|---:|---:|---:|---:|:---:|")
     for r in general_results:

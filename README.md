@@ -10,8 +10,10 @@ That's a description of a reversible predictive transform. This repo
 implements it as one: a compact representation plus a handful of
 calibrated parameters that regenerate the full data exactly, built by a
 local rule applied repeatedly across scale -- plus a real LZ77-style
-dictionary matcher for the kind of redundancy (repeated substrings, not
-predictable samples) that a predictive transform can't touch. See
+dictionary matcher for repeated-substring redundancy and a Burrows-
+Wheeler Transform + move-to-front mode for local byte-context statistics,
+the two kinds of structure a predictive transform can't touch on its
+own. See
 `DESIGN.md` for the full technical mapping, `BENCHMARKS.md` for real,
 regenerable compression-ratio measurements, `USE_CASES.md` for how it does
 on realistic (not maximally repetitive) text/log/telemetry files,
@@ -158,21 +160,21 @@ cd bindings/go/csa && go test ./...
 | `gps_track.xy` | noisy real-world-style path | beats lzma by ~1.3x |
 | `toroidal.xyz` | doubly-curved (wobbling radius) | **32% smaller; beats lzma** -- see below for how |
 
-**Realistic use cases** (`--level balanced`, the default; see `USE_CASES.md` for the full picture, including bz2/lzma comparisons):
+**Realistic use cases** (auto-selected candidate, general mode; see `USE_CASES.md` for the full picture):
 
-| dataset | scenario | vs. gzip -9 |
-|---|---|---|
-| server access log | 5,000 synthetic nginx-format lines | close to gzip (57.9KB vs 56.9KB) |
-| JSON telemetry events | 5,000 IoT/analytics events | **beats gzip** (72.4KB vs 73.2KB) |
-| sensor CSV export | 20,000 rows, smooth+noisy columns | close to gzip (168.3KB vs 164.4KB) |
+| dataset | scenario | auto-selected | vs. gzip -9 | vs. bz2 -9 | vs. lzma -9 |
+|---|---|---|---|---|---|
+| server access log | 5,000 synthetic nginx-format lines | BWT + move-to-front | **beats** (53.4KB vs 56.9KB) | loses (38.0KB) | loses, close (51.8KB) |
+| JSON telemetry events | 5,000 IoT/analytics events | BWT + move-to-front | **beats big** (54.7KB vs 73.2KB) | loses (43.3KB) | **beats** (58.0KB) |
+| sensor CSV export | 20,000 rows, smooth+noisy columns | BWT + move-to-front | **beats** (134.5KB vs 164.4KB) | loses (113.4KB) | loses (93.8KB) |
 
 **A real, non-synthetic corpus** (18MB of unmodified C++ source code, vs. real market compressors -- see `REAL_CORPUS_BENCHMARK.md`):
 
 | level | size | notable comparisons | compress time |
 |---|---:|---|---:|
-| `--level fast` | 2.04MB | **beats gzip (3.10MB), bz2 (2.40MB), zstd -3 (2.93MB)** | 1.4s |
-| `--level balanced` | 1.95MB | **beats brotli -11 (2.09MB)**, still ahead of gzip/bz2/zstd -3 | 5.2s |
-| `--level high` | 1.91MB | within 13% of lzma -9 (1.68MB) -- but **zstd -19 beats it on size *and* speed** (1.71MB in 5.2s vs 30.2s) | 30.2s |
+| `--level fast` | 2.04MB | **beats gzip (3.10MB), bz2 (2.40MB), zstd -3 (2.93MB)** | 1.5s |
+| `--level balanced` | 1.95MB | **beats brotli -11 (2.09MB)**, still ahead of gzip/bz2/zstd -3 | 5.0s |
+| `--level high` | 1.91MB | within 13% of lzma -9 (1.68MB) -- but **zstd -19 beats it on size *and* speed** (1.71MB in 5.3s vs 30.1s) | 30.1s |
 
 ## Honesty, not hype
 
@@ -211,37 +213,43 @@ cd bindings/go/csa && go test ./...
   the textbook trio. `--level fast` beats gzip, bz2, *and* zstd's default
   level; `--level balanced` beats brotli's max level too. But the more
   important, more humbling number: **zstd -19 beats CSA `--level high` on
-  both size *and* speed at once** (1.71MB in 5.2s vs 1.91MB in 30.2s) --
-  not just a better ratio, a better ratio *and* 6x faster. That's the
+  both size *and* speed at once** (1.71MB in 5.3s vs 1.91MB in 30.1s) --
+  not just a better ratio, a better ratio *and* 5.7x faster. That's the
   honest measure of the gap to a real modern production compressor: the
   whole speed/ratio curve, not one axis. Real source code has exactly the
   kind of structure LZMA/zstd's optimal-ish parsing and bz2's
-  Burrows-Wheeler Transform are built to exploit, and this codec's
-  lazy-matching LZ + order-1 entropy model currently isn't (see
-  `DESIGN.md`'s future work for exactly what closing that gap would
-  require: optimal parsing, a BWT mode, and the kind of performance
-  engineering zstd has had years of). The first version of this matcher
-  took ~30s to compress that
+  Burrows-Wheeler Transform are built to exploit; CSA's own BWT mode
+  (see above) is skipped on a file this size (its suffix-array
+  construction cost isn't worth paying unconditionally -- see
+  `DESIGN.md`), and this codec's lazy-matching LZ + order-1 entropy model
+  currently isn't either (see `DESIGN.md`'s future work for exactly what
+  closing that gap would require: optimal cost-based parsing, and the
+  kind of performance engineering zstd has had years of). The first
+  version of this matcher took ~30s to compress that
   same 18MB at only 0.6 MB/s regardless of level -- a real performance bug
   (an unbounded lazy-lookahead search on highly repetitive text), found by
   profiling and fixed, not glossed over.
-- GPU timing is reported honestly, at two different fidelities. Launching
-  a fresh process per measurement (which pays its own allocation, and a
-  real ~1.2s wake/context-creation cost if this laptop GPU had idled since
-  the last call), GPU-vs-CPU time converges from ~128x slower at 100K
-  elements to ~0.6-0.8x at 256M elements -- the CPU path still wins every
-  size measured that way. But that understates real deployment: a service
-  handles many requests from one long-lived process, not one process per
-  input, and measuring *that* directly (`scissorc bench-transform --repeat
-  N`, steady-state average once the GPU's clocks have ramped up) shows GPU
-  reaching **~0.98-1.00x of CPU time at 16M-256M elements, and an outright
-  win at 64M** in the runs recorded in `GPU_BENCHMARKS.md`. Genuine parity
-  for a mid-range laptop GPU against a modern CPU, reported as measured --
-  not the fixed one-shot number, and not oversold as a definitive win
-  everywhere either. This mirrors the same PCIe/warm-up-bound pattern this
-  repo owner's other GPU-resident projects (a GPU-resident CKKS
-  homomorphic-encryption library, and a production LiDAR CUDA pipeline)
-  already measured and documented.
+- GPU timing is reported honestly, at three different fidelities (see
+  `GPU_BENCHMARKS.md`). A fresh process per measurement, best-of-3
+  back-to-back so the GPU is already warm, converges from ~0.25x (4x
+  slower) at 100K elements to ~parity (~0.99x) by 64M-256M -- not an
+  outright win at the largest sizes in the latest run, but within
+  ordinary run-to-run noise of one. Measuring sustained throughput within
+  one long-lived process instead (`scissorc bench-transform --repeat N`,
+  the realistic shape of a batch/service workload) shows a materially
+  more favorable picture: **~0.98-1.05x of CPU time at 16M-256M elements,
+  an outright GPU win at 64M and 256M** in the latest run. Genuine
+  near-parity-to-a-slight-win for a mid-range laptop GPU against a modern
+  CPU, reported as measured -- not oversold as a definitive win
+  everywhere, and not identical run to run at this margin. Separately,
+  the ~1.2s one-time GPU wake/context-creation cost measured in an
+  earlier run hasn't reliably reproduced since (`nvidia-smi`'s reported
+  idle P-state turned out not to be a reliable proxy for whatever
+  actually causes it) -- reported honestly as an open question rather
+  than re-asserted as settled; see `DESIGN.md`. This mirrors the same
+  PCIe/warm-up-bound pattern this repo owner's other GPU-resident
+  projects (a GPU-resident CKKS homomorphic-encryption library, and a
+  production LiDAR CUDA pipeline) already measured and documented.
 
 ## Repo layout
 

@@ -174,9 +174,11 @@ def main():
             "code has exactly the kind of medium-range, high-order repeated structure (identifiers, "
             "indentation, common phrases) that LZMA/zstd's optimal-ish parsing and larger match "
             "finders, and bz2's Burrows-Wheeler Transform, are specifically built to exploit, and this "
-            "codec's lazy-matching LZ + order-1 entropy model currently isn't -- see DESIGN.md's "
-            "future work (optimal parsing, a BWT-based mode) for what closing it would actually "
-            "require.\n"
+            "codec's lazy-matching LZ + order-1 entropy model currently isn't. (CSA's BWT mode, which "
+            "wins big on smaller realistic files -- see USE_CASES.md -- is skipped here: this 18MB "
+            "corpus is well above the size where its suffix-array construction cost stops being worth "
+            "paying, see DESIGN.md.) Closing this specific gap needs the other named future work item, "
+            "optimal cost-based LZ parsing.\n"
         )
     if faster_than_lzma:
         fastest_beating_gzip_and_bz2 = next(
