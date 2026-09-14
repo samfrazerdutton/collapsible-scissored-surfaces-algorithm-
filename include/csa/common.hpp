@@ -32,6 +32,16 @@ inline i64 fixed_mul_round(i64 value, i64 fixed_ratio) {
     return prod >> kFixedShift;
 }
 
+// Rounds d/q to the nearest integer (round-half-away-from-zero), for
+// q >= 1. q == 1 returns d unchanged exactly, which is what makes q=1
+// mean "lossless" rather than "lossy with a suspiciously small step" --
+// shared by every lossy mode in this codebase (Rod-Joint 2D/3D, and the
+// Pantograph Lift) so they all agree on this rounding convention.
+inline i64 quant_round_div(i64 d, i64 q) {
+    if (q <= 1) return d;
+    return (d >= 0) ? (d + q / 2) / q : -((-d + q / 2) / q);
+}
+
 // ---- Zigzag encoding: maps signed ints to unsigned so small-magnitude
 // residuals (positive or negative) become small unsigned values, which the
 // entropy coder can then exploit. ----

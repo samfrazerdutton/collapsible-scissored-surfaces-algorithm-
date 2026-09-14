@@ -47,9 +47,10 @@ size_t num_blocks_for(size_t half) {
 
 } // namespace
 
-LiftResult pantograph_lift_forward(const std::vector<i32>& input) {
+LiftResult pantograph_lift_forward(const std::vector<i32>& input, u32 quant_step) {
     LiftResult result;
     result.original_length = input.size();
+    result.quant_step = (quant_step == 0) ? 1 : quant_step;
 
     if (input.empty()) {
         return result;
@@ -79,11 +80,13 @@ LiftResult pantograph_lift_forward(const std::vector<i32>& input) {
                 i32 a = cur[2 * i];
                 i32 b = cur[2 * i + 1];
                 i64 predicted = fixed_mul_round(a, ro.ratio) + ro.offset;
-                i32 d = (i32)(b - predicted);
-                i32 upd = d >> 1; // arithmetic shift: floor(d/2)
+                i64 raw_d = (i64)b - predicted;
+                i64 q = quant_round_div(raw_d, (i64)result.quant_step);
+                i64 d_rec = q * (i64)result.quant_step;
+                i32 upd = (i32)(d_rec >> 1); // arithmetic shift: floor(d_rec/2)
                 i32 s = (i32)(a + upd);
                 next_low[i] = s;
-                residual[i] = d;
+                residual[i] = (i32)q;
             }
         }
 
@@ -100,6 +103,7 @@ LiftResult pantograph_lift_forward(const std::vector<i32>& input) {
 std::vector<i32> pantograph_lift_inverse(const LiftResult& result) {
     if (result.original_length == 0) return {};
 
+    u32 quant_step = (result.quant_step == 0) ? 1 : result.quant_step;
     std::vector<i32> cur = result.base;
     int levels = (int)result.residuals.size();
 
@@ -115,11 +119,12 @@ std::vector<i32> pantograph_lift_inverse(const LiftResult& result) {
             i64 ratio = ratios[blk];
             i32 offset = offsets[blk];
             i32 s = cur[i];
-            i32 d = residual[i];
-            i32 upd = d >> 1;
+            i64 q = residual[i];
+            i64 d_rec = q * (i64)quant_step;
+            i32 upd = (i32)(d_rec >> 1);
             i32 a = (i32)(s - upd);
             i64 predicted = fixed_mul_round(a, ratio) + offset;
-            i32 b = (i32)(predicted + d);
+            i32 b = (i32)(predicted + d_rec);
             next[2 * i] = a;
             next[2 * i + 1] = b;
         }

@@ -38,15 +38,33 @@ namespace csa {
 
 constexpr size_t kPantographBlockSize = 1024; // pairs per calibration block
 
+// Lossless and lossy share one code path, the same unification every
+// other lossy mode in this codebase uses: a level's residual is
+// quantized to the nearest multiple of `quant_step` (q=1 is exact, so
+// lossless is simply the q=1 special case). The quantized *index*
+// (residual/q, rounded) is what's actually stored in `residuals`, and
+// critically, the "update" half that becomes the *next* level's input
+// (`s = a + upd`) is computed from the quantized/reconstructed residual,
+// never the true one -- the same closed-loop DPCM design Rod-Joint's
+// lossy mode uses, generalized across this transform's O(log n) cascaded
+// levels instead of one flat rod sequence. Every level shares the same
+// quant_step; there's no per-level resync mechanism the way Rod-Joint has
+// one, because the failure mode resync exists to bound (drift
+// accumulating over a long flat sequence of rods) doesn't have a direct
+// analogue here -- error here can only compound across O(log n) levels,
+// not across the sequence length, a fundamentally smaller and
+// differently-shaped effect (see DESIGN.md for what was actually
+// measured).
 struct LiftResult {
     std::vector<i32> base;                          // final single (or few) low-pass value(s)
-    std::vector<std::vector<i32>> residuals;         // per level, finest (level 0) first
+    std::vector<std::vector<i32>> residuals;         // per level, finest (level 0) first; quantized index when quant_step > 1
     std::vector<std::vector<i64>> block_ratios;      // per level, per block, Q16.16 fixed-point
     std::vector<std::vector<i32>> block_offsets;     // per level, per block, integer intercept
     u64 original_length = 0;                         // length before padding
+    u32 quant_step = 1;                              // 1 == lossless
 };
 
-LiftResult pantograph_lift_forward(const std::vector<i32>& input);
+LiftResult pantograph_lift_forward(const std::vector<i32>& input, u32 quant_step = 1);
 std::vector<i32> pantograph_lift_inverse(const LiftResult& result);
 
 } // namespace csa

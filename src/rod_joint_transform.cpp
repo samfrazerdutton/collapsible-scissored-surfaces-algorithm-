@@ -13,13 +13,6 @@ inline i64 clampd(double v, double lo, double hi) {
     return (i64)llround(v * (double)kFixedOne);
 }
 
-// Rounds d/q to the nearest integer (round-half-away-from-zero), for
-// q >= 1. q == 1 returns d unchanged exactly, which is what makes q=1
-// mean "lossless" rather than "lossy with a suspiciously small step".
-inline i64 quant_round_div(i64 d, i64 q) {
-    if (q <= 1) return d;
-    return (d >= 0) ? (d + q / 2) / q : -((-d + q / 2) / q);
-}
 
 // complex multiply: (cr + i*ci) * (ex + i*ey), all fixed-point/int inputs,
 // result rounded to nearest integer pair.
@@ -357,7 +350,8 @@ std::vector<Point2i> rod_joint_2d_inverse(const RodJoint2DResult& r) {
     return points;
 }
 
-RodJoint3DResult rod_joint_3d_forward(const std::vector<Point3i>& points, u32 xy_force_lag) {
+RodJoint3DResult rod_joint_3d_forward(const std::vector<Point3i>& points, u32 xy_force_lag,
+                                       u32 xy_quant_step, u32 xy_resync_interval, u32 z_quant_step) {
     std::vector<Point2i> xy(points.size());
     std::vector<i32> zs(points.size());
     for (size_t i = 0; i < points.size(); i++) {
@@ -365,8 +359,8 @@ RodJoint3DResult rod_joint_3d_forward(const std::vector<Point3i>& points, u32 xy
         zs[i] = points[i].z;
     }
     RodJoint3DResult r;
-    r.xy = rod_joint_2d_forward(xy, xy_force_lag);
-    r.lift_z = pantograph_lift_forward(zs);
+    r.xy = rod_joint_2d_forward(xy, xy_force_lag, xy_quant_step, xy_resync_interval);
+    r.lift_z = pantograph_lift_forward(zs, z_quant_step);
     return r;
 }
 

@@ -147,7 +147,17 @@ struct RodJoint3DResult {
     LiftResult lift_z;
 };
 
-RodJoint3DResult rod_joint_3d_forward(const std::vector<Point3i>& points, u32 xy_force_lag = 0);
+// xy_quant_step/xy_resync_interval reach RodJoint2DResult's own already-
+// lossy-capable xy plane directly; z_quant_step is new -- it's what lets
+// this composition model's z-axis (a plain Pantograph Lift over the raw
+// z-coordinates) go lossy too, closing the gap noted in DESIGN.md where
+// this model previously couldn't participate in a lossy comparison
+// against the true 3D similarity joint at all. quant_step <= 1 on either
+// axis is exactly lossless for that axis (see RodJoint2DResult's and
+// LiftResult's own comments).
+RodJoint3DResult rod_joint_3d_forward(const std::vector<Point3i>& points, u32 xy_force_lag = 0,
+                                       u32 xy_quant_step = 1, u32 xy_resync_interval = 0,
+                                       u32 z_quant_step = 1);
 std::vector<Point3i> rod_joint_3d_inverse(const RodJoint3DResult& r);
 
 // Same lossless/lossy unification as RodJoint2DResult (quant_step == 1 is

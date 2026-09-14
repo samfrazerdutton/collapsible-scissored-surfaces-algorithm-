@@ -10,7 +10,10 @@ package csa
 import (
 	"os"
 	"syscall"
+	"unsafe"
 )
+
+const defaultLibraryName = "csa.dll"
 
 type lazyProc struct {
 	proc *syscall.Proc
@@ -34,6 +37,19 @@ func newLazyProc(dll *syscall.DLL, name string) *lazyProc {
 func (p *lazyProc) call(args ...uintptr) uintptr {
 	r1, _, _ := p.proc.Call(args...)
 	return r1
+}
+
+// bufferReturningCall implements the Microsoft x64 ABI's hidden-out-
+// pointer convention for a 16-byte-by-value struct return (see dll_unix.go's
+// own bufferReturningCall for why Linux/macOS need a different
+// implementation instead of sharing this one).
+func bufferReturningCall(p *lazyProc, args ...uintptr) csaBuffer {
+	var buf csaBuffer
+	full := make([]uintptr, 0, len(args)+1)
+	full = append(full, uintptr(unsafe.Pointer(&buf)))
+	full = append(full, args...)
+	p.call(full...)
+	return buf
 }
 
 func mustLoadLibrary() *syscall.DLL {

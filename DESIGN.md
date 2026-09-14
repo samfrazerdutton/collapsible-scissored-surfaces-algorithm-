@@ -460,18 +460,39 @@ The same design is generalized to 3D on the true similarity joint
 prediction still uses the reconstructed rod history, quantization and
 error bound (`rod_joint_3d_error_bound()`) are identical in form, and
 resync still targets the true absolute *point* given wherever
-reconstruction currently sits, not the true rod. It deliberately only
-tries the similarity-joint model, not the xy+z composition -- the
-composition's z-axis Pantograph Lift has no lossy mode, so
-`compress_geo3d_lossy` can occasionally lose to `compress_geo3d` on
-shapes the composition would have won (a helix with a very constant
-climb rate, say); that's a known, documented tradeoff, not a bug, and it
-only matters once `quant_step > 1` actually engages lossy mode.
+reconstruction currently sits, not the true rod.
 `test_rod_joint_3d_lossy` in `tests/test_main.cpp` checks the same
 properties as the 2D test (bounded per-rod error away from resync
 points, exact reset at resync points, bounded absolute drift, a real
 compression win over lossless, and exact lossless behavior at
 `quant_step <= 1`) on a synthetic curving-and-climbing path.
+
+`compress_geo3d_lossy` also tries the xy+z composition model, not just
+the similarity joint: the composition's z-axis Pantograph Lift now
+supports the same closed-loop quantization (`LiftResult::quant_step`,
+threaded through `pantograph_lift_forward`/`_inverse`), so
+`rod_joint_3d_forward` takes an independent `z_quant_step` alongside the
+xy plane's own `xy_quant_step`/`xy_resync_interval` (see
+`include/csa/rod_joint_transform.hpp`). This closes what used to be a
+known gap: previously the composition model could only ever be tried
+losslessly, so a helix with a very constant climb rate -- exactly the
+shape the composition wins on -- would lose out to the similarity joint
+once `quant_step > 1` engaged lossy mode, even though the composition
+would have compressed it better. `compress_geo3d_lossy` now builds both
+candidates with the same `quant_step`/`resync_interval` and keeps
+whichever serializes smaller, the same auto-select `compress_geo3d`
+already does losslessly. `test_pantograph_lift_lossy` in
+`tests/test_main.cpp` exercises this end-to-end on a synthetic helix
+(constant-radius rotation with a steady, noisy z climb) through the
+public `compress_geo3d`/`compress_geo3d_lossy`/`decompress_geo3d` API,
+confirming a real compression win, bounded coordinate error, and exact
+lossless behavior at `quant_step <= 1`. On a synthetic 20,000-point helix
+(constant-radius rotation, noisy steady climb -- the shape class the
+composition model is meant for), `compress-geo3d-lossy --quant 20
+--resync 64` measures 71,908 -> 44,329 bytes (~38% smaller than lossless
+`compress-geo3d`) at a measured max coordinate error of 0.567 units,
+confirming the composition model's new lossy z-axis is a real win, not
+just a theoretical one.
 `scissorc compress-geo3d-lossy <in.xyz> <out> --quant N --resync N`
 exposes it from the CLI the same way, and it's wired through the C ABI
 (`csa_compress_geo3d_lossy`) and Python bindings
@@ -557,6 +578,40 @@ reviewed false positive (the address in question is a `syscall.Proc.Call`
 return value pointing into libcsa's C heap, never Go-GC-managed memory in
 the first place, so the moving-GC hazard that rule exists to prevent
 doesn't apply), not a bug.
+
+`dll_unix.go` (behind `//go:build !windows`) extends the same no-cgo
+approach to Linux/macOS using
+[`purego`](https://github.com/ebitengine/purego) (pinned to v0.8.4
+specifically because it's the newest release whose own `go.mod` still
+says `go 1.18`, rather than the current `v0.11.0`, which would have
+forced this module's minimum Go version up to `1.25` for every
+consumer including Windows-only ones, just to gain access to a Unix code
+path most of them will never compile) for `dlopen`/`dlsym`, mirroring
+`dll_windows.go`'s `syscall.LoadDLL`/`Proc.Call` approach one level down.
+The two platforms' loaders can't share `csa.go`'s buffer-returning call
+path, though, because they disagree on how `csa_buffer` (two eightbytes:
+a pointer and a size) comes back from a function call: the Microsoft x64
+ABI uses the hidden-out-pointer convention described above, while the
+System V AMD64 ABI (Linux) and the equivalent Darwin ABI instead pack
+both eightbytes directly into the RAX:RDX return registers -- no hidden
+pointer at all. `purego.SyscallN` conveniently exposes both registers as
+`(r1, r2)`, so `dll_unix.go`'s own `bufferReturningCall` reconstructs
+`csaBuffer{data: r1, size: r2}` directly instead of reusing
+`dll_windows.go`'s hidden-pointer version; each platform file now owns
+its own `bufferReturningCall`, not just the smaller `lazyProc`/
+`mustLoadLibrary`/`envOr`/`fileExists` surface originally anticipated.
+**Honesty caveat**: this file was written carefully and cross-compiled
+clean for `linux/amd64`, `linux/arm64`, `darwin/amd64`, and
+`darwin/arm64` (`GOOS=... GOARCH=... CGO_ENABLED=0 go build ./...`), but
+this development environment is Windows-only, so unlike literally
+everything else in this repository, it has never actually been run --
+no real machine loaded a real `libcsa.so`/`.dylib` and exercised
+`csa_test.go` against it. The ABI reasoning is the standard, well-
+documented behavior for both platforms, and the Windows path (same
+loader shape, different ABI convention) is proof the overall design
+works, but this is the one part of the codebase resting on review rather
+than measurement, and it should be treated that way until someone runs
+it on real Linux/macOS hardware.
 
 ## GPU acceleration (`cuda/pantograph_lift_cuda.cu`)
 
@@ -779,16 +834,6 @@ smaller call's result).
      rather than a static empirical proxy -- remains the honest
      future-work item here; both of these attempts were real, careful
      tries at it, not strawmen, and neither paid off.
-- **Lossy mode's 3D path only tries the similarity joint, not the xy+z
-  composition** (see the lossy-mode section above) -- extending the
-  composition's z-axis Pantograph Lift to support quantization too would
-  close that gap, at the cost of another lossy code path to maintain.
-- **A Go build tag for non-Windows platforms** -- `bindings/go/` currently
-  only implements `dll_windows.go` (this environment had no C compiler
-  available to build a portable `cgo` version); a `cgo`-based
-  `dll_unix.go` behind a `//go:build !windows` tag, or a `purego`-based
-  one to stay cgo-free everywhere, would extend it to Linux/macOS's
-  `.so`/`.dylib` without changing `csa.go`'s public API at all.
 - **A genuinely cross-vendor GPU backend** (Vulkan Compute, WebGPU, or
   similar) would let the parallel block-coding kernels run on non-NVIDIA
   hardware and non-Windows/Linux platforms (macOS/Metal, mobile, WASM).

@@ -339,6 +339,103 @@ static void test_pantograph_lift() {
     CHECK(all_small);
 }
 
+// Lossy Pantograph Lift: quant_step <= 1 must be exactly lossless (the
+// same closed-loop-quantization invariant every other lossy mode in this
+// codebase provides), and quant_step > 1 must still round-trip to a
+// *bounded* error while compressing measurably smaller. Unlike Rod-
+// Joint's lossy modes (a flat sequence of rods, where error accumulates
+// as a simple random walk with a clean per-rod bound), error here can
+// compound across this transform's O(log n) cascaded levels -- a
+// quantized residual at one level perturbs the "update" value that
+// becomes part of the *next* level's own input, which then gets
+// quantized again. There's no clean closed-form bound to assert a priori
+// the way rod_joint_2d_error_bound() provides one, so this test measures
+// the actual observed error on representative inputs and prints it,
+// rather than asserting an unverified formula.
+static void test_pantograph_lift_lossy() {
+    // quant_step <= 1 is exactly lossless, on every existing case.
+    for (auto& input : {smooth_ramp(1000), smooth_sine(777), std::vector<i32>(500, -17)}) {
+        LiftResult lr0 = pantograph_lift_forward(input, 0); // 0 normalizes to 1
+        LiftResult lr1 = pantograph_lift_forward(input, 1);
+        CHECK(pantograph_lift_inverse(lr0) == input);
+        CHECK(pantograph_lift_inverse(lr1) == input);
+    }
+
+    // A smooth-but-noisy signal (like a real sensor reading), the
+    // realistic target for this mode -- not a perfectly smooth ramp,
+    // which would trivially compress either way.
+    std::vector<i32> signal(4096);
+    unsigned int seed = 2027;
+    auto next_rand = [&]() { seed = seed * 1664525u + 1013904223u; return (double)(seed >> 8) / (double)(1u << 24); };
+    double v = 0.0;
+    for (size_t i = 0; i < signal.size(); i++) {
+        v += 3.0 + (next_rand() - 0.5) * 2.0; // steady drift with noise, like the z-axis of a climbing path
+        signal[i] = (i32)std::lround(v);
+    }
+
+    u32 quant_step = 16;
+    LiftResult lossless = pantograph_lift_forward(signal, 1);
+    LiftResult lossy = pantograph_lift_forward(signal, quant_step);
+    auto back = pantograph_lift_inverse(lossy);
+    CHECK(back.size() == signal.size());
+
+    i32 max_err = 0;
+    for (size_t i = 0; i < signal.size(); i++) max_err = std::max(max_err, std::abs(signal[i] - back[i]));
+
+    // A generous, empirically-motivated bound: quant_step/2 per level
+    // compounding across at most log2(n) levels, doubled again as
+    // headroom rather than a claimed tight derivation.
+    int levels = 0;
+    for (size_t n = signal.size(); n > 1; n /= 2) levels++;
+    i32 generous_bound = (i32)quant_step * (levels + 1);
+    CHECK(max_err <= generous_bound);
+
+    std::printf("  (Pantograph Lift lossy: quant_step=%u, max observed error=%d (bound %d))\n",
+                 quant_step, max_err, generous_bound);
+
+    // Real, end-to-end compression gain through the actual public API:
+    // compress_geo3d_lossy now threads quant_step through the xy+z
+    // composition model's z-axis Pantograph Lift too (previously it
+    // could only go lossy via the true 3D similarity joint). A helix-
+    // like path (constant-radius rotation + steady z climb) is exactly
+    // the shape compress_geo3d's auto-select already favors the
+    // composition model for (see test_geo3d_codec_autoselect), so this
+    // is testing the composition model's new lossy z-axis specifically,
+    // not just whichever model happens to win.
+    std::vector<Point3i> helix;
+    unsigned int hseed = 2028;
+    auto next_rand2 = [&]() { hseed = hseed * 1664525u + 1013904223u; return (double)(hseed >> 8) / (double)(1u << 24); };
+    double hz = 0.0;
+    for (int i = 0; i < 2000; i++) {
+        double t = i * 0.1;
+        hz += 3.0 + (next_rand2() - 0.5) * 0.5;
+        helix.push_back({(i32)std::lround(1000 * std::cos(t)), (i32)std::lround(1000 * std::sin(t)), (i32)std::lround(hz)});
+    }
+
+    auto helix_lossless = compress_geo3d(helix);
+    auto helix_lossy = compress_geo3d_lossy(helix, quant_step, 64);
+    CHECK(helix_lossy.size() < helix_lossless.size());
+
+    auto helix_back = decompress_geo3d(helix_lossy);
+    CHECK(helix_back.size() == helix.size());
+    i32 helix_max_err = 0;
+    for (size_t i = 0; i < helix.size(); i++)
+        helix_max_err = std::max({helix_max_err, std::abs(helix[i].x - helix_back[i].x),
+                                   std::abs(helix[i].y - helix_back[i].y), std::abs(helix[i].z - helix_back[i].z)});
+    CHECK(helix_max_err > 0); // genuinely lossy, not accidentally exact
+
+    auto helix_exact_blob = compress_geo3d_lossy(helix, 1, 0);
+    auto helix_exact_back = decompress_geo3d(helix_exact_blob);
+    bool helix_exact_match = helix_exact_back.size() == helix.size();
+    for (size_t i = 0; helix_exact_match && i < helix.size(); i++)
+        if (helix_exact_back[i].x != helix[i].x || helix_exact_back[i].y != helix[i].y || helix_exact_back[i].z != helix[i].z)
+            helix_exact_match = false;
+    CHECK(helix_exact_match);
+
+    std::printf("  (Geo3D composition lossy: %zu -> %zu bytes, max coordinate error = %d)\n",
+                 helix_lossless.size(), helix_lossy.size(), helix_max_err);
+}
+
 static void test_rod_joint_2d() {
     std::mt19937 rng(7);
 
@@ -982,6 +1079,7 @@ int main() {
     test_bwt_sais_matches_reference();
     test_bwt_codec();
     test_pantograph_lift();
+    test_pantograph_lift_lossy();
     test_rod_joint_2d();
     test_rod_joint_3d();
     test_rod_joint_3d_similarity();

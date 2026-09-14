@@ -15,8 +15,11 @@
 // helper below that calls a csa_buffer-returning function passes that
 // hidden pointer as the first element of the args slice.
 //
-// Windows-only for now (see DESIGN.md); a cgo or purego-based build tag
-// would be the natural way to extend this to Linux/macOS's .so/.dylib.
+// Linux/macOS support (dll_unix.go) uses purego instead of cgo, for the
+// same reason: no portable C toolchain can be assumed at build time, and
+// purego's dlopen/dlsym-based loading works against any .so/.dylib
+// regardless of which compiler built it, exactly like this file's
+// LoadLibrary/GetProcAddress approach does for Windows.
 package csa
 
 import (
@@ -66,9 +69,11 @@ func init() {
 }
 
 // libraryPath resolves the same way the Python/Rust/C# bindings do:
-// CSA_LIB_PATH env var to an exact file, else ../../../build/csa.dll
+// CSA_LIB_PATH env var to an exact file, else ../../../build/<name>
 // relative to this source file's location (captured at build time via
-// runtime.Caller, the closest Go equivalent of __file__/CARGO_MANIFEST_DIR).
+// runtime.Caller, the closest Go equivalent of __file__/CARGO_MANIFEST_DIR),
+// where <name> is platform's native shared library name (defaultLibraryName,
+// defined per-platform in dll_windows.go/dll_unix.go).
 func libraryPath() (string, error) {
 	if p := envOr("CSA_LIB_PATH", ""); p != "" {
 		if fileExists(p) {
@@ -81,22 +86,13 @@ func libraryPath() (string, error) {
 		return "", errors.New("csa: could not determine source file location")
 	}
 	dir := filepath.Dir(thisFile)
-	candidate := filepath.Join(dir, "..", "..", "..", "build", "csa.dll")
+	candidate := filepath.Join(dir, "..", "..", "..", "build", defaultLibraryName)
 	if fileExists(candidate) {
 		return candidate, nil
 	}
-	return "", errors.New("csa: could not locate csa.dll at " + candidate +
+	return "", errors.New("csa: could not locate " + defaultLibraryName + " at " + candidate +
 		"; build the C++ project first (cmake --build build from the repo root), " +
-		"or set CSA_LIB_PATH to the exact .dll path")
-}
-
-func bufferReturningCall(p *lazyProc, args ...uintptr) csaBuffer {
-	var buf csaBuffer
-	full := make([]uintptr, 0, len(args)+1)
-	full = append(full, uintptr(unsafe.Pointer(&buf)))
-	full = append(full, args...)
-	p.call(full...)
-	return buf
+		"or set CSA_LIB_PATH to the exact library path")
 }
 
 func extractAndFree(buf csaBuffer) ([]byte, error) {

@@ -41,6 +41,7 @@ Mode read_magic_mode(const u8* data, size_t size, size_t& pos) {
 void serialize_lift(const LiftResult& lr, std::vector<u8>& out) {
     put_u64(out, lr.original_length);
     put_u32(out, (u32)lr.residuals.size());
+    put_u32(out, lr.quant_step);
     if (lr.original_length > 0) {
         put_i32(out, lr.base.empty() ? 0 : lr.base[0]);
     }
@@ -63,6 +64,8 @@ LiftResult deserialize_lift(const u8* data, size_t size, size_t& pos) {
     LiftResult lr;
     lr.original_length = get_u64(data, size, pos);
     u32 num_levels = get_u32(data, size, pos);
+    lr.quant_step = get_u32(data, size, pos);
+    if (lr.quant_step == 0) lr.quant_step = 1;
 
     // Per-level pair counts (deterministic from original_length), needed
     // up front to know how many blocks of ratio/offset each level wrote.
@@ -451,9 +454,13 @@ std::vector<u8> compress_geo2d_lossy(const std::vector<Point2i>& points, u32 qua
 enum class Geo3DSubMode : u8 { Composition = 0, Similarity3D = 1 };
 
 // Same auto-vs-best-forced-uniform-lag comparison as best_geo2d_encoding,
-// for the xy+z composition model.
-std::vector<u8> best_geo3d_composition_encoding(const std::vector<Point3i>& points) {
-    RodJoint3DResult auto_comp = rod_joint_3d_forward(points);
+// for the xy+z composition model. quant_step/resync_interval apply to
+// both the xy plane (RodJoint2DResult's own existing lossy support) and
+// the z-axis Pantograph Lift (LiftResult's own now-lossy-capable
+// quant_step) -- see DESIGN.md for the closed-loop design that makes the
+// Pantograph Lift side of this safe.
+std::vector<u8> best_geo3d_composition_encoding(const std::vector<Point3i>& points, u32 quant_step, u32 resync_interval) {
+    RodJoint3DResult auto_comp = rod_joint_3d_forward(points, /*xy_force_lag=*/0, quant_step, resync_interval, quant_step);
     std::vector<u8> best;
     write_magic_mode(best, Mode::Geo3D);
     best.push_back((u8)Geo3DSubMode::Composition);
@@ -461,7 +468,7 @@ std::vector<u8> best_geo3d_composition_encoding(const std::vector<Point3i>& poin
     serialize_lift(auto_comp.lift_z, best);
 
     for (u32 lag : kRodJointCandidateLags) {
-        RodJoint3DResult comp = rod_joint_3d_forward(points, lag);
+        RodJoint3DResult comp = rod_joint_3d_forward(points, lag, quant_step, resync_interval, quant_step);
         std::vector<u8> out;
         write_magic_mode(out, Mode::Geo3D);
         out.push_back((u8)Geo3DSubMode::Composition);
@@ -493,18 +500,21 @@ std::vector<u8> best_geo3d_similarity_encoding(const std::vector<Point3i>& point
 }
 
 std::vector<u8> compress_geo3d(const std::vector<Point3i>& points) {
-    std::vector<u8> comp_out = best_geo3d_composition_encoding(points);
+    std::vector<u8> comp_out = best_geo3d_composition_encoding(points, 1, 0);
     std::vector<u8> sim_out = best_geo3d_similarity_encoding(points, 1, 0);
     return (sim_out.size() < comp_out.size()) ? sim_out : comp_out;
 }
 
-// Lossy geo3d only tries the true 3D similarity joint, not the xy+z
-// composition -- the composition's z-axis goes through the Pantograph
-// Lift, which doesn't have a lossy mode yet (see DESIGN.md's future
-// work), so it can't participate in a fair lossy comparison here.
+// Tries both Geo3D models in lossy mode and keeps whichever encodes
+// smaller -- now that the composition model's z-axis Pantograph Lift
+// supports quantization too (see DESIGN.md), this is the same full
+// auto-select compress_geo3d already does, just with quant_step/
+// resync_interval threaded through both candidates.
 std::vector<u8> compress_geo3d_lossy(const std::vector<Point3i>& points, u32 quant_step, u32 resync_interval) {
     if (quant_step <= 1) return compress_geo3d(points); // no lossy effect; use the full lossless auto-select
-    return best_geo3d_similarity_encoding(points, quant_step, resync_interval);
+    std::vector<u8> comp_out = best_geo3d_composition_encoding(points, quant_step, resync_interval);
+    std::vector<u8> sim_out = best_geo3d_similarity_encoding(points, quant_step, resync_interval);
+    return (sim_out.size() < comp_out.size()) ? sim_out : comp_out;
 }
 
 std::vector<Point3i> decompress_geo3d(const std::vector<u8>& blob) {

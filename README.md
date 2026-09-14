@@ -76,10 +76,14 @@ unmodified C++ source code, not text written for this project -- and
   `libcsa.so` / `libcsa.dylib`) with no C++ types crossing the boundary,
   plus **Python `ctypes`** (`bindings/python/`), **Rust FFI**
   (`bindings/rust/`), **C# P/Invoke** (`bindings/csharp/`), and **Go**
-  (`bindings/go/`, via `syscall.LoadDLL` -- no C compiler needed)
+  (`bindings/go/`, via `syscall.LoadDLL` on Windows / `purego` on
+  Linux/macOS -- no C compiler needed on any platform)
   bindings on top of it -- all four tested end-to-end against the actual
   built shared library, not mocked, and cross-checked against each other
-  (same input, same output size, across all four languages).
+  (same input, same output size, across all four languages). The Go
+  binding's Unix path is cross-compile-verified only (see `DESIGN.md`) --
+  this is a Windows-only development environment, so it has no real
+  Linux/macOS machine to actually run it on.
 - **CUDA kernel** for the Pantograph Lift's forward transform (genuinely
   parallel: every pair within a decomposition level is independent),
   GPU-resident across the whole multi-level pass (one upload, a handful of
@@ -151,7 +155,7 @@ cd bindings/rust && cargo test
 # C# bindings (P/Invoke, on top of the same C ABI)
 cd bindings/csharp/Csa.Tests && dotnet run
 
-# Go bindings (syscall.LoadDLL, on top of the same C ABI; Windows only for now)
+# Go bindings (syscall.LoadDLL on Windows / purego on Linux+macOS, on top of the same C ABI)
 cd bindings/go/csa && go test ./...
 ```
 
@@ -271,7 +275,7 @@ cli/              scissorc command-line tool
 bindings/python/  ctypes bindings (csa.py) + test_bindings.py, on the C ABI
 bindings/rust/    FFI bindings (extern "C") + cargo test, on the C ABI
 bindings/csharp/  P/Invoke bindings (Csa/) + Csa.Tests console app, on the C ABI
-bindings/go/      syscall.LoadDLL bindings (Windows only) + go test, on the C ABI
+bindings/go/      syscall.LoadDLL (Windows) / purego (Linux+macOS) bindings + go test, on the C ABI
 tests/            round-trip test suite (test_main.cpp) + C-ABI test that
                   links the real shared library (test_capi.cpp), no external deps
 bench/            dataset generator + benchmark runner (writes BENCHMARKS.md)
