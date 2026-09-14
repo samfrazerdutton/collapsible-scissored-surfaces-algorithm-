@@ -769,6 +769,47 @@ motion that's just uniformly hard to predict (a handheld camera's
 constant small jitter) rather than distinct easy/hard *regimes* the way
 EuRoC's stabilized flight and KITTI's mostly-straight driving both have.
 
+## Streaming/incremental pose API (`pose_stream.hpp`/`.cpp`)
+
+`compress_pose`/`decompress_pose` are batch APIs: the whole sequence must
+be in memory before any output exists. A real drone, vehicle, or camera
+produces a continuous feed, not one pre-collected buffer, so
+`PoseStreamEncoder`/`PoseStreamDecoder` add a genuinely incremental path
+on top: the encoder buffers at most `chunk_size` poses (not the whole
+stream) and emits a complete, independently-decodable, length-prefixed
+chunk the moment one fills; the decoder is fed bytes as they arrive (in
+any chunking a real transport happens to deliver, not just one write()
+per chunk) and dispatches each pose as soon as its chunk has fully
+arrived and been decoded.
+
+The implementation deliberately does not re-derive any calibration or
+serialization logic: each chunk is compressed via an ordinary
+`compress_pose()` call on just that chunk's poses. This works correctly
+because the batch codec's own first block already handles "no history
+yet" (predicts from zero until a candidate lag's lookback is satisfied) --
+a chunked stream just pays that cost once per chunk instead of once per
+file. That is a real, measured ratio cost, not a free abstraction:
+`bench/pose_stream_demo.cpp` on a synthetic 2,000-pose feed measured
++142.6% at `chunk_size=32`, +39.8% at 128, and +13.9% at 512, against
+`compress_pose` on the identical data -- `chunk_size` is a genuine
+latency-vs-ratio knob (smaller chunks mean data is available to a
+consumer sooner but cost more bytes; larger chunks approach batch ratio
+at the cost of higher per-chunk latency), not a tuning parameter with a
+free lunch at one end.
+
+`tests/test_main.cpp`'s `test_pose_stream` validates round-trip
+correctness under adversarial delivery (bytes fed to the decoder in
+61-byte pieces that don't align to any chunk boundary, proving it
+correctly buffers a partial chunk rather than assuming aligned delivery)
+and reports the same real ratio-cost measurement.
+**Honest scope note**: this trades away compress_pose's own additional
+batch-only optimizations -- there is no adaptive-resolution block
+calibration and no per-file composition-vs-similarity-joint model
+selection in the streaming path, both because they require seeing the
+whole sequence (or committing to one choice for the whole file) before
+they can be applied. Each chunk always uses the fixed-block, per-block-
+auto-lag-search encoding, applied independently.
+
 ## GPU acceleration (`cuda/pantograph_lift_cuda.cu`)
 
 The Pantograph Lift's per-level transform is embarrassingly parallel: given

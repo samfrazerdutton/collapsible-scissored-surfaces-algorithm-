@@ -32,6 +32,7 @@ add_library(csa_core STATIC
     src/pantograph_lift.cpp
     src/rod_joint_transform.cpp
     src/quaternion_joint.cpp
+    src/pose_stream.cpp
     src/lz_matcher.cpp
     src/lz_codec.cpp
     src/bwt_transform.cpp

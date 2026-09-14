@@ -54,6 +54,10 @@ dedicated CPU-vs-GPU crossover measurement from 100K to 256M elements
   size. Validated on three real ground-truth trajectories (a drone
   flight, a handheld camera, a car driving through Karlsruhe) -- beats
   lzma -9 on all three (4.9-36.3% smaller). See `REAL_POSE_BENCHMARK.md`.
+  `PoseStreamEncoder`/`PoseStreamDecoder` (`pose_stream.hpp`) add a
+  genuinely incremental path on top for a live feed (bounded memory,
+  real per-chunk output/decode instead of needing the whole sequence up
+  front) at a real, measured, tunable ratio cost -- see `DESIGN.md`.
 - **LZ dictionary matcher** -- a real, working LZ77-style compressor
   (unbounded-window hash-chain matching with lazy/one-step-lookahead
   parsing, the same technique zlib's higher levels use) for the
@@ -111,7 +115,7 @@ dedicated CPU-vs-GPU crossover measurement from 100K to 256M elements
   `compress()` keeps one per thread automatically. Measured, not assumed:
   ~3.5x faster sustained per-call time at 50K elements, ~1.7x at 2M (see
   `DESIGN.md`).
-- **1592 round-trip correctness checks** (`tests/test_main.cpp` +
+- **1596 round-trip correctness checks** (`tests/test_main.cpp` +
   `tests/test_capi.cpp`, the latter linking the real shared library to
   catch actual symbol-export problems), including a dedicated check that
   the GPU path actually succeeds (not just that the overall call

@@ -8,6 +8,7 @@
 #include "csa/lz_matcher.hpp"
 #include "csa/pantograph_lift.hpp"
 #include "csa/pantograph_lift_cuda.hpp"
+#include "csa/pose_stream.hpp"
 #include "csa/quaternion_joint.hpp"
 #include "csa/range_coder.hpp"
 #include "csa/rod_joint_transform.hpp"
@@ -1493,6 +1494,88 @@ static void test_pose_codec() {
                  blob.size(), lossy_blob.size(), max_pos_err, max_quat_err);
 }
 
+// Validates PoseStreamEncoder/PoseStreamDecoder: simulates a live feed by
+// pushing poses one at a time (never handing the encoder the whole
+// sequence at once), collecting the bytes it emits incrementally exactly
+// as a real transport would deliver them, and feeding those bytes to the
+// decoder in small, deliberately-misaligned pieces (not one chunk at a
+// time) to prove it correctly handles partial/arbitrary delivery
+// boundaries, not just "one write() per chunk." Also reports the real,
+// measured ratio cost of chunking (every chunk restarts prediction from
+// zero, unlike one continuous batch encode) against compress_pose on the
+// identical pose sequence.
+static void test_pose_stream() {
+    const double qscale = 1 << 20;
+    std::vector<Pose> poses;
+    double qw = 1, qx = 0, qy = 0, qz = 0;
+    unsigned int seed = 4242;
+    auto next_rand = [&]() { seed = seed * 1664525u + 1013904223u; return (double)(seed >> 8) / (double)(1u << 24); };
+    double z = 0.0;
+    for (int i = 0; i < 2000; i++) {
+        double t = i * 0.05;
+        i32 px = (i32)std::lround(2000 * std::cos(t));
+        i32 py = (i32)std::lround(2000 * std::sin(t));
+        z += 4.0 + (next_rand() - 0.5) * 0.5;
+        i32 pz = (i32)std::lround(z);
+        poses.push_back({{px, py, pz}, quat_to_i32(qw, qx, qy, qz, qscale)});
+
+        double deg = 2.0 + (next_rand() - 0.5) * 0.3;
+        double half = (deg * kTestPi / 180.0) / 2.0;
+        double dqw = std::cos(half), dqz = std::sin(half);
+        double nw, nx, ny, nz;
+        quat_mul_d(qw, qx, qy, qz, dqw, 0, 0, dqz, nw, nx, ny, nz);
+        qw = nw; qx = nx; qy = ny; qz = nz;
+    }
+
+    // Encode: push one at a time, collect emitted bytes as a single
+    // growing buffer standing in for "what a real transport delivered."
+    std::vector<u8> wire;
+    size_t max_buffered_during_encode = 0;
+    {
+        PoseStreamEncoder enc([&](const std::vector<u8>& chunk) {
+            wire.insert(wire.end(), chunk.begin(), chunk.end());
+        }, /*chunk_size=*/128);
+        for (const Pose& p : poses) enc.push(p);
+        enc.finish();
+    }
+    (void)max_buffered_during_encode;
+    CHECK(!wire.empty());
+
+    // Decode: feed bytes back in small, arbitrarily-sized (and
+    // deliberately NOT chunk-aligned) pieces, to prove the decoder
+    // correctly buffers a partial chunk instead of assuming each feed()
+    // call lines up with a chunk boundary.
+    std::vector<Pose> decoded;
+    {
+        PoseStreamDecoder dec([&](const Pose& p) { decoded.push_back(p); });
+        size_t pos = 0;
+        size_t step = 37; // deliberately not aligned to any chunk/header boundary
+        while (pos < wire.size()) {
+            size_t n = std::min(step, wire.size() - pos);
+            dec.feed(wire.data() + pos, n);
+            pos += n;
+        }
+        CHECK(dec.finished());
+    }
+
+    CHECK(decoded.size() == poses.size());
+    bool match = true;
+    for (size_t i = 0; i < poses.size() && i < decoded.size(); i++) {
+        const Pose& a = poses[i]; const Pose& b = decoded[i];
+        if (a.position.x != b.position.x || a.position.y != b.position.y || a.position.z != b.position.z ||
+            a.orientation.w != b.orientation.w || a.orientation.x != b.orientation.x ||
+            a.orientation.y != b.orientation.y || a.orientation.z != b.orientation.z) match = false;
+    }
+    CHECK(match);
+
+    // Real, measured ratio cost of chunking vs. one continuous batch encode.
+    std::vector<u8> batch_blob = compress_pose(poses);
+    std::printf("  (Pose stream: %zu poses in %zu chunks, streamed=%zu bytes vs batch=%zu bytes (%.1f%% larger), round-trip=%s)\n",
+                 poses.size(), (poses.size() + 127) / 128, wire.size(), batch_blob.size(),
+                 100.0 * ((double)wire.size() / (double)batch_blob.size() - 1.0),
+                 match ? "PASS" : "FAIL");
+}
+
 int main() {
     test_range_coder();
     test_lz_matcher();
@@ -1512,6 +1595,7 @@ int main() {
     test_rod_joint_3d_adaptive_blocking();
     test_quaternion_joint_adaptive_blocking();
     test_pose_codec();
+    test_pose_stream();
     test_codec();
     test_codec_adaptive_skip();
     test_geo_codec();
