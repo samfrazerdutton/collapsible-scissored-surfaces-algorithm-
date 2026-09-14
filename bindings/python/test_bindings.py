@@ -104,6 +104,49 @@ def test_geo3d_lossy():
     print(f"  3d lossy: {len(lossless)} -> {len(lossy)} bytes, max coordinate error = {max_err}")
 
 
+def test_pose_lossy():
+    poses = []
+    qw, qx, qy, qz = 1.0, 0.0, 0.0, 0.0
+    seed = 4242
+    def rnd():
+        nonlocal seed
+        seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
+        return (seed % 10000) / 10000.0
+    z = 0.0
+    qscale = 1 << 20
+    for i in range(1500):
+        t = i * 0.05
+        x, y = 2000 * math.cos(t), 2000 * math.sin(t)
+        z += 4.0 + (rnd() - 0.5) * 0.5
+        position = (round(x), round(y), round(z))
+        orientation = (round(qw * qscale), round(qx * qscale), round(qy * qscale), round(qz * qscale))
+        poses.append((position, orientation))
+
+        deg = 2.0 + (rnd() - 0.5) * 0.3
+        half = math.radians(deg) / 2.0
+        dqw, dqz = math.cos(half), math.sin(half)
+        nw = qw * dqw - qz * dqz
+        nx = qx * dqw + qy * dqz
+        ny = qy * dqw - qx * dqz
+        nz = qw * dqz + qz * dqw
+        qw, qx, qy, qz = nw, nx, ny, nz
+
+    lossless = csa.compress_pose(poses)
+    back = csa.decompress_pose(lossless)
+    check(back == poses, "pose exact round-trip")
+
+    lossy = csa.compress_pose_lossy(poses, pos_quant_step=8, pos_resync_interval=64,
+                                     quat_quant_step=32, quat_resync_interval=32)
+    check(len(lossy) < len(lossless), f"pose lossy smaller than lossless ({len(lossy)} < {len(lossless)})")
+
+    lossy_back = csa.decompress_pose(lossy)
+    check(len(lossy_back) == len(poses), "pose lossy round-trip length matches")
+    max_err = max(max(abs(a - b) for a, b in zip(pa + oa, pb + ob))
+                  for (pa, oa), (pb, ob) in zip(poses, lossy_back))
+    check(max_err <= 64 * 64, f"pose lossy error bounded (max_err={max_err})")
+    print(f"  pose lossy: {len(lossless)} -> {len(lossy)} bytes, max component error = {max_err}")
+
+
 def test_error_handling():
     try:
         csa.decompress(b"\x01\x02\x03\x04\x05")
@@ -117,6 +160,7 @@ def main():
     test_geo2d()
     test_geo2d_lossy()
     test_geo3d_lossy()
+    test_pose_lossy()
     test_error_handling()
     print(f"cuda_available() = {csa.cuda_available()}")
     print(f"{checks} checks, {failures} failures")

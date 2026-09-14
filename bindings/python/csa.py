@@ -29,6 +29,7 @@ __all__ = [
     "CsaError", "compress", "decompress",
     "compress_geo2d", "compress_geo2d_lossy", "decompress_geo2d",
     "compress_geo3d", "compress_geo3d_lossy", "decompress_geo3d",
+    "compress_pose", "compress_pose_lossy", "decompress_pose",
     "cuda_available",
 ]
 
@@ -96,6 +97,15 @@ _lib.csa_compress_geo3d_lossy.argtypes = [
 _lib.csa_compress_geo3d_lossy.restype = _CsaBuffer
 _lib.csa_decompress_geo3d.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
 _lib.csa_decompress_geo3d.restype = _CsaBuffer
+_lib.csa_compress_pose.argtypes = [ctypes.POINTER(ctypes.c_int32), ctypes.c_size_t]
+_lib.csa_compress_pose.restype = _CsaBuffer
+_lib.csa_compress_pose_lossy.argtypes = [
+    ctypes.POINTER(ctypes.c_int32), ctypes.c_size_t,
+    ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+]
+_lib.csa_compress_pose_lossy.restype = _CsaBuffer
+_lib.csa_decompress_pose.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
+_lib.csa_decompress_pose.restype = _CsaBuffer
 _lib.csa_free_buffer.argtypes = [_CsaBuffer]
 _lib.csa_free_buffer.restype = None
 _lib.csa_last_error.argtypes = []
@@ -188,7 +198,8 @@ def compress_geo3d(points) -> bytes:
 
 
 def compress_geo3d_lossy(points, quant_step: int, resync_interval: int = 0) -> bytes:
-    """Same design as compress_geo2d_lossy, on the true 3D similarity joint.
+    """Same design as compress_geo2d_lossy. Tries both the xy+z composition
+    and the true 3D similarity joint and keeps whichever encodes smaller.
     quant_step <= 1 is lossless (identical to compress_geo3d)."""
     arr, n = _points3d_to_array(points)
     buf = _lib.csa_compress_geo3d_lossy(arr, n, quant_step, resync_interval)
@@ -204,6 +215,55 @@ def decompress_geo3d(data: bytes):
         return []
     values = struct.unpack(f"={3 * n}i", raw)
     return [(values[3 * i], values[3 * i + 1], values[3 * i + 2]) for i in range(n)]
+
+
+def _poses_to_array(poses):
+    """poses: an iterable of ((x, y, z), (qw, qx, qy, qz)) pairs -- position
+    and a unit-quaternion orientation, both integer-ish."""
+    n = len(poses)
+    arr = (ctypes.c_int32 * (n * 7))()
+    for i, (position, orientation) in enumerate(poses):
+        x, y, z = position
+        qw, qx, qy, qz = orientation
+        base = 7 * i
+        arr[base] = int(x); arr[base + 1] = int(y); arr[base + 2] = int(z)
+        arr[base + 3] = int(qw); arr[base + 4] = int(qx); arr[base + 5] = int(qy); arr[base + 6] = int(qz)
+    return arr, n
+
+
+def compress_pose(poses) -> bytes:
+    """6-DOF pose stream: position via the Geo3D auto-select, orientation
+    via the Quaternion Joint (see DESIGN.md). poses: an iterable of
+    ((x, y, z), (qw, qx, qy, qz)) pairs."""
+    arr, n = _poses_to_array(poses)
+    buf = _lib.csa_compress_pose(arr, n)
+    return _check_and_extract(buf)
+
+
+def compress_pose_lossy(poses, pos_quant_step: int, pos_resync_interval: int = 0,
+                         quat_quant_step: int = 1, quat_resync_interval: int = 0) -> bytes:
+    """pos_quant_step/pos_resync_interval reach the position half's existing
+    lossy support; quat_quant_step/quat_resync_interval are the analogous
+    knobs for the Quaternion Joint. Either quant_step <= 1 is lossless for
+    that half."""
+    arr, n = _poses_to_array(poses)
+    buf = _lib.csa_compress_pose_lossy(arr, n, pos_quant_step, pos_resync_interval,
+                                        quat_quant_step, quat_resync_interval)
+    return _check_and_extract(buf)
+
+
+def decompress_pose(data: bytes):
+    """Returns a list of ((x, y, z), (qw, qx, qy, qz)) pairs. Works for both
+    lossless and lossy blobs."""
+    out_count = ctypes.c_size_t(0)
+    buf = _lib.csa_decompress_pose(data, len(data), ctypes.byref(out_count))
+    raw = _check_and_extract(buf)
+    n = out_count.value
+    if n == 0:
+        return []
+    values = struct.unpack(f"={7 * n}i", raw)
+    return [((values[7 * i], values[7 * i + 1], values[7 * i + 2]),
+             (values[7 * i + 3], values[7 * i + 4], values[7 * i + 5], values[7 * i + 6])) for i in range(n)]
 
 
 def cuda_available() -> bool:

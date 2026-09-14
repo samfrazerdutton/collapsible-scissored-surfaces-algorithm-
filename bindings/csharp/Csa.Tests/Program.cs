@@ -122,6 +122,56 @@ void TestGeo3DLossy()
     Console.WriteLine($"  3d lossy: {lossless.Length} -> {lossy.Length} bytes, max coordinate error = {maxErr}");
 }
 
+void TestPoseLossy()
+{
+    var poses = new List<Codec.Pose>();
+    double qw = 1, qx = 0, qy = 0, qz = 0;
+    lcgSeed = 4242;
+    double z = 0;
+    double qscale = 1 << 20;
+    for (int i = 0; i < 1500; i++)
+    {
+        double t = i * 0.05;
+        double x = 2000 * Math.Cos(t), y = 2000 * Math.Sin(t);
+        z += 4.0 + (LcgNext() - 0.5) * 0.5;
+        var position = ((int)Math.Round(x), (int)Math.Round(y), (int)Math.Round(z));
+        var orientation = ((int)Math.Round(qw * qscale), (int)Math.Round(qx * qscale),
+                            (int)Math.Round(qy * qscale), (int)Math.Round(qz * qscale));
+        poses.Add(new Codec.Pose(position, orientation));
+
+        double deg = 2.0 + (LcgNext() - 0.5) * 0.3;
+        double half = deg * Math.PI / 180.0 / 2.0;
+        double dqw = Math.Cos(half), dqz = Math.Sin(half);
+        double nw = qw * dqw - qz * dqz;
+        double nx = qx * dqw + qy * dqz;
+        double ny = qy * dqw - qx * dqz;
+        double nz = qw * dqz + qz * dqw;
+        qw = nw; qx = nx; qy = ny; qz = nz;
+    }
+
+    byte[] lossless = Codec.CompressPose(poses);
+    var backLossless = Codec.DecompressPose(lossless);
+    Check(backLossless.SequenceEqual(poses), "pose exact round-trip");
+
+    byte[] lossy = Codec.CompressPoseLossy(poses, 8, 64, 32, 32);
+    Check(lossy.Length < lossless.Length, $"pose lossy smaller than lossless ({lossy.Length} < {lossless.Length})");
+
+    var back = Codec.DecompressPose(lossy);
+    Check(back.Length == poses.Count, "pose lossy round-trip length matches");
+    int maxErr = 0;
+    for (int i = 0; i < poses.Count; i++)
+    {
+        var a = poses[i]; var b = back[i];
+        maxErr = Math.Max(maxErr, Math.Max(Math.Abs(a.Position.X - b.Position.X),
+                 Math.Max(Math.Abs(a.Position.Y - b.Position.Y), Math.Abs(a.Position.Z - b.Position.Z))));
+        maxErr = Math.Max(maxErr, Math.Max(Math.Abs(a.Orientation.W - b.Orientation.W),
+                 Math.Max(Math.Abs(a.Orientation.X - b.Orientation.X),
+                 Math.Max(Math.Abs(a.Orientation.Y - b.Orientation.Y), Math.Abs(a.Orientation.Z - b.Orientation.Z)))));
+    }
+    Check(maxErr <= 64 * 64, $"pose lossy error bounded (maxErr={maxErr})");
+    Console.WriteLine($"  pose lossy: {lossless.Length} -> {lossy.Length} bytes, max component error = {maxErr}");
+}
+
 void TestErrorHandling()
 {
     try
@@ -139,6 +189,7 @@ TestGeneral();
 TestGeo2D();
 TestGeo2DLossy();
 TestGeo3DLossy();
+TestPoseLossy();
 TestErrorHandling();
 Console.WriteLine($"cuda_available() = {Codec.CudaAvailable()}");
 Console.WriteLine($"{checks} checks, {failures} failures");

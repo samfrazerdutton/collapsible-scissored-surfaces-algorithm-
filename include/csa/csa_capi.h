@@ -57,12 +57,31 @@ CSA_API csa_buffer csa_decompress_geo2d(const unsigned char* input, size_t input
 
 /* Geo3D: points as interleaved int32 (x0,y0,z0,x1,y1,z1,...). */
 CSA_API csa_buffer csa_compress_geo3d(const int32_t* xyz, size_t count);
-/* Same lossy design as csa_compress_geo2d_lossy, on the true 3D similarity
- * joint (see codec.hpp's compress_geo3d_lossy doc comment). quant_step <= 1
- * is lossless (identical to csa_compress_geo3d). */
+/* Same lossy design as csa_compress_geo2d_lossy. Tries both the xy+z
+ * composition and the true 3D similarity joint and keeps whichever
+ * encodes smaller (see codec.hpp's compress_geo3d_lossy doc comment).
+ * quant_step <= 1 is lossless (identical to csa_compress_geo3d). */
 CSA_API csa_buffer csa_compress_geo3d_lossy(const int32_t* xyz, size_t count,
                                              uint32_t quant_step, uint32_t resync_interval);
 CSA_API csa_buffer csa_decompress_geo3d(const unsigned char* input, size_t input_size, size_t* out_count);
+
+/* Pose: 6-DOF samples (position + unit quaternion orientation) as
+ * interleaved int32, 7 per pose (x0,y0,z0,qw0,qx0,qy0,qz0,x1,...) --
+ * `count` is the number of poses, so `pose7` has 7*count elements.
+ * Position and orientation are compressed independently (unrelated
+ * structure) via the Geo3D auto-select and the Quaternion Joint
+ * respectively -- see quaternion_joint.hpp/DESIGN.md. */
+CSA_API csa_buffer csa_compress_pose(const int32_t* pose7, size_t count);
+/* pos_quant_step/pos_resync_interval reach the position half's existing
+ * lossy support; quat_quant_step/quat_resync_interval are the analogous
+ * knobs for the Quaternion Joint. Either quant_step <= 1 is lossless for
+ * that half; both <= 1 is identical to csa_compress_pose. */
+CSA_API csa_buffer csa_compress_pose_lossy(const int32_t* pose7, size_t count,
+                                            uint32_t pos_quant_step, uint32_t pos_resync_interval,
+                                            uint32_t quat_quant_step, uint32_t quat_resync_interval);
+/* Returns a buffer of interleaved int32 pose7 tuples; *out_count receives
+ * the number of poses. Works for both lossless and lossy blobs. */
+CSA_API csa_buffer csa_decompress_pose(const unsigned char* input, size_t input_size, size_t* out_count);
 
 /* Frees a buffer returned by any csa_compress_... or csa_decompress_... function. */
 CSA_API void csa_free_buffer(csa_buffer buf);

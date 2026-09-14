@@ -104,7 +104,7 @@ unmodified C++ source code, not text written for this project -- and
   `compress()` keeps one per thread automatically. Measured, not assumed:
   ~3.5x faster sustained per-call time at 50K elements, ~1.7x at 2M (see
   `DESIGN.md`).
-- **1580 round-trip correctness checks** (`tests/test_main.cpp` +
+- **1586 round-trip correctness checks** (`tests/test_main.cpp` +
   `tests/test_capi.cpp`, the latter linking the real shared library to
   catch actual symbol-export problems), including a dedicated check that
   the GPU path actually succeeds (not just that the overall call

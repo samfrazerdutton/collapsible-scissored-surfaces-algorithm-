@@ -48,6 +48,9 @@ var (
 	procCompressGeo3D      *lazyProc
 	procCompressGeo3DLossy *lazyProc
 	procDecompressGeo3D    *lazyProc
+	procCompressPose       *lazyProc
+	procCompressPoseLossy  *lazyProc
+	procDecompressPose     *lazyProc
 	procFreeBuffer         *lazyProc
 	procLastError          *lazyProc
 	procCudaAvailable      *lazyProc
@@ -63,6 +66,9 @@ func init() {
 	procCompressGeo3D = newLazyProc(dll, "csa_compress_geo3d")
 	procCompressGeo3DLossy = newLazyProc(dll, "csa_compress_geo3d_lossy")
 	procDecompressGeo3D = newLazyProc(dll, "csa_decompress_geo3d")
+	procCompressPose = newLazyProc(dll, "csa_compress_pose")
+	procCompressPoseLossy = newLazyProc(dll, "csa_compress_pose_lossy")
+	procDecompressPose = newLazyProc(dll, "csa_decompress_pose")
 	procFreeBuffer = newLazyProc(dll, "csa_free_buffer")
 	procLastError = newLazyProc(dll, "csa_last_error")
 	procCudaAvailable = newLazyProc(dll, "csa_cuda_available")
@@ -261,8 +267,9 @@ func CompressGeo3D(points []Point3D) ([]byte, error) {
 	return extractAndFree(buf)
 }
 
-// CompressGeo3DLossy: same design as CompressGeo2DLossy, on the true 3D
-// similarity joint. quantStep <= 1 is lossless (identical to CompressGeo3D).
+// CompressGeo3DLossy: same design as CompressGeo2DLossy. Tries both the
+// xy+z composition and the true 3D similarity joint and keeps whichever
+// encodes smaller. quantStep <= 1 is lossless (identical to CompressGeo3D).
 func CompressGeo3DLossy(points []Point3D, quantStep, resyncInterval uint32) ([]byte, error) {
 	flat := points3DToFlat(points)
 	var ptr uintptr
@@ -295,6 +302,89 @@ func DecompressGeo3D(data []byte) ([]Point3D, error) {
 		y := *(*int32)(unsafe.Pointer(&raw[i*12+4]))
 		z := *(*int32)(unsafe.Pointer(&raw[i*12+8]))
 		result[i] = Point3D{x, y, z}
+	}
+	return result, nil
+}
+
+// Quat is a unit-quaternion orientation (w, x, y, z).
+type Quat struct{ W, X, Y, Z int32 }
+
+// Pose is a 6-DOF sample: position, then orientation.
+type Pose struct {
+	Position    Point3D
+	Orientation Quat
+}
+
+func posesToFlat(poses []Pose) []int32 {
+	flat := make([]int32, len(poses)*7)
+	for i, p := range poses {
+		base := 7 * i
+		flat[base] = p.Position.X
+		flat[base+1] = p.Position.Y
+		flat[base+2] = p.Position.Z
+		flat[base+3] = p.Orientation.W
+		flat[base+4] = p.Orientation.X
+		flat[base+5] = p.Orientation.Y
+		flat[base+6] = p.Orientation.Z
+	}
+	return flat
+}
+
+// CompressPose: 6-DOF pose stream -- position via the Geo3D auto-select,
+// orientation via the Quaternion Joint (see DESIGN.md).
+func CompressPose(poses []Pose) ([]byte, error) {
+	flat := posesToFlat(poses)
+	var ptr uintptr
+	if len(flat) > 0 {
+		ptr = uintptr(unsafe.Pointer(&flat[0]))
+	}
+	buf := bufferReturningCall(procCompressPose, ptr, uintptr(len(poses)))
+	runtime.KeepAlive(flat)
+	return extractAndFree(buf)
+}
+
+// CompressPoseLossy: posQuantStep/posResyncInterval reach the position
+// half's existing lossy support; quatQuantStep/quatResyncInterval are the
+// analogous knobs for the Quaternion Joint. Either quantStep <= 1 is
+// lossless for that half.
+func CompressPoseLossy(poses []Pose, posQuantStep, posResyncInterval, quatQuantStep, quatResyncInterval uint32) ([]byte, error) {
+	flat := posesToFlat(poses)
+	var ptr uintptr
+	if len(flat) > 0 {
+		ptr = uintptr(unsafe.Pointer(&flat[0]))
+	}
+	buf := bufferReturningCall(procCompressPoseLossy, ptr, uintptr(len(poses)),
+		uintptr(posQuantStep), uintptr(posResyncInterval), uintptr(quatQuantStep), uintptr(quatResyncInterval))
+	runtime.KeepAlive(flat)
+	return extractAndFree(buf)
+}
+
+// DecompressPose works for both lossless and lossy blobs.
+func DecompressPose(data []byte) ([]Pose, error) {
+	var inputPtr uintptr
+	if len(data) > 0 {
+		inputPtr = uintptr(unsafe.Pointer(&data[0]))
+	}
+	var outCount uintptr
+	buf := bufferReturningCall(procDecompressPose, inputPtr, uintptr(len(data)),
+		uintptr(unsafe.Pointer(&outCount)))
+	runtime.KeepAlive(data)
+	raw, err := extractAndFree(buf)
+	if err != nil {
+		return nil, err
+	}
+	n := int(outCount)
+	result := make([]Pose, n)
+	for i := 0; i < n; i++ {
+		base := i * 28
+		x := *(*int32)(unsafe.Pointer(&raw[base]))
+		y := *(*int32)(unsafe.Pointer(&raw[base+4]))
+		z := *(*int32)(unsafe.Pointer(&raw[base+8]))
+		qw := *(*int32)(unsafe.Pointer(&raw[base+12]))
+		qx := *(*int32)(unsafe.Pointer(&raw[base+16]))
+		qy := *(*int32)(unsafe.Pointer(&raw[base+20]))
+		qz := *(*int32)(unsafe.Pointer(&raw[base+24]))
+		result[i] = Pose{Point3D{x, y, z}, Quat{qw, qx, qy, qz}}
 	}
 	return result, nil
 }

@@ -185,6 +185,84 @@ func TestGeo3DLossyBoundedError(t *testing.T) {
 	t.Logf("3d lossy: %d -> %d bytes, max coordinate error = %d", len(lossless), len(lossy), maxErr)
 }
 
+func TestPoseLossyBoundedError(t *testing.T) {
+	var poses []Pose
+	qw, qx, qy, qz := 1.0, 0.0, 0.0, 0.0
+	g := &lcg{seed: 4242}
+	z := 0.0
+	const qscale = float64(1 << 20)
+	for i := 0; i < 1500; i++ {
+		t := float64(i) * 0.05
+		x, y := 2000*math.Cos(t), 2000*math.Sin(t)
+		z += 4.0 + (g.next()-0.5)*0.5
+		position := Point3D{int32(math.Round(x)), int32(math.Round(y)), int32(math.Round(z))}
+		orientation := Quat{
+			int32(math.Round(qw * qscale)), int32(math.Round(qx * qscale)),
+			int32(math.Round(qy * qscale)), int32(math.Round(qz * qscale)),
+		}
+		poses = append(poses, Pose{position, orientation})
+
+		deg := 2.0 + (g.next()-0.5)*0.3
+		half := deg * math.Pi / 180.0 / 2.0
+		dqw, dqz := math.Cos(half), math.Sin(half)
+		nw := qw*dqw - qz*dqz
+		nx := qx*dqw + qy*dqz
+		ny := qy*dqw - qx*dqz
+		nz := qw*dqz + qz*dqw
+		qw, qx, qy, qz = nw, nx, ny, nz
+	}
+
+	lossless, err := CompressPose(poses)
+	if err != nil {
+		t.Fatalf("lossless compress failed: %v", err)
+	}
+	backLossless, err := DecompressPose(lossless)
+	if err != nil {
+		t.Fatalf("lossless decompress failed: %v", err)
+	}
+	for i := range poses {
+		if backLossless[i] != poses[i] {
+			t.Fatalf("lossless pose %d mismatch: got %v want %v", i, backLossless[i], poses[i])
+		}
+	}
+
+	lossy, err := CompressPoseLossy(poses, 8, 64, 32, 32)
+	if err != nil {
+		t.Fatalf("lossy compress failed: %v", err)
+	}
+	if len(lossy) >= len(lossless) {
+		t.Fatalf("expected pose lossy (%d) smaller than lossless (%d)", len(lossy), len(lossless))
+	}
+
+	back, err := DecompressPose(lossy)
+	if err != nil {
+		t.Fatalf("decompress failed: %v", err)
+	}
+	maxErr := int32(0)
+	abs := func(v int32) int32 {
+		if v < 0 {
+			return -v
+		}
+		return v
+	}
+	for i := range poses {
+		a, b := poses[i], back[i]
+		for _, d := range []int32{
+			abs(a.Position.X - b.Position.X), abs(a.Position.Y - b.Position.Y), abs(a.Position.Z - b.Position.Z),
+			abs(a.Orientation.W - b.Orientation.W), abs(a.Orientation.X - b.Orientation.X),
+			abs(a.Orientation.Y - b.Orientation.Y), abs(a.Orientation.Z - b.Orientation.Z),
+		} {
+			if d > maxErr {
+				maxErr = d
+			}
+		}
+	}
+	if maxErr > 64*64 {
+		t.Fatalf("max_err=%d exceeds bound", maxErr)
+	}
+	t.Logf("pose lossy: %d -> %d bytes, max component error = %d", len(lossless), len(lossy), maxErr)
+}
+
 func TestErrorHandlingOnGarbageInput(t *testing.T) {
 	_, err := Decompress([]byte{1, 2, 3, 4, 5})
 	if err == nil {

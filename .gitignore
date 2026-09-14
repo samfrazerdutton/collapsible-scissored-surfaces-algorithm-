@@ -14,3 +14,4 @@ Cargo.lock
 bindings/csharp/**/bin/
 bindings/csharp/**/obj/
 bindings/go/**/*.exe
+.claude/worktrees/

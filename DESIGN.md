@@ -701,7 +701,11 @@ correctness (including an adversarial random-quaternion case), the lag-
 search claim above, bounded lossy error, and a real compression win on a
 synthetic drone-circling-while-yawing pose stream (**83.3%** smaller than
 a fair raw-packed baseline, lossless; a further **42%** smaller in lossy
-mode with modest bounded error).
+mode with modest bounded error). `csa_capi.h`/`csa_capi.cpp` expose
+`csa_compress_pose`/`csa_compress_pose_lossy`/`csa_decompress_pose` the
+same way as the existing geo2d/geo3d functions (interleaved int32, 7 per
+pose), and all four language bindings (Python/Rust/C#/Go) wrap them the
+same way they wrap `compress_geo3d`.
 
 **Not yet done**: this is validated on synthetic data only (the same
 honest-caveat pattern as everything new in this codebase before real-
@@ -939,19 +943,11 @@ smaller call's result).
   incremental addition to the existing CUDA path, and is out of scope for
   what a single-repository research project can responsibly claim to have
   built alongside everything else here.
-- **`compress_pose`/`decompress_pose` aren't wired through the C ABI yet**
-  -- `csa_capi.cpp`/`csa_capi.h` and all four language bindings currently
-  only expose `compress`/`compress_geo2d`/`compress_geo3d` (+ their lossy
-  variants). Extending the C ABI to a `Pose`-array-of-structs marshaling
-  convention and adding the corresponding wrapper in each binding is
-  straightforward (same shape as the existing geo3d wiring) but not yet
-  done.
-- **The Quaternion Joint / Pose codec is validated on synthetic data
-  only** -- see its own section above. A real head-to-head against actual
-  6-DOF tracking data (EuRoC MAV, TUM RGB-D, KITTI odometry ground truth)
-  and whatever specialized competitor exists for that domain, following
-  `REAL_GEO_BENCHMARK.md`'s precedent, is the natural next step before
-  claiming this is more than a promising synthetic result.
+- **The Quaternion Joint / Pose codec's real-data validation** -- see its
+  own section above for the synthetic-only result and what a real
+  head-to-head (EuRoC MAV, TUM RGB-D, KITTI odometry ground truth, plus
+  whatever specialized competitor exists for that domain) would need to
+  look like, following `REAL_GEO_BENCHMARK.md`'s precedent.
 
 ## Build gotcha: adding a new `__global__` kernel
 

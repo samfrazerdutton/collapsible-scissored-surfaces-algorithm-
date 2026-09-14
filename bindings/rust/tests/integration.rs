@@ -99,6 +99,59 @@ fn geo3d_lossy_bounded_error() {
 }
 
 #[test]
+fn pose_lossy_bounded_error() {
+    let mut poses = Vec::new();
+    let (mut qw, mut qx, mut qy, mut qz) = (1.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
+    let mut seed = 4242u32;
+    let mut z = 0.0_f64;
+    let qscale = (1i64 << 20) as f64;
+    for i in 0..1500 {
+        let t = i as f64 * 0.05;
+        let x = 2000.0 * t.cos();
+        let y = 2000.0 * t.sin();
+        z += 4.0 + (lcg_next(&mut seed) - 0.5) * 0.5;
+        let position = (x.round() as i32, y.round() as i32, z.round() as i32);
+        let orientation = (
+            (qw * qscale).round() as i32,
+            (qx * qscale).round() as i32,
+            (qy * qscale).round() as i32,
+            (qz * qscale).round() as i32,
+        );
+        poses.push((position, orientation));
+
+        let deg = 2.0 + (lcg_next(&mut seed) - 0.5) * 0.3;
+        let half = deg.to_radians() / 2.0;
+        let (dqw, dqz) = (half.cos(), half.sin());
+        let nw = qw * dqw - qz * dqz;
+        let nx = qx * dqw + qy * dqz;
+        let ny = qy * dqw - qx * dqz;
+        let nz = qw * dqz + qz * dqw;
+        qw = nw; qx = nx; qy = ny; qz = nz;
+    }
+
+    let lossless = csa::compress_pose(&poses).unwrap();
+    let back_lossless = csa::decompress_pose(&lossless).unwrap();
+    assert_eq!(back_lossless, poses);
+
+    let lossy = csa::compress_pose_lossy(&poses, 8, 64, 32, 32).unwrap();
+    assert!(lossy.len() < lossless.len(), "pose lossy ({}) should beat lossless ({})", lossy.len(), lossless.len());
+
+    let back = csa::decompress_pose(&lossy).unwrap();
+    assert_eq!(back.len(), poses.len());
+    let max_err = poses
+        .iter()
+        .zip(back.iter())
+        .map(|(a, b)| {
+            let pos_err = (a.0 .0 - b.0 .0).abs().max((a.0 .1 - b.0 .1).abs()).max((a.0 .2 - b.0 .2).abs());
+            let quat_err = (a.1 .0 - b.1 .0).abs().max((a.1 .1 - b.1 .1).abs()).max((a.1 .2 - b.1 .2).abs()).max((a.1 .3 - b.1 .3).abs());
+            pos_err.max(quat_err)
+        })
+        .max()
+        .unwrap();
+    assert!(max_err <= 64 * 64, "max_err={max_err} exceeds bound");
+}
+
+#[test]
 fn error_handling_on_garbage_input() {
     let garbage = [1u8, 2, 3, 4, 5];
     let err = csa::decompress(&garbage).expect_err("expected an error on garbage input");

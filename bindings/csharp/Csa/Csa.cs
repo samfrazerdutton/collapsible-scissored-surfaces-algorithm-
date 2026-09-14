@@ -127,8 +127,9 @@ namespace Csa
         }
 
         /// <summary>
-        /// Same design as CompressGeo2DLossy, on the true 3D similarity
-        /// joint. quantStep &lt;= 1 is lossless (identical to CompressGeo3D).
+        /// Same design as CompressGeo2DLossy. Tries both the xy+z
+        /// composition and the true 3D similarity joint and keeps whichever
+        /// encodes smaller. quantStep &lt;= 1 is lossless (identical to CompressGeo3D).
         /// </summary>
         public static byte[] CompressGeo3DLossy(IReadOnlyList<(int X, int Y, int Z)> points, uint quantStep, uint resyncInterval = 0)
         {
@@ -149,6 +150,83 @@ namespace Csa
                 int y = BitConverter.ToInt32(raw, i * 12 + 4);
                 int z = BitConverter.ToInt32(raw, i * 12 + 8);
                 result[i] = (x, y, z);
+            }
+            return result;
+        }
+
+        /// <summary>A 6-DOF pose sample: position, then a unit-quaternion orientation.</summary>
+        public struct Pose
+        {
+            public (int X, int Y, int Z) Position;
+            public (int W, int X, int Y, int Z) Orientation;
+            public Pose((int, int, int) position, (int, int, int, int) orientation)
+            {
+                Position = position;
+                Orientation = orientation;
+            }
+        }
+
+        private static int[] PosesToFlat(IReadOnlyList<Pose> poses)
+        {
+            var flat = new int[poses.Count * 7];
+            for (int i = 0; i < poses.Count; i++)
+            {
+                int b = 7 * i;
+                flat[b] = poses[i].Position.X;
+                flat[b + 1] = poses[i].Position.Y;
+                flat[b + 2] = poses[i].Position.Z;
+                flat[b + 3] = poses[i].Orientation.W;
+                flat[b + 4] = poses[i].Orientation.X;
+                flat[b + 5] = poses[i].Orientation.Y;
+                flat[b + 6] = poses[i].Orientation.Z;
+            }
+            return flat;
+        }
+
+        /// <summary>
+        /// 6-DOF pose stream: position via the Geo3D auto-select,
+        /// orientation via the Quaternion Joint (see DESIGN.md).
+        /// </summary>
+        public static byte[] CompressPose(IReadOnlyList<Pose> poses)
+        {
+            var flat = PosesToFlat(poses);
+            var buf = CsaNative.csa_compress_pose(flat, (UIntPtr)poses.Count);
+            return CheckAndExtract(buf);
+        }
+
+        /// <summary>
+        /// posQuantStep/posResyncInterval reach the position half's existing
+        /// lossy support; quatQuantStep/quatResyncInterval are the analogous
+        /// knobs for the Quaternion Joint. Either quantStep &lt;= 1 is
+        /// lossless for that half.
+        /// </summary>
+        public static byte[] CompressPoseLossy(IReadOnlyList<Pose> poses,
+            uint posQuantStep, uint posResyncInterval, uint quatQuantStep, uint quatResyncInterval)
+        {
+            var flat = PosesToFlat(poses);
+            var buf = CsaNative.csa_compress_pose_lossy(flat, (UIntPtr)poses.Count,
+                posQuantStep, posResyncInterval, quatQuantStep, quatResyncInterval);
+            return CheckAndExtract(buf);
+        }
+
+        /// <summary>Works for both lossless and lossy blobs.</summary>
+        public static Pose[] DecompressPose(byte[] data)
+        {
+            var buf = CsaNative.csa_decompress_pose(data, (UIntPtr)data.Length, out UIntPtr outCount);
+            byte[] raw = CheckAndExtract(buf);
+            int n = checked((int)outCount);
+            var result = new Pose[n];
+            for (int i = 0; i < n; i++)
+            {
+                int b = i * 28;
+                int x = BitConverter.ToInt32(raw, b);
+                int y = BitConverter.ToInt32(raw, b + 4);
+                int z = BitConverter.ToInt32(raw, b + 8);
+                int qw = BitConverter.ToInt32(raw, b + 12);
+                int qx = BitConverter.ToInt32(raw, b + 16);
+                int qy = BitConverter.ToInt32(raw, b + 20);
+                int qz = BitConverter.ToInt32(raw, b + 24);
+                result[i] = new Pose((x, y, z), (qw, qx, qy, qz));
             }
             return result;
         }

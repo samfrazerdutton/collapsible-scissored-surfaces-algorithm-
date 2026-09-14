@@ -156,6 +156,72 @@ static void test_geo3d_lossy() {
     csa_free_buffer(decoded);
 }
 
+static void test_pose_lossy() {
+    // A drone-circling-while-yawing 6-DOF pose stream: constant-radius xy
+    // rotation + noisy steady climb (position) with orientation tracking
+    // the heading + noise (quaternion), same shape class as csa_tests'
+    // test_pose_codec.
+    std::vector<int32_t> pose7;
+    const double qscale = 1 << 20;
+    double qw = 1, qx = 0, qy = 0, qz = 0;
+    unsigned int seed = 4242;
+    auto next_rand = [&]() { seed = seed * 1664525u + 1013904223u; return (double)(seed >> 8) / (double)(1u << 24); };
+    double z = 0.0;
+    for (int i = 0; i < 1500; i++) {
+        double t = i * 0.05;
+        pose7.push_back((int32_t)std::lround(2000 * std::cos(t)));
+        pose7.push_back((int32_t)std::lround(2000 * std::sin(t)));
+        z += 4.0 + (next_rand() - 0.5) * 0.5;
+        pose7.push_back((int32_t)std::lround(z));
+        pose7.push_back((int32_t)std::lround(qw * qscale));
+        pose7.push_back((int32_t)std::lround(qx * qscale));
+        pose7.push_back((int32_t)std::lround(qy * qscale));
+        pose7.push_back((int32_t)std::lround(qz * qscale));
+
+        double deg = 2.0 + (next_rand() - 0.5) * 0.3;
+        double half = (deg * 3.14159265358979323846 / 180.0) / 2.0;
+        double dqw = std::cos(half), dqz = std::sin(half);
+        double nw = qw * dqw - qx * 0 - qy * 0 - qz * dqz;
+        double nx = qw * 0 + qx * dqw + qy * dqz - qz * 0;
+        double ny = qw * 0 - qx * dqz + qy * dqw + qz * 0;
+        double nz = qw * dqz + qx * 0 - qy * 0 + qz * dqw;
+        qw = nw; qx = nx; qy = ny; qz = nz;
+    }
+    size_t count = pose7.size() / 7;
+
+    csa_buffer lossless = csa_compress_pose(pose7.data(), count);
+    CHECK(lossless.data != nullptr && lossless.size > 0);
+
+    size_t out_count = 0;
+    csa_buffer decoded = csa_decompress_pose(lossless.data, lossless.size, &out_count);
+    CHECK(out_count == count);
+    CHECK(decoded.data != nullptr &&
+          std::memcmp(decoded.data, pose7.data(), pose7.size() * sizeof(int32_t)) == 0);
+
+    csa_buffer lossy = csa_compress_pose_lossy(pose7.data(), count, /*pos_quant=*/8, /*pos_resync=*/64,
+                                                /*quat_quant=*/32, /*quat_resync=*/32);
+    CHECK(lossy.size > 0 && lossy.size < lossless.size);
+
+    size_t lossy_out_count = 0;
+    csa_buffer lossy_decoded = csa_decompress_pose(lossy.data, lossy.size, &lossy_out_count);
+    CHECK(lossy_out_count == count);
+    if (lossy_decoded.data) {
+        const int32_t* out = (const int32_t*)lossy_decoded.data;
+        int32_t max_err = 0;
+        for (size_t i = 0; i < pose7.size(); i++) {
+            int32_t d = out[i] - pose7[i];
+            if (d < 0) d = -d;
+            if (d > max_err) max_err = d;
+        }
+        CHECK(max_err <= 64 * 64); // generous bound, same spirit as the geo3d lossy check
+    }
+
+    csa_free_buffer(lossless);
+    csa_free_buffer(decoded);
+    csa_free_buffer(lossy);
+    csa_free_buffer(lossy_decoded);
+}
+
 static void test_error_reporting() {
     unsigned char garbage[] = {1, 2, 3, 4, 5};
     csa_buffer result = csa_decompress(garbage, sizeof(garbage));
@@ -171,6 +237,7 @@ int main() {
     test_geo2d();
     test_geo2d_lossy();
     test_geo3d_lossy();
+    test_pose_lossy();
     test_error_reporting();
     std::printf("cuda available (via C ABI): %s\n", csa_cuda_available() ? "yes" : "no");
     std::printf("%d checks, %d failures\n", g_checks, g_failures);

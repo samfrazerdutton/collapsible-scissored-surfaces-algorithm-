@@ -61,6 +61,21 @@ extern "C" {
         out_count: *mut usize,
     ) -> CsaBuffer;
 
+    fn csa_compress_pose(pose7: *const i32, count: usize) -> CsaBuffer;
+    fn csa_compress_pose_lossy(
+        pose7: *const i32,
+        count: usize,
+        pos_quant_step: u32,
+        pos_resync_interval: u32,
+        quat_quant_step: u32,
+        quat_resync_interval: u32,
+    ) -> CsaBuffer;
+    fn csa_decompress_pose(
+        input: *const c_uchar,
+        input_size: usize,
+        out_count: *mut usize,
+    ) -> CsaBuffer;
+
     fn csa_free_buffer(buf: CsaBuffer);
     fn csa_last_error() -> *const c_char;
     fn csa_cuda_available() -> c_int;
@@ -189,8 +204,9 @@ pub fn compress_geo3d(points: &[(i32, i32, i32)]) -> Result<Vec<u8>, CsaError> {
     unsafe { check_and_extract(csa_compress_geo3d(flat.as_ptr(), points.len())) }
 }
 
-/// Same design as [`compress_geo2d_lossy`], on the true 3D similarity
-/// joint. `quant_step <= 1` is lossless (identical to [`compress_geo3d`]).
+/// Same design as [`compress_geo2d_lossy`]. Tries both the xy+z
+/// composition and the true 3D similarity joint and keeps whichever
+/// encodes smaller. `quant_step <= 1` is lossless (identical to [`compress_geo3d`]).
 pub fn compress_geo3d_lossy(
     points: &[(i32, i32, i32)],
     quant_step: u32,
@@ -219,6 +235,78 @@ pub fn decompress_geo3d(data: &[u8]) -> Result<Vec<(i32, i32, i32)>, CsaError> {
             let y = read_i32_at(&raw, i * 12 + 4);
             let z = read_i32_at(&raw, i * 12 + 8);
             result.push((x, y, z));
+        }
+        Ok(result)
+    }
+}
+
+/// A 6-DOF pose sample: position, then a unit-quaternion orientation
+/// (w, x, y, z).
+pub type Pose = ((i32, i32, i32), (i32, i32, i32, i32));
+
+fn poses_to_flat(poses: &[Pose]) -> Vec<i32> {
+    let mut v = Vec::with_capacity(poses.len() * 7);
+    for &((x, y, z), (qw, qx, qy, qz)) in poses {
+        v.push(x);
+        v.push(y);
+        v.push(z);
+        v.push(qw);
+        v.push(qx);
+        v.push(qy);
+        v.push(qz);
+    }
+    v
+}
+
+/// 6-DOF pose stream: position via the Geo3D auto-select, orientation via
+/// the Quaternion Joint (see DESIGN.md).
+pub fn compress_pose(poses: &[Pose]) -> Result<Vec<u8>, CsaError> {
+    let flat = poses_to_flat(poses);
+    unsafe { check_and_extract(csa_compress_pose(flat.as_ptr(), poses.len())) }
+}
+
+/// `pos_quant_step`/`pos_resync_interval` reach the position half's
+/// existing lossy support; `quat_quant_step`/`quat_resync_interval` are
+/// the analogous knobs for the Quaternion Joint. Either `quant_step <= 1`
+/// is lossless for that half.
+pub fn compress_pose_lossy(
+    poses: &[Pose],
+    pos_quant_step: u32,
+    pos_resync_interval: u32,
+    quat_quant_step: u32,
+    quat_resync_interval: u32,
+) -> Result<Vec<u8>, CsaError> {
+    let flat = poses_to_flat(poses);
+    unsafe {
+        check_and_extract(csa_compress_pose_lossy(
+            flat.as_ptr(),
+            poses.len(),
+            pos_quant_step,
+            pos_resync_interval,
+            quat_quant_step,
+            quat_resync_interval,
+        ))
+    }
+}
+
+/// Works for both lossless and lossy blobs.
+pub fn decompress_pose(data: &[u8]) -> Result<Vec<Pose>, CsaError> {
+    let mut out_count: usize = 0;
+    unsafe {
+        let buf = csa_decompress_pose(data.as_ptr(), data.len(), &mut out_count as *mut usize);
+        let raw = check_and_extract(buf)?;
+        let n = out_count;
+        let mut result = Vec::with_capacity(n);
+        for i in 0..n {
+            let base = i * 28;
+            let x = read_i32_at(&raw, base);
+            let y = read_i32_at(&raw, base + 4);
+            let z = read_i32_at(&raw, base + 8);
+            let qw = read_i32_at(&raw, base + 12);
+            let qx = read_i32_at(&raw, base + 16);
+            let qy = read_i32_at(&raw, base + 20);
+            let qz = read_i32_at(&raw, base + 24);
+            result.push(((x, y, z), (qw, qx, qy, qz)));
         }
         Ok(result)
     }

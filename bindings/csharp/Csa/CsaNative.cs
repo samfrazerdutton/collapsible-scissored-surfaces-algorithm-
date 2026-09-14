@@ -42,6 +42,16 @@ namespace Csa
         internal static extern CsaBuffer csa_decompress_geo3d(byte[] input, UIntPtr input_size, out UIntPtr out_count);
 
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern CsaBuffer csa_compress_pose(int[] pose7, UIntPtr count);
+
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern CsaBuffer csa_compress_pose_lossy(int[] pose7, UIntPtr count,
+            uint pos_quant_step, uint pos_resync_interval, uint quat_quant_step, uint quat_resync_interval);
+
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern CsaBuffer csa_decompress_pose(byte[] input, UIntPtr input_size, out UIntPtr out_count);
+
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         internal static extern void csa_free_buffer(CsaBuffer buf);
 
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]

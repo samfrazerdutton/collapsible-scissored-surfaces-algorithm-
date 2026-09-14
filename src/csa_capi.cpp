@@ -169,6 +169,63 @@ csa_buffer csa_decompress_geo3d(const unsigned char* input, size_t input_size, s
     }
 }
 
+csa_buffer csa_compress_pose(const int32_t* pose7, size_t count) {
+    try {
+        std::vector<csa::Pose> poses(count);
+        for (size_t i = 0; i < count; i++) {
+            const int32_t* p = pose7 + 7 * i;
+            poses[i].position = {p[0], p[1], p[2]};
+            poses[i].orientation = {p[3], p[4], p[5], p[6]};
+        }
+        return make_buffer(csa::compress_pose(poses));
+    } catch (const std::exception& e) {
+        return fail(e.what());
+    } catch (...) {
+        return fail("csa_compress_pose: unknown error");
+    }
+}
+
+csa_buffer csa_compress_pose_lossy(const int32_t* pose7, size_t count,
+                                    uint32_t pos_quant_step, uint32_t pos_resync_interval,
+                                    uint32_t quat_quant_step, uint32_t quat_resync_interval) {
+    try {
+        std::vector<csa::Pose> poses(count);
+        for (size_t i = 0; i < count; i++) {
+            const int32_t* p = pose7 + 7 * i;
+            poses[i].position = {p[0], p[1], p[2]};
+            poses[i].orientation = {p[3], p[4], p[5], p[6]};
+        }
+        return make_buffer(csa::compress_pose_lossy(poses, pos_quant_step, pos_resync_interval,
+                                                      quat_quant_step, quat_resync_interval));
+    } catch (const std::exception& e) {
+        return fail(e.what());
+    } catch (...) {
+        return fail("csa_compress_pose_lossy: unknown error");
+    }
+}
+
+csa_buffer csa_decompress_pose(const unsigned char* input, size_t input_size, size_t* out_count) {
+    try {
+        std::vector<csa::u8> in(input, input + input_size);
+        auto poses = csa::decompress_pose(in);
+        if (out_count) *out_count = poses.size();
+        std::vector<int32_t> flat(poses.size() * 7);
+        for (size_t i = 0; i < poses.size(); i++) {
+            int32_t* p = flat.data() + 7 * i;
+            p[0] = poses[i].position.x; p[1] = poses[i].position.y; p[2] = poses[i].position.z;
+            p[3] = poses[i].orientation.w; p[4] = poses[i].orientation.x;
+            p[5] = poses[i].orientation.y; p[6] = poses[i].orientation.z;
+        }
+        return make_int32_buffer(flat);
+    } catch (const std::exception& e) {
+        if (out_count) *out_count = 0;
+        return fail(e.what());
+    } catch (...) {
+        if (out_count) *out_count = 0;
+        return fail("csa_decompress_pose: unknown error");
+    }
+}
+
 void csa_free_buffer(csa_buffer buf) {
     if (buf.data) std::free(buf.data);
 }
