@@ -1,4 +1,8 @@
 #include "csa/lz_matcher.hpp"
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <limits>
 
 namespace csa {
 
@@ -28,24 +32,35 @@ size_t match_length(const u8* a, const u8* b, size_t max_len) {
 // over pure greedy longest-match-first, for a bounded amount of extra
 // work (one extra search per position, not a recursive lookahead chain).
 //
-// An experiment tried here and reverted: selecting matches by an
-// estimated encoded-bit cost (bytes covered per bit, favoring a much
-// closer but slightly shorter match over a farther, marginally longer
-// one) instead of pure greedy-longest. It measurably helped on some real
-// data (real source code: ~0.8-0.9% smaller at every speed level; a
-// synthetic numeric CSV use case: ~5.7% smaller) but measurably *hurt*
-// on other realistic data (a synthetic server-log use case: ~7.4%
-// *larger*; JSON telemetry events: ~2.1% larger) -- a real, honest,
-// mixed result, not a net win. The likely cause: the cost estimate is
-// evaluated greedily per candidate with no visibility into how the
-// choice affects the cost of whatever comes *after* it, so on
-// template-like repeated data (e.g. a log line repeating a whole
-// template with only a few fields differing) it can prefer a shorter,
-// cheaper-looking match that forces a worse parse of the remaining bytes
-// -- exactly the class of problem true cost-based *optimal* parsing (a
-// dynamic-programming pass over the whole remaining parse, not a
-// greedy per-candidate score) is built to avoid. See DESIGN.md's future
-// work for that harder, still-unbuilt alternative.
+// Two experiments tried here and reverted, both documented in full in
+// DESIGN.md (with the actual code preserved in git history, not just a
+// changelog entry):
+//
+// 1. Selecting matches by an estimated encoded-bit cost (bytes covered
+//    per bit, favoring a much closer but slightly shorter match over a
+//    farther, marginally longer one) instead of pure greedy-longest. A
+//    real, honest, *mixed* result -- helped on some real data, hurt on
+//    other realistic data -- traced to the cost estimate being evaluated
+//    greedily per candidate with no visibility into how that choice
+//    affects the cost of whatever comes after it in the parse.
+// 2. A genuine dynamic-programming *optimal* parser (`lz_parse_optimal`,
+//    since removed): minimum-cost path over the whole remaining input,
+//    using a real Shannon-entropy cost model empirically derived from a
+//    baseline lz_parse() of the same input, specifically built to fix
+//    experiment 1's "no visibility into what comes after" problem. It
+//    was correctly implemented (round-trip correctness held throughout)
+//    and, after fixing a real ~13x performance bug (reusing the caller's
+//    max_chain at every position instead of the lazy parser's much
+//    sparser calling pattern), ran at a reasonable speed -- but measured
+//    honestly, it never actually beat the plain lazy parser: identical
+//    output size on the 18MB real-source-code corpus (at 2.4x the
+//    compress time) and on synthetic templated server-log data. The
+//    likely cause: the cost model is derived from the lazy parse's own
+//    output statistics, so it's implicitly calibrated toward the lazy
+//    parser's own preferences rather than an independent measure of what
+//    a genuinely better parse would look like -- a subtler, second-order
+//    version of the same "not enough real signal" problem as experiment
+//    1, not a coding bug.
 std::vector<LzToken> lz_parse(const std::vector<u8>& data, int max_chain, size_t nice_length) {
     std::vector<LzToken> tokens;
     size_t n = data.size();

@@ -34,17 +34,16 @@ u32 bucket_decode(int bucket, u32 extra_value) {
 
 } // namespace
 
-std::vector<u8> lz_encode(const std::vector<u8>& input, int max_chain, size_t nice_length) {
+namespace {
+
+// Entropy-codes a given token stream into the payload lz_encode appends
+// after its length header (coded_length + coded + extra_length + extra).
+// Factored out so lz_encode can try more than one tokenization of the
+// same input and keep whichever actually encodes smaller -- the decoder
+// doesn't care which parse produced its tokens, so this never needs a
+// matching change on the decode side.
+std::vector<u8> encode_tokens_payload(const std::vector<u8>& input, const std::vector<LzToken>& tokens) {
     std::vector<u8> out;
-    put_u64(out, (u64)input.size());
-
-    if (input.empty()) {
-        put_u64(out, 0); // coded_length
-        put_u64(out, 0); // extra_bits_length
-        return out;
-    }
-
-    std::vector<LzToken> tokens = lz_parse(input, max_chain, nice_length);
 
     std::vector<u8> coded;
     RangeEncoder enc(coded);
@@ -97,6 +96,24 @@ std::vector<u8> lz_encode(const std::vector<u8>& input, int max_chain, size_t ni
     out.insert(out.end(), coded.begin(), coded.end());
     put_u64(out, (u64)extra.size());
     out.insert(out.end(), extra.begin(), extra.end());
+    return out;
+}
+
+} // namespace
+
+std::vector<u8> lz_encode(const std::vector<u8>& input, int max_chain, size_t nice_length) {
+    std::vector<u8> out;
+    put_u64(out, (u64)input.size());
+
+    if (input.empty()) {
+        put_u64(out, 0); // coded_length
+        put_u64(out, 0); // extra_bits_length
+        return out;
+    }
+
+    std::vector<LzToken> tokens = lz_parse(input, max_chain, nice_length);
+    std::vector<u8> payload = encode_tokens_payload(input, tokens);
+    out.insert(out.end(), payload.begin(), payload.end());
     return out;
 }
 

@@ -727,38 +727,58 @@ smaller call's result).
   a fresh driver load / system boot), not a per-idle-period one, which
   would need instrumentation below what a benchmark script driving
   `nvidia-smi` and `scissorc` can observe to actually confirm.
-- **Optimal (cost-based) LZ parsing** would likely close more of the
-  remaining gap to bz2/lzma on realistic text (see `USE_CASES.md`): the
-  current matcher's lookahead is one step (lazy matching), not a full
-  search over parse choices weighted by their actual entropy-coded cost,
-  which is what LZMA-class compressors do. **A greedy (non-optimal)
-  version of this was actually tried and reverted**: `find_match` and the
-  lazy-deferral decision were changed to select matches by an estimated
-  encoded-bit cost (bytes covered per bit, a cheap integer proxy built
-  from `bucket_encode`'s own bucket math -- see the reverted code's
-  comments, kept in git history) instead of pure greedy-longest, on the
-  theory that a much closer, slightly shorter match often costs fewer
-  bits than a farther, marginally longer one. Measured honestly, it was a
-  real but *mixed* result, not a net win: on the 18MB real-source-code
-  corpus it shrank output by ~0.8-0.9% at every speed level (narrowing
-  the gap to lzma from 13.4% to 12.4%) and on a synthetic numeric-CSV use
-  case by ~5.7%, but on a synthetic server-log use case it made output
-  ~7.4% *larger*, and on JSON telemetry events ~2.1% larger -- while also
-  costing 20-30% more compression time everywhere, since the cost
-  estimate has to be computed for every still-viable chain candidate
-  instead of a cheap length comparison. The likely cause of the
-  regressions: the cost estimate is evaluated greedily, per candidate,
-  with no visibility into how that choice affects the cost of whatever
-  comes *after* it in the parse -- so on template-like repeated data
-  (e.g. a log line repeating a whole template with only a few fields
-  differing), it can prefer a shorter, locally-cheaper-looking match that
-  forces a worse parse of the remaining bytes. This is exactly the
-  failure mode true optimal parsing (a dynamic-programming pass scoring
-  the *whole* remaining parse, not one candidate in isolation) is built
-  to avoid, and why a cost-aware-but-still-greedy heuristic isn't a
-  substitute for it. Reverted rather than kept as an ambiguous, mixed-
-  result default; a real DP-based optimal parser remains the actual
-  future-work item here, not the greedy approximation.
+- **Optimal (cost-based) LZ parsing** was tried twice now, both times
+  reverted, both documented here in full rather than quietly dropped
+  (the actual code for both remains recoverable from git history, not
+  just this summary):
+  1. A greedy per-candidate cost heuristic: `find_match` and the lazy-
+     deferral decision selected matches by an estimated encoded-bit cost
+     (bytes covered per bit, a cheap integer proxy built from
+     `bucket_encode`'s own bucket math) instead of pure greedy-longest,
+     on the theory that a much closer, slightly shorter match often
+     costs fewer bits than a farther, marginally longer one. A real,
+     honest, *mixed* result: helped on the 18MB real-source-code corpus
+     (~0.8-0.9% smaller at every level) and a synthetic numeric-CSV case
+     (~5.7% smaller), but hurt a synthetic server-log case (~7.4%
+     *larger*) and JSON telemetry (~2.1% larger), while costing 20-30%
+     more compression time everywhere. Traced to the cost estimate being
+     evaluated greedily per candidate with no visibility into how that
+     choice affects whatever comes *after* it in the parse -- exactly
+     the failure mode a true DP-based optimal parser is built to avoid.
+  2. A genuine dynamic-programming optimal parser (`lz_parse_optimal`),
+     built specifically to fix (1)'s blind spot: minimum-cost path over
+     the whole remaining input, using a real Shannon-entropy (`-log2(p)`)
+     cost model empirically derived from a baseline lazy parse of the
+     same input -- literal byte frequencies, the match-vs-literal split,
+     and length/distance bucket frequencies, not an ad hoc formula.
+     Correctly implemented (round-trip correctness held throughout) and,
+     after finding and fixing a real ~13x performance bug (the DP calls
+     `find_match` at *every* position, unlike the lazy parser, which
+     skips ahead once a match commits -- reusing the caller's
+     `max_chain`/`nice_length` directly at that calling frequency made a
+     1MB test file take 30-40s at the "high" level, fixed by giving the
+     DP its own small, fixed internal search budget decoupled from the
+     level the caller requested), ran at a reasonable speed. Gated to
+     only run at the "high" level (its own fixed budget still means a
+     second full parse, not worth paying unconditionally on "fast"/
+     "balanced") and compared against the plain lazy parse by actual
+     encoded size, so it could only ever help or be a no-op, never
+     regress anything. Measured honestly, it never actually won: byte-
+     identical output on the 18MB real-source-code corpus (at 2.4x the
+     "high"-level compress time) and on synthetic templated server-log
+     data. Likely cause: the cost model is derived from the lazy parse's
+     *own* output statistics, so it's implicitly calibrated toward
+     reproducing the lazy parser's own preferences rather than measuring
+     what a genuinely different, better parse would look like -- a
+     subtler, second-order version of (1)'s same "not enough independent
+     signal" problem, not an implementation bug. Reverted in full rather
+     than kept as a correctly-working feature that simply never helps in
+     practice. A real optimal parser -- one whose cost model has some
+     source of information genuinely independent of the parse it's
+     trying to improve on, e.g. an actual simulated adaptive-coder state
+     rather than a static empirical proxy -- remains the honest
+     future-work item here; both of these attempts were real, careful
+     tries at it, not strawmen, and neither paid off.
 - **Lossy mode's 3D path only tries the similarity joint, not the xy+z
   composition** (see the lossy-mode section above) -- extending the
   composition's z-axis Pantograph Lift to support quantization too would
