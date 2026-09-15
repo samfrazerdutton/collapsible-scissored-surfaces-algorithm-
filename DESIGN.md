@@ -1497,6 +1497,44 @@ thing this cannot cover without a real browser is whether the WebGL
 scene and new layout actually look right -- that remains unverified
 pending a real look.
 
+### Fix: Three.js module resolution was broken in every real browser
+
+The redesign above shipped with the same Three.js import lines the
+prior rebuild had used, unchanged, and that prior entry's own
+verification caveat said plainly: "whether the actual WebGL rendering
+looks right... is the one part of this change that's unverified
+pending a real look." Nobody had looked. The user reported the whole
+UI dead -- no 3D view, nothing responding -- immediately after this
+redesign shipped.
+
+Root cause, found by actually loading the live page in a real browser
+(headless Chrome via `puppeteer-core` against the already-installed
+Chrome binary, since the Claude-in-Chrome extension wasn't connected in
+this session): `examples/jsm/controls/OrbitControls.js` at this pinned
+Three.js version internally does `import ... from 'three'` -- a bare
+module specifier, which browsers cannot resolve without an import map.
+There wasn't one. That threw `TypeError: Failed to resolve module
+specifier "three"` at module-graph-resolution time, which aborted the
+entire `<script type="module">` block before a single line of it ran --
+not just the 3D view, everything: sliders, buttons, the boot sequence,
+all of it. This is invisible to a Node-based harness that stubs Three.js
+entirely (as every harness in this project has, including the two used
+to verify the redesign above), since stubbing THREE means the real
+module specifier resolution never happens at all.
+
+Fixed with a `<script type="importmap">` mapping the bare specifier
+`"three"` to the pinned jsdelivr URL, added before the module script
+(import maps must precede any module script that depends on them), and
+switched this page's own `import * as THREE from 'three'` to match.
+Verified by serving `docs/` from a local static server and re-running
+the same headless-Chrome check: no page errors, a real `<canvas>`
+renders inside the viewport, and a screenshot confirms the reconstructed
+trajectory actually draws. This is the first time this page's Three.js
+integration has been checked in an actual browser rather than a stubbed
+harness -- worth remembering next time a DESIGN.md entry says
+"unverified pending a real look": it means exactly that, and it should
+get one before, not after, it ships.
+
 ## Local web app (`webapp/`)
 
 The one thing `demo/csa_demo.html` (the WASM Artifact) structurally
