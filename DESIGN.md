@@ -1356,6 +1356,147 @@ verification *cannot* cover without a real browser: whether the actual
 WebGL rendering looks right. That's the one part of this change that's
 unverified pending a real look.
 
+### CSA Spatial Lab: honesty-first product redesign
+
+The next ask was a much larger one: a 30-section product brief for an
+"edge-native spatial computing laboratory" aesthetic (not a generic SaaS
+dashboard, not crypto/neon), rebranding the page "CSA Spatial Lab," with
+an explicit, repeated constraint running through every section --
+preserve technical honesty, never fake a progress percentage, never
+invent metadata fields, never claim universal superiority, clearly
+separate synthetic demo data from real benchmark data. The brief also
+named five features as the priority if not everything got built at
+once: "Break the Codec," an "Error Field" heatmap, an "Edge Link
+Simulator," a "Local Trust Boundary" panel, and Real-vs-Synthetic
+badges. Built those five, plus the hero/branding/dominant-viewport
+changes they depend on; explicitly declined to build (not silently
+drop) several other named sections this round -- listed at the end of
+this entry and disclosed directly on the page itself.
+
+**Worker changes -- the part that had to be right before any UI could
+honestly sit on top of it**:
+
+- **Split position/rotation quantization.** The brief asked for
+  separate precision sliders per field. `compress-pose-lossy` already
+  exposes independent `pos_quant_step`/`quat_quant_step` parameters
+  (see "Lossy mode" above); the Worker's `squeeze()` was previously
+  collapsing both to one `quality` value. Now takes `posQuality` and
+  `rotQuality` independently -- each `0` maps to an exact quant step of
+  `1` (not a separate lossless code path) so a user can, for example,
+  keep position exact while quantizing rotation aggressively, or vice
+  versa. Verified with an asymmetric-quality test (position quality 9 /
+  rotation quality 1, then the reverse) confirming the error that grows
+  is actually the field whose slider moved, not both together.
+- **Real per-point error arrays, not just a scalar max.** The existing
+  round-trip verification already computed a single `maxErr` (or
+  `maxPosErr`/`maxQuatErr`) across the whole file. The Error Field view
+  mode needs per-point color, so the same loop that was already walking
+  every row now also fills a `Float32Array` of per-point error and
+  reports it downsampled (same stride as the existing preview
+  downsampling) as `errors` (geo) or `posErrors`/`rotErrors` (pose) --
+  real numbers from the real round-trip, not interpolated or estimated.
+  Mean error (not just max) is now reported too, since a single worst
+  point can make an otherwise-good reconstruction look bad on its own.
+- **Original (pre-quantization) preview alongside the reconstructed
+  one.** `rows` (the parsed original file values) was already sitting
+  in scope; the same downsampling loop now also captures the original
+  coordinates at each sampled index, so the page can toggle between
+  what was fed in and what came back out, point for point, instead of
+  only ever showing the reconstruction.
+- **Real sequential progress stages, not a fabricated percentage.** The
+  Worker now emits non-terminal `postMessage({id, progress: stage})`
+  notifications at the real code checkpoints squeeze() already passes
+  through -- ingest, detect, quantize, encode, pack, verify -- with the
+  general (non-spatial) path skipping quantize/pack since it genuinely
+  has no such stages. Because `Worker.postMessage` from inside the
+  worker is dispatched immediately regardless of whether the worker
+  thread later blocks on a long synchronous WASM call, the main thread
+  really does see "encode" light up and then sit there for the actual
+  duration of a slow compression, not an animated approximation of one.
+- **Real WASM heap size** (`Module.HEAPU8.buffer.byteLength`) now rides
+  along on every result, feeding the status strip's "Memory" reading.
+  Note this does not fix any pre-existing heap growth in
+  `toHeapU8`/`toHeapI32`'s unfreed `_malloc` calls (out of scope for
+  this pass, since it's a WASM-side correctness question, not a UI
+  one) -- the number reported is real, but a real number that may grow
+  across repeated compressions in the current build is itself an
+  honest thing to surface, not something to hide.
+
+**New UI, keyed to the five priority features**:
+
+- **Break the Codec**: nine synthetic pathological generators (noisy
+  GPS, high-frequency rotation, sudden movement, sparse/dense point
+  clouds, sensor jitter, missing samples, irregular sample timing,
+  extreme coordinate range), each with a short explanation of the real
+  mechanism it stresses, run through the actual codec live. One
+  explicit honesty note lives in the "irregular timing" case: this
+  format has no timestamp field to stress (see `FORMAT.md`), so that
+  case instead varies row-to-row step size, named as the closest real
+  analogue rather than silently pretending timestamps exist.
+- **Error Field**: a third viewport mode (alongside Original and
+  Reconstructed) that colors the reconstructed path by the Worker's
+  real per-point error array on a teal-to-red ramp, with a legend
+  showing the actual max value driving the scale -- nothing here is a
+  synthetic gradient, it's the same numbers already in the HUD.
+- **Edge Link Simulator**: extended the existing simulated-transmission
+  race with a custom bitrate field and a "model as packets" toggle. The
+  packetized math (fixed 51-byte payload / 13-byte overhead per packet,
+  a flat 2% retransmit-probability estimate) is declared in the UI copy
+  as a stated assumption, not a live measurement of any real radio --
+  matching the brief's explicit requirement to distinguish estimation
+  from measurement.
+- **Local Trust Boundary**: a static pipeline diagram (Internet /
+  Server / Upload all marked "NOT REQUIRED") plus a network-status chip
+  driven by the browser's real `navigator.onLine` and `online`/`offline`
+  events, with copy inviting the reader to disconnect their network and
+  re-run the compression above to check the claim themselves.
+- **Real-vs-Synthetic badges + Research Benchmarks section**: a "live
+  browser demo, synthetic" badge next to the hero stat, and a new
+  section citing the actual figures already measured and written up in
+  `REAL_POSE_BENCHMARK.md`/`REAL_GEO_BENCHMARK.md`/
+  `ADVERSARIAL_BENCHMARK.md` (EuRoC/TUM/KITTI pose margins, the real
+  693,895-point LiDAR scan vs. LASzip and Draco), pulled from those
+  files rather than re-derived or approximated for the page. A paired
+  "Where This Fits" / "Where CSA loses -- honestly" section states the
+  LASzip and zstd-on-source-code losses as plainly as the wins,
+  pointing back to `WHY_NOT_ZSTD.md`.
+
+**Explicitly not built this round, disclosed on the page itself rather
+than silently dropped**: replay mode with variable playback speed, a
+side-by-side raw-vs-CSA split screen, a guided drag-and-drop
+schema-confirmation flow, a full `.csa` file-structure inspector, a
+dedicated WASM/Worker/render performance-telemetry panel beyond the
+lightweight status strip, a full accessibility and responsive-design
+pass, and an animated/clickable version of the pipeline diagram (it is
+currently a static label).
+
+**Verification**: extended the existing Node/`worker_threads` harness
+(same pattern as the prior rebuild -- a real Worker running the actual
+embedded, base64-decoded source, not a copy) with test cases specific
+to this round's changes: asymmetric position/rotation quality producing
+asymmetric, correctly-directed error; per-point error arrays present
+and aligned with the preview array; original-vs-reconstructed preview
+arrays actually differing under lossy quantization and matching exactly
+under lossless; the six progress stages arriving in the expected order;
+positive WASM memory size on every result. Then went a level further
+than the prior round: a second harness parses the real shipped HTML for
+its actual ids/classes/data-attributes (rather than a hand-duplicated
+list), stubs just enough DOM/Three.js/`Worker` to execute the *entire*
+real page module script end-to-end, and drives it through the boot
+sequence, an Error-mode view switch, a Maximum preset click, and a full
+Break-the-Codec run (confirming the rotation slider correctly disables
+itself for point-cloud-shaped data), plus the Edge Link Simulator's
+packetized custom-bitrate path and the restore-panel filename. That
+harness caught one real bug before it shipped: `updateNetworkChip()`
+ran at module load time and read `engineReady`, but that `let` binding
+was declared later in the file -- a genuine temporal-dead-zone
+`ReferenceError` that would have broken the page on every real load,
+not a test artifact. Fixed by moving the declaration earlier, and the
+full harness passed cleanly afterward. As with the prior round, the one
+thing this cannot cover without a real browser is whether the WebGL
+scene and new layout actually look right -- that remains unverified
+pending a real look.
+
 ## Local web app (`webapp/`)
 
 The one thing `demo/csa_demo.html` (the WASM Artifact) structurally
