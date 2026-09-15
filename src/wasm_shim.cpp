@@ -52,6 +52,28 @@ int32_t* csa_wasm_decompress_pose(const unsigned char* input, size_t input_size,
 }
 
 EMSCRIPTEN_KEEPALIVE
+unsigned char* csa_wasm_compress_geo2d(const int32_t* xy, size_t count, size_t* out_size) {
+    csa_buffer b = csa_compress_geo2d(xy, count);
+    *out_size = b.size;
+    return b.data;
+}
+
+EMSCRIPTEN_KEEPALIVE
+unsigned char* csa_wasm_compress_geo2d_lossy(const int32_t* xy, size_t count,
+                                              uint32_t quant_step, uint32_t resync_interval,
+                                              size_t* out_size) {
+    csa_buffer b = csa_compress_geo2d_lossy(xy, count, quant_step, resync_interval);
+    *out_size = b.size;
+    return b.data;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int32_t* csa_wasm_decompress_geo2d(const unsigned char* input, size_t input_size, size_t* out_count) {
+    csa_buffer b = csa_decompress_geo2d(input, input_size, out_count);
+    return (int32_t*)b.data;
+}
+
+EMSCRIPTEN_KEEPALIVE
 unsigned char* csa_wasm_compress_geo3d(const int32_t* xyz, size_t count, size_t* out_size) {
     csa_buffer b = csa_compress_geo3d(xyz, count);
     *out_size = b.size;

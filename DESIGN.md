@@ -1218,6 +1218,50 @@ Every explicit command from before this addition is unchanged and still
 exists for pipelines/scripts that already know their data's shape and
 want to name the scale themselves rather than have it detected.
 
+## Zero-backend browser app (`browser-app/`)
+
+`webapp/` (below) is real, but needs Python/Flask running locally --
+not something a stranger with a link can use. `browser-app/index.html`
+is the version built for that: a single self-contained static HTML file
+(the compiled WASM core inlined, same as `demo/csa_demo.html`) with no
+server at all, so it can be hosted anywhere plain files are served
+(GitHub Pages, Netlify, a plain `python -m http.server`) and, unlike the
+Artifact demo, isn't sandboxed -- real drag-and-drop, real
+`<a download>`, real files in and out, entirely client-side.
+
+The one piece of logic that had to move: `squeeze`/`unsqueeze`'s
+sniffing/auto-scale/round-trip-verify algorithm lives only in
+`cli/main.cpp`, which doesn't run in a browser. `browser-app/index.html`
+re-implements it in JS (`sniffTable`/`safeScale`/`qualityToQuantStep`),
+deliberately mirroring `cli/main.cpp`'s algorithm line-for-line rather
+than approximating it, plus the tiny `CSAG`-header framing
+(`write_geo_header`/`write_pose_header` in the CLI) so files this page
+produces are byte-compatible with ones the CLI/`webapp/` produce, and
+vice versa. Required adding real WASM exports for `compress_geo2d`(`_lossy`)
+(the CLI's `squeeze` needed it; the earlier WASM build only had
+geo3d/pose/general) -- verified correct via Node against the real module
+before being wired into anything (`csa_wasm_compress_geo2d` round-tripped
+a synthetic 2D trajectory correctly at 8/32 scale/quant settings).
+
+**Verified before being trusted, not just read through**: extracted the
+actual `squeeze`/`unsqueeze` functions from the shipped HTML file (not a
+copy) and ran them against the real compiled WASM module in Node,
+against all three shapes plus general -- pose (500 rows, 87.9% smaller,
+lossless, max error 0), geo3d lossy at quality 5 (97.1% smaller, measured
+error 0.00381), geo2d (95.5% smaller, lossless), and general text
+(byte-identical). Then, matching the same discipline used for `webapp/`,
+did a *numeric* comparison (not byte-for-byte, since `unsqueeze` always
+writes 9 decimal digits) of a squeezed-then-unsqueezed pose sample against
+the original: max error 5e-6, exactly the rounding tolerance the
+auto-picked scale implies -- a real, checked fact, not an assumption
+carried over from the CLI's own tests.
+
+**Not hosted anywhere yet.** Tested by serving the plain file locally
+(`python -m http.server` from `browser-app/`, or just opening it
+directly) -- publishing it somewhere with a real URL is the same kind of
+deliberate, separate decision as `webapp/`'s hosting question, not
+something to do silently.
+
 ## Local web app (`webapp/`)
 
 The one thing `demo/csa_demo.html` (the WASM Artifact) structurally
