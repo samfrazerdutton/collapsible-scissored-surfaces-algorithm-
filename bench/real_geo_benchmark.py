@@ -24,6 +24,18 @@ import struct
 import subprocess
 import sys
 
+try:
+    import zstandard
+    HAVE_ZSTD = True
+except ImportError:
+    HAVE_ZSTD = False
+
+try:
+    import brotli
+    HAVE_BROTLI = True
+except ImportError:
+    HAVE_BROTLI = False
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(HERE)
 SCISSORC = os.path.join(REPO_ROOT, "build", "scissorc.exe" if os.name == "nt" else "scissorc")
@@ -106,11 +118,16 @@ def main():
     raw_packed_size = len(packed)
     print(f"raw packed (4-byte int/axis): {raw_packed_size} bytes")
 
-    for name, comp in [
+    codecs = [
         ("gzip -9", gzip.compress(packed, compresslevel=9)),
         ("bz2 -9", bz2.compress(packed, compresslevel=9)),
         ("lzma -9", lzma.compress(packed, preset=9)),
-    ]:
+    ]
+    if HAVE_ZSTD:
+        codecs.append(("zstd -19", zstandard.ZstdCompressor(level=19).compress(packed)))
+    if HAVE_BROTLI:
+        codecs.append(("brotli -11", brotli.compress(packed, quality=11)))
+    for name, comp in codecs:
         pct = 100.0 * (1 - len(comp) / raw_packed_size)
         print(f"{name}: {len(comp)} bytes ({pct:.1f}% smaller than raw packed)")
 

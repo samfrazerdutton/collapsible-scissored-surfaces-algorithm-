@@ -40,6 +40,18 @@ import os
 import subprocess
 import sys
 
+try:
+    import zstandard
+    HAVE_ZSTD = True
+except ImportError:
+    HAVE_ZSTD = False
+
+try:
+    import brotli
+    HAVE_BROTLI = True
+except ImportError:
+    HAVE_BROTLI = False
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(HERE)
 SCISSORC = os.path.join(REPO_ROOT, "build", "scissorc.exe" if os.name == "nt" else "scissorc")
@@ -154,11 +166,16 @@ def run(*args):
 
 
 def compress_general(data_bytes):
-    return {
+    out = {
         "gzip -9": len(gzip.compress(data_bytes, 9)),
         "bz2 -9": len(bz2.compress(data_bytes, 9)),
         "lzma -9": len(lzma.compress(data_bytes, preset=9)),
     }
+    if HAVE_ZSTD:
+        out["zstd -19"] = len(zstandard.ZstdCompressor(level=19).compress(data_bytes))
+    if HAVE_BROTLI:
+        out["brotli -11"] = len(brotli.compress(data_bytes, quality=11))
+    return out
 
 
 def pack_binary(poses):

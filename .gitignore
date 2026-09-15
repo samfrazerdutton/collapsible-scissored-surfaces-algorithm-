@@ -1,4 +1,5 @@
 build/
+build_wasm/
 bench/datasets/
 bench/datasets_real/
 bench/_tmp/

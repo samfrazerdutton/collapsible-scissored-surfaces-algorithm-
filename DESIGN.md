@@ -1088,6 +1088,48 @@ parallel) is the logical next step, following the same
 validate-correctness-before-trusting-timing discipline used for the
 Quaternion Joint calibration kernel above -- not yet done.
 
+## In-browser demo (`demo/csa_demo.html`, `src/wasm_shim.cpp`)
+
+The actual C++ core (range coder, Pantograph Lift, Rod-Joint/Quaternion
+Joint transforms, LZ/BWT candidates, interleaved rANS -- everything
+`compress()`/`compress_pose()`/`compress_geo3d()` use) compiles directly
+to WebAssembly via Emscripten (`em++`, CPU-only: `pantograph_lift_cuda_stub.cpp`
+takes the place of the real CUDA kernel, since there is no GPU in a
+browser tab). `src/wasm_shim.cpp` is a thin re-export of `csa_capi.h`'s
+functions with one change: every `csa_buffer`-by-value return becomes an
+explicit `(pointer, out-size-param)` pair, because Emscripten lowers a
+struct-by-value C return into a hidden pointer parameter that JS's
+`cwrap`/`ccall` have no way to know about. `demo/csa_demo.html` embeds
+the compiled module (`-s SINGLE_FILE=1` inlines the wasm binary as base64
+directly in the JS, so the whole page is one self-contained file) plus
+three real sample datasets (a KITTI vehicle trajectory, a synthetic
+LiDAR ring scan, a slice of real C++ source) and runs the actual codec
+against them live, client-side, alongside the browser's native
+`CompressionStream('gzip')` as a live baseline.
+
+**One real correctness bug this surfaced, fixed, and worth recording**:
+`rans_coder.cpp`'s lane parallelism uses `std::thread`, which links fine
+under Emscripten without `-pthread` but *aborts at runtime* the moment a
+thread actually tries to start -- `-pthread` requires SharedArrayBuffer,
+which requires cross-origin-isolation response headers this hosted page
+doesn't control. Every other module in this codec is single-threaded
+C++ with no such dependency, so this was the one place the WASM port
+wasn't a free recompile. Fixed with a `run_lanes()` helper
+(`src/rans_coder.cpp`) that keeps genuine `std::thread` parallelism on
+every native target and only falls back to a plain sequential loop when
+`__EMSCRIPTEN__` is defined without `__EMSCRIPTEN_PTHREADS__` -- verified
+by rebuilding and re-running the full native test suite afterward (1619
+checks, unchanged) to confirm the guard is truly a no-op off-WASM. The
+practical honest consequence: the demo's rANS panel proves correctness
+at every lane count live, in-browser, but not the ~2.3x/2.79x (4 lanes)
+and ~2.32x/3.65x (8 lanes) encode/decode speedup already measured on the
+native desktop build above -- the page says so directly rather than
+implying a speedup that isn't actually happening in that tab.
+
+Not yet done: a GPU-in-browser path (WebGPU compute for, e.g., the
+interleaved rANS decode) -- a real further step, not attempted this
+round.
+
 ## Honest limitations / future work
 
 - **A CPU-vs-GPU crossover past this GPU's ~256M-element practical VRAM

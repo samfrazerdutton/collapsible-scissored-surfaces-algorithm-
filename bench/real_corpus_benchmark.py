@@ -179,8 +179,16 @@ def main():
             "not skipped: it's cheap enough since switching to a linear-time suffix-array construction "
             "(see DESIGN.md) to run unconditionally at this size, but it still doesn't win on real "
             "source code specifically -- LZ's exact-repeat matching simply covers this corpus's "
-            "redundancy better.) Closing this specific gap needs the other named future work item, "
-            "optimal cost-based LZ parsing.\n"
+            "redundancy better.) A real, carefully-implemented DP-based optimal-parsing pass was "
+            "actually built and measured against this exact corpus -- and reverted, because it never "
+            "won: byte-identical output to the plain lazy parse at 2.4x the compress time (see "
+            "DESIGN.md's \"Optimal (cost-based) LZ parsing\" section for the full postmortem, including "
+            "a real ~13x performance bug found and fixed along the way before that measurement was even "
+            "possible). So closing this gap isn't a matter of adding optimal parsing -- that specific "
+            "idea was tried and didn't pay off. What's actually missing is a cost model with some "
+            "source of information genuinely independent of the parse it's evaluating (e.g. real "
+            "simulated adaptive-coder state, not a static proxy derived from the lazy parser's own "
+            "output statistics), which remains open future work, not a known fix waiting to be applied.\n"
         )
     if faster_than_lzma:
         fastest_beating_gzip_and_bz2 = next(
@@ -217,10 +225,10 @@ def main():
                     f"bytes, {gap:.1f}% smaller, in {zstd_high['time']:.2f}s vs CSA's "
                     f"{csa_best['compress_time']:.2f}s -- {speed_ratio:.1f}x faster). That's the honest "
                     "measure of the actual gap to a modern production compressor: not just ratio, but "
-                    "the whole speed/ratio curve simultaneously. Closing it needs the things "
-                    "DESIGN.md's future work already names (optimal parsing, a smarter match finder) "
-                    "plus real performance engineering zstd has had years of -- not a claim this "
-                    "project makes.\n"
+                    "the whole speed/ratio curve simultaneously. Closing it needs a smarter match finder "
+                    "and a genuinely independent cost model for parse decisions (optimal-parsing itself "
+                    "was tried and reverted -- see the postmortem above), plus real performance "
+                    "engineering zstd has had years of -- not a claim this project makes.\n"
                 )
 
     out_path = os.path.join(ROOT, "REAL_CORPUS_BENCHMARK.md")

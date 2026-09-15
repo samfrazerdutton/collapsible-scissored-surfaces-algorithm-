@@ -15,8 +15,11 @@ LiDAR or Google's Encoded Polyline format is for 2D GPS traces -- 6-DOF
 tracking data is usually stored as plain CSV/text (as the three real
 datasets below are, straight from their original sources) and compressed
 generically if at all. That absence is itself part of why this is a
-less-contested niche; general-purpose compressors (gzip/bz2/lzma) are the
-only fair reference available, so that's what this file compares against.
+less-contested niche; general-purpose compressors are the only fair
+reference available, so that's what this file compares against --
+gzip/bz2/lzma as the textbook trio, plus zstd and brotli as what "the
+market" actually reaches for today (see `REAL_CORPUS_BENCHMARK.md`'s
+docstring for why those two specifically).
 
 ## Data provenance (read this before trusting the numbers)
 
@@ -72,6 +75,8 @@ representative setting (`--pos-quant 8 --pos-resync 64 --quat-quant 32
 | gzip -9 | 365,071 | 21.9% smaller |
 | bz2 -9 | 350,970 | 25.0% smaller |
 | lzma -9 | 230,840 | 50.6% smaller |
+| zstd -19 | 355,126 | 24.1% smaller |
+| brotli -11 | 236,010 | 49.5% smaller |
 | **CSA `compress-pose`** | **146,999** | **68.6% smaller** |
 | CSA `compress-pose-lossy` | 65,514 | 86.0% smaller (max pos err 9.4e-5, max orientation-component err 1.6e-5) |
 
@@ -86,6 +91,8 @@ Orientation's share of the full pose blob: 83,600 bytes.
 | gzip -9 | 324,979 | 44.6% smaller |
 | bz2 -9 | 309,731 | 47.2% smaller |
 | lzma -9 | 223,080 | 62.0% smaller |
+| zstd -19 | 305,723 | 47.9% smaller |
+| brotli -11 | 220,848 | 62.4% smaller |
 | **CSA `compress-pose`** | **212,162** | **63.8% smaller** |
 | CSA `compress-pose-lossy` | 134,956 | 77.0% smaller (max pos err 7.4e-5, max orientation-component err 1.6e-5) |
 
@@ -99,6 +106,8 @@ Position-only: 90,276 bytes. Orientation's share: 121,886 bytes.
 | gzip -9 | 107,288 | 15.6% smaller |
 | bz2 -9 | 109,382 | 14.0% smaller |
 | lzma -9 | 78,332 | 38.4% smaller |
+| zstd -19 | 104,701 | 17.7% smaller |
+| brotli -11 | 85,991 | 32.4% smaller |
 | **CSA `compress-pose`** | **72,093** | **43.3% smaller** |
 | CSA `compress-pose-lossy` | 50,127 | 60.6% smaller (max pos err 7.7e-5, max orientation-component err 1.6e-5) |
 
@@ -106,10 +115,16 @@ Position-only: 36,269 bytes. Orientation's share: 35,824 bytes.
 
 ## Honest verdict
 
-- **CSA beats lzma -9 -- the strongest general-purpose reference tested
-  -- on all three real trajectories**, not just the one it was designed
-  around: 36.3% smaller on the drone flight, 4.9% smaller on the
-  handheld camera, 8.0% smaller on the vehicle drive. This is a real,
+- **CSA beats the strongest of five real general-purpose compressors
+  tested (gzip/bz2/lzma/zstd/brotli) on all three real trajectories**,
+  not just the one it was designed around: 36.3% smaller than lzma -9 on
+  the drone flight, 3.9% smaller than brotli -11 (the strongest reference
+  on this dataset specifically -- brotli edges out lzma here by a hair)
+  on the handheld camera, 8.0% smaller than lzma -9 on the vehicle drive.
+  Notably, CSA's margin holds even against brotli -11 and zstd -19 at
+  their *maximum* quality settings, not just their defaults -- these are
+  real modern production codecs (Chrome/CDNs and Meta/Linux/Btrfs
+  respectively), not strawmen. This is a real,
   consistent (if not equally large) win across three genuinely different
   kinds of real 6-DOF motion, not a single cherry-picked case -- the
   closest this project has come to validating the "less-contested niche"

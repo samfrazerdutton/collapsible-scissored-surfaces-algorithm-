@@ -121,6 +121,26 @@ std::vector<u8> rans_decode_lane(const u8* data, size_t n_symbols, const RansTab
     return out;
 }
 
+// Runs fn(0..num_lanes-1), one call per lane. On every native target this
+// is genuine std::thread parallelism (the whole point of the lane
+// design). Under Emscripten without -pthread -- e.g. this project's
+// browser demo, built to avoid the cross-origin-isolation headers real
+// WASM threads require -- std::thread can link but aborts at runtime the
+// moment a thread actually tries to start, so that configuration falls
+// back to a plain sequential loop instead. Native builds never take that
+// branch; the real measured thread speedup (DESIGN.md) is unaffected.
+template <typename Fn>
+void run_lanes(int num_lanes, Fn&& fn) {
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+    for (int i = 0; i < num_lanes; i++) fn(i);
+#else
+    std::vector<std::thread> threads;
+    threads.reserve((size_t)num_lanes);
+    for (int i = 0; i < num_lanes; i++) threads.emplace_back(fn, i);
+    for (auto& th : threads) th.join();
+#endif
+}
+
 } // namespace
 
 std::vector<u8> encode_interleaved_rans(const std::vector<u8>& data, int num_lanes, int scale_bits) {
@@ -152,17 +172,10 @@ std::vector<u8> encode_interleaved_rans(const std::vector<u8>& data, int num_lan
         lane_starts[i + 1] = lane_starts[i] + base + ((size_t)i < rem ? 1 : 0);
 
     std::vector<std::vector<u8>> lane_out((size_t)num_lanes);
-    {
-        std::vector<std::thread> threads;
-        threads.reserve((size_t)num_lanes);
-        for (int i = 0; i < num_lanes; i++) {
-            threads.emplace_back([&, i]() {
-                size_t s = lane_starts[i], e = lane_starts[i + 1];
-                lane_out[i] = rans_encode_lane(data.data() + s, e - s, table);
-            });
-        }
-        for (auto& th : threads) th.join();
-    }
+    run_lanes(num_lanes, [&](int i) {
+        size_t s = lane_starts[i], e = lane_starts[i + 1];
+        lane_out[i] = rans_encode_lane(data.data() + s, e - s, table);
+    });
 
     for (int i = 0; i < num_lanes; i++) {
         put_u64(out, lane_starts[i + 1] - lane_starts[i]);
@@ -199,18 +212,11 @@ std::vector<u8> decode_interleaved_rans(const std::vector<u8>& blob) {
     if (out_offset != (size_t)total_len) throw std::runtime_error("csa: interleaved-rans lane lengths don't sum to total_len");
 
     std::vector<u8> out(total_len);
-    {
-        std::vector<std::thread> threads;
-        threads.reserve(num_lanes);
-        for (u32 i = 0; i < num_lanes; i++) {
-            threads.emplace_back([&, i]() {
-                if (lane_symcount[i] == 0) return;
-                std::vector<u8> lane_result = rans_decode_lane(blob.data() + lane_byteoffset[i], lane_symcount[i], table);
-                std::copy(lane_result.begin(), lane_result.end(), out.begin() + (std::ptrdiff_t)lane_out_offset[i]);
-            });
-        }
-        for (auto& th : threads) th.join();
-    }
+    run_lanes((int)num_lanes, [&](int i) {
+        if (lane_symcount[i] == 0) return;
+        std::vector<u8> lane_result = rans_decode_lane(blob.data() + lane_byteoffset[i], lane_symcount[i], table);
+        std::copy(lane_result.begin(), lane_result.end(), out.begin() + (std::ptrdiff_t)lane_out_offset[i]);
+    });
     return out;
 }
 

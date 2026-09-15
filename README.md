@@ -1,5 +1,13 @@
 # Collapsible Scissored Surfaces Algorithm (CSA)
 
+**[Live in-browser demo](https://claude.ai/artifact/GpJeaG3pwRzfVGW65bKxWq)** --
+the actual C++ core compiled to WebAssembly, compressing a real KITTI
+vehicle trajectory, a synthetic LiDAR ring scan, and a real source-code
+byte stream live, client-side, against a live gzip baseline. See
+`DESIGN.md`'s "In-browser demo" section for how it's built and what it
+does and doesn't prove (single-threaded WASM; the real multi-thread
+rANS speedup is the native-build measurement below, not this tab's).
+
 A lossless compression codec built directly from a mechanical-metamaterials
 idea: Harvard SEAS's "pantograph lattices" -- networks of scissor-jointed
 rods that collapse into a compact line and deploy into helical, toroidal,
