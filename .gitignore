@@ -17,3 +17,4 @@ bindings/csharp/**/bin/
 bindings/csharp/**/obj/
 bindings/go/**/*.exe
 .claude/worktrees/
+webapp/*.log

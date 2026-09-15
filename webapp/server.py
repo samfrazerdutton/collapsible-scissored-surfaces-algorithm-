@@ -14,6 +14,19 @@ server just shells out to the already-built scissorc binary and relays
 its own stdout report and output file back to the browser -- so there is
 no second implementation of that logic anywhere to drift out of sync.
 
+Two things this file adds on top of that report, because a bare
+percentage number with nothing to compare it to isn't actually
+informative, and this codec's real edge (structured position/orientation
+data) is invisible if the first file anyone tries is a PDF:
+  - a live gzip -9 size on the same input, computed with the stdlib's own
+    zlib, so "smaller" has a real baseline instead of just a percentage;
+  - synthetic sample datasets (a pose trajectory, a point cloud, a GPS
+    track) generated on request, so the first thing someone can click
+    shows the domain this codec is actually built for -- see
+    DESIGN.md/REAL_POSE_BENCHMARK.md for why that's the honest framing:
+    general files like a PDF are NOT this codec's specialty, and pretending
+    otherwise with a good number on the wrong kind of file is misleading.
+
 Run:
     pip install -r requirements.txt
     python server.py [--scissorc PATH] [--port 8000]
@@ -23,7 +36,9 @@ Not deployed anywhere -- this only runs locally until a hosting decision
 is made deliberately (see DESIGN.md's "Local web app" section).
 """
 import argparse
+import gzip
 import json
+import math
 import os
 import subprocess
 import tempfile
@@ -57,6 +72,38 @@ def parse_report(stdout, in_path, in_name, out_path, out_name):
     return {"summary": lines[0] if lines else "", "detail": lines[1:]}
 
 
+def detect_shape(detail_lines):
+    joined = " ".join(detail_lines)
+    for shape in ("geo2d", "geo3d", "pose"):
+        if shape in joined:
+            return shape
+    return "general"
+
+
+def read_preview_points(path, max_points=2000):
+    """Downsamples a squeeze/unsqueeze-restored numeric text file to at
+    most max_points (x, y) pairs (first two columns of whatever shape it
+    is -- geo2d/geo3d/pose all have position first) for a client-side
+    trajectory/scatter plot. Returns [] if the file isn't such a table."""
+    try:
+        with open(path, "r") as f:
+            rows = []
+            for line in f:
+                parts = line.split()
+                if len(parts) < 2:
+                    continue
+                try:
+                    rows.append((float(parts[0]), float(parts[1])))
+                except ValueError:
+                    return []
+    except OSError:
+        return []
+    if not rows:
+        return []
+    stride = max(1, len(rows) // max_points)
+    return rows[::stride]
+
+
 def error_response(message, status=400):
     return Response(json.dumps({"error": message}), status=status, mimetype="application/json")
 
@@ -79,6 +126,10 @@ def api_squeeze():
         f.save(in_path)
         out_path = in_path + ".csa"
 
+        with open(in_path, "rb") as raw_f:
+            raw_bytes = raw_f.read()
+        gzip_size = len(gzip.compress(raw_bytes, compresslevel=9))
+
         args = ["squeeze", in_path, out_path, "--explain", "--force"]
         if quality:
             args += ["--quality", quality]
@@ -97,6 +148,20 @@ def api_squeeze():
             data = out_f.read()
 
         report = parse_report(r.stdout, in_path, in_name, out_path, in_name + ".csa")
+        report["raw_size"] = len(raw_bytes)
+        report["csa_size"] = len(data)
+        report["gzip_size"] = gzip_size
+        shape = detect_shape(report["detail"])
+        report["shape"] = shape
+
+        preview = []
+        if shape in ("geo2d", "geo3d", "pose"):
+            preview_path = out_path + ".preview"
+            pr = run_scissorc("unsqueeze", out_path, preview_path, "--force")
+            if pr.returncode == 0:
+                preview = read_preview_points(preview_path)
+        report["preview"] = preview
+
         resp = Response(data, mimetype="application/octet-stream")
         resp.headers["Content-Disposition"] = f'attachment; filename="{in_name}.csa"'
         resp.headers["X-Csa-Report"] = json.dumps(report)
@@ -136,11 +201,86 @@ def api_unsqueeze():
         download_name = in_name[:-4] if in_name.lower().endswith(".csa") else in_name + ".restored"
 
         report = parse_report(r.stdout, in_path, in_name, out_path, download_name)
+        report["shape"] = detect_shape(report["detail"])
+        report["preview"] = read_preview_points(out_path) if report["shape"] != "general" else []
+
         resp = Response(data, mimetype="application/octet-stream")
         resp.headers["Content-Disposition"] = f'attachment; filename="{download_name}"'
         resp.headers["X-Csa-Report"] = json.dumps(report)
         resp.headers["Access-Control-Expose-Headers"] = "X-Csa-Report, Content-Disposition"
         return resp
+
+
+# ---- sample datasets: the actual point of this codec, one click away ----
+# Synthetic, not real recordings (real ones live under bench/_thirdparty/,
+# gitignored for size and fetched on demand -- see bench/*.py) -- but the
+# same shape class as the real KITTI/EuRoC pose data and the real LiDAR
+# ring benchmark already measured elsewhere in this repo, so the ratios
+# shown here land in the same neighborhood as the honestly-measured real
+# numbers in REAL_POSE_BENCHMARK.md/REAL_GEO_BENCHMARK.md, not inflated.
+def make_pose_sample(n=2000):
+    lines = []
+    qw, qz = 1.0, 0.0
+    z = 0.0
+    seed = 4242
+    def rnd():
+        nonlocal seed
+        seed = (seed * 1664525 + 1013904223) & 0xFFFFFFFF
+        return (seed >> 8) / float(1 << 24)
+    for i in range(n):
+        t = i * 0.05
+        x = 2000 * math.cos(t)
+        y = 2000 * math.sin(t)
+        z += 4.0 + (rnd() - 0.5) * 0.5
+        lines.append(f"{x:.6f} {y:.6f} {z:.6f} {qw:.6f} 0.000000 0.000000 {qz:.6f}")
+        deg = 2.0 + (rnd() - 0.5) * 0.3
+        half = math.radians(deg) / 2
+        dqw, dqz = math.cos(half), math.sin(half)
+        qw, qz = qw * dqw - qz * dqz, qw * dqz + qz * dqw
+    return ("\n".join(lines) + "\n").encode(), "sample_drone_pose_trajectory.txt"
+
+
+def make_points_sample(n=1800):
+    lines = []
+    for i in range(n):
+        a = i * (2 * math.pi / 60)
+        r = 3000 - (i / n) * 8
+        x = r * math.cos(a)
+        y = r * math.sin(a)
+        z = -4.0 + 0.5 * math.sin(a * 3)
+        lines.append(f"{x:.6f} {y:.6f} {z:.6f}")
+    return ("\n".join(lines) + "\n").encode(), "sample_lidar_ring_scan.txt"
+
+
+def make_gps_sample(n=1500):
+    lines = []
+    lat, lon = 37.7749, -122.4194
+    seed = 99
+    def rnd():
+        nonlocal seed
+        seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
+        return (seed / float(0x7FFFFFFF)) - 0.5
+    heading = 0.0
+    for _ in range(n):
+        heading += rnd() * 0.15
+        lat += math.cos(heading) * 0.00003
+        lon += math.sin(heading) * 0.00003
+        lines.append(f"{lat:.6f} {lon:.6f}")
+    return ("\n".join(lines) + "\n").encode(), "sample_gps_walk.txt"
+
+
+SAMPLES = {"pose": make_pose_sample, "points": make_points_sample, "gps": make_gps_sample}
+
+
+@app.route("/api/sample/<name>")
+def api_sample(name):
+    gen = SAMPLES.get(name)
+    if not gen:
+        return error_response(f"unknown sample: {name}", 404)
+    data, filename = gen()
+    resp = Response(data, mimetype="text/plain")
+    resp.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+    return resp
 
 
 if __name__ == "__main__":

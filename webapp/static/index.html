@@ -8,7 +8,7 @@
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
 <style>
   :root {
-    --bg: #f3f5f7; --surface: #ffffff; --surface-2: #eef1f4; --border: #d7dee4;
+    --bg: #f3f5f7; --surface: #ffffff; --surface-2: #eef1f4; --scope: #0d1218; --border: #d7dee4;
     --text: #16202b; --text-dim: #576775; --accent: #1c8fa3; --accent-2: #a8641a;
     --good: #2f9e5b; --bad: #c94f43;
     --font-display: 'IBM Plex Sans', system-ui, sans-serif;
@@ -16,20 +16,29 @@
   }
   @media (prefers-color-scheme: dark) {
     :root {
-      --bg: #0b0f14; --surface: #121821; --surface-2: #1a222d; --border: #26313d;
+      --bg: #0b0f14; --surface: #121821; --surface-2: #1a222d; --scope: #060a0e; --border: #26313d;
       --text: #e7edf3; --text-dim: #8fa0b0; --accent: #5ec8d8; --accent-2: #e8a34d;
       --good: #6fcf97; --bad: #e0857c;
     }
   }
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--text); font-family: var(--font-display); line-height: 1.5; }
-  .wrap { max-width: 720px; margin: 0 auto; padding: 40px 20px 64px; }
+  .wrap { max-width: 760px; margin: 0 auto; padding: 40px 20px 64px; }
   .eyebrow { font-family: var(--font-mono); font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: var(--accent); }
   h1 { font-size: 28px; margin: 4px 0 8px; letter-spacing: -0.01em; }
-  p.thesis { color: var(--text-dim); font-size: 15px; max-width: 60ch; margin: 0 0 28px; }
+  p.thesis { color: var(--text-dim); font-size: 15px; max-width: 62ch; margin: 0 0 20px; }
+
+  .samples { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 24px; }
+  .samples button {
+    font-family: var(--font-display); font-size: 13px; font-weight: 500; color: var(--text);
+    background: var(--surface); border: 1px solid var(--border); border-radius: 20px;
+    padding: 7px 14px; cursor: pointer;
+  }
+  .samples button:hover { border-color: var(--accent); }
+  .samples .label { font-size: 12px; color: var(--text-dim); align-self: center; margin-right: 2px; }
 
   .dropzone {
-    border: 2px dashed var(--border); border-radius: 12px; padding: 40px 20px;
+    border: 2px dashed var(--border); border-radius: 12px; padding: 36px 20px;
     text-align: center; cursor: pointer; background: var(--surface); transition: border-color .15s, background .15s;
   }
   .dropzone.drag { border-color: var(--accent); background: var(--surface-2); }
@@ -56,8 +65,22 @@
 
   .result { display: none; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 18px; margin-top: 16px; }
   .result.show { display: block; }
-  .result .summary { font-size: 15px; font-weight: 600; margin-bottom: 8px; }
+  .result .summary { font-size: 15px; font-weight: 600; margin-bottom: 4px; }
+  .result .not-specialty { font-size: 12.5px; color: var(--accent-2); margin-bottom: 10px; }
   .result .detail { font-family: var(--font-mono); font-size: 12.5px; color: var(--text-dim); white-space: pre-wrap; margin-bottom: 14px; }
+
+  table.sizes { width: 100%; border-collapse: collapse; font-size: 13px; margin-bottom: 14px; }
+  table.sizes td { padding: 6px 4px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+  table.sizes tr:last-child td { border-bottom: none; }
+  .size-label { color: var(--text-dim); white-space: nowrap; padding-right: 10px; width: 1%; }
+  .size-num { font-family: var(--font-mono); text-align: right; white-space: nowrap; width: 1%; padding-left: 10px; font-variant-numeric: tabular-nums; }
+  .size-bar-track { background: var(--surface-2); border-radius: 4px; height: 10px; overflow: hidden; }
+  .size-bar-fill { height: 100%; border-radius: 4px; background: var(--text-dim); }
+  .size-bar-fill.csa { background: var(--accent); }
+
+  .preview-scope { background: var(--scope); border-radius: 8px; margin-bottom: 14px; }
+  .preview-scope canvas { display: block; width: 100%; height: 200px; }
+
   a.download {
     display: inline-block; font-family: var(--font-display); font-weight: 600; font-size: 14px;
     background: var(--good); color: #062a15; border-radius: 8px; padding: 9px 16px; text-decoration: none;
@@ -75,6 +98,13 @@
   <span class="eyebrow">CSA &middot; local tool</span>
   <h1>Squeeze</h1>
   <p class="thesis">Drop any file. It detects whether it's a 2D/3D point trajectory, a 6-DOF pose stream, or just bytes, compresses it accordingly, and verifies the round-trip before handing you the result &mdash; lossless by default.</p>
+
+  <div class="samples">
+    <span class="label">Try a sample:</span>
+    <button data-sample="pose">Drone pose trajectory</button>
+    <button data-sample="points">LiDAR-style point cloud</button>
+    <button data-sample="gps">GPS walk</button>
+  </div>
 
   <div class="dropzone" id="dropzone">
     <div class="big">Drop a file here, or click to choose one</div>
@@ -95,6 +125,9 @@
 
   <div class="result" id="result">
     <div class="summary" id="result-summary"></div>
+    <div class="not-specialty" id="result-not-specialty" style="display:none">This is a general byte stream, not this codec's specialty (structured point/pose data) &mdash; the gzip comparison below is the fair baseline here. Try a sample above to see the real edge.</div>
+    <div class="preview-scope" id="preview-scope" style="display:none"><canvas id="preview-canvas" width="700" height="200"></canvas></div>
+    <table class="sizes" id="sizes-table"></table>
     <div class="detail" id="result-detail"></div>
     <a class="download" id="download-link" href="#">Download</a>
   </div>
@@ -116,7 +149,8 @@
   <footer>
     Runs entirely on this machine &mdash; your file never leaves it. This is a thin front end over
     <code>scissorc squeeze</code>/<code>unsqueeze</code>; see <code>DESIGN.md</code> in the repository
-    for what "quality" actually changes and how the detected shape/scale gets picked.
+    for what "quality" actually changes, how the detected shape/scale gets picked, and honest
+    real-dataset numbers (not the synthetic samples above) in <code>REAL_POSE_BENCHMARK.md</code>.
   </footer>
 </div>
 
@@ -133,8 +167,11 @@ const qualityValue = document.getElementById('quality-value');
 const statusEl = document.getElementById('status');
 const resultEl = document.getElementById('result');
 const resultSummary = document.getElementById('result-summary');
+const resultNotSpecialty = document.getElementById('result-not-specialty');
 const resultDetail = document.getElementById('result-detail');
 const downloadLink = document.getElementById('download-link');
+const previewScope = document.getElementById('preview-scope');
+const sizesTable = document.getElementById('sizes-table');
 
 dropzone.addEventListener('click', () => fileInput.click());
 dropzone.addEventListener('dragover', e => { e.preventDefault(); dropzone.classList.add('drag'); });
@@ -160,7 +197,64 @@ qualitySlider.addEventListener('input', () => {
   qualityValue.textContent = v === 0 ? 'lossless' : `lossy (${v}/9)`;
 });
 
-runBtn.addEventListener('click', async () => {
+document.querySelectorAll('.samples button').forEach(btn => {
+  btn.addEventListener('click', async () => {
+    btn.disabled = true;
+    const name = btn.dataset.sample;
+    try {
+      const resp = await fetch(`/api/sample/${name}`);
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const disposition = resp.headers.get('Content-Disposition') || '';
+      const match = disposition.match(/filename="([^"]+)"/);
+      const filename = match ? match[1] : `${name}.txt`;
+      const blob = await resp.blob();
+      const file = new File([blob], filename, { type: 'text/plain' });
+      setSelectedFile(file);
+      qualitySlider.value = 0;
+      qualityValue.textContent = 'lossless';
+      await runSqueeze();
+    } catch (e) {
+      statusEl.className = 'status err';
+      statusEl.textContent = 'Error loading sample: ' + e.message;
+    } finally {
+      btn.disabled = false;
+    }
+  });
+});
+
+function renderSizes(rawSize, gzipSize, csaSize) {
+  const maxSize = Math.max(rawSize, gzipSize, csaSize, 1);
+  const row = (label, size, cls) => `
+    <tr>
+      <td class="size-label">${label}</td>
+      <td style="width:100%"><div class="size-bar-track"><div class="size-bar-fill ${cls || ''}" style="width:${(100 * size / maxSize).toFixed(1)}%"></div></div></td>
+      <td class="size-num">${size.toLocaleString()} B</td>
+      <td class="size-num" style="color:var(--text-dim)">${size === rawSize ? '' : (100 * (1 - size / rawSize)).toFixed(1) + '% smaller'}</td>
+    </tr>`;
+  sizesTable.innerHTML = row('original', rawSize) + row('gzip -9', gzipSize) + row('CSA squeeze', csaSize, 'csa');
+}
+
+function drawPreview(points) {
+  if (!points || points.length < 2) { previewScope.style.display = 'none'; return; }
+  previewScope.style.display = 'block';
+  const canvas = document.getElementById('preview-canvas');
+  const ctx = canvas.getContext('2d');
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (const [x, y] of points) { minX = Math.min(minX, x); maxX = Math.max(maxX, x); minY = Math.min(minY, y); maxY = Math.max(maxY, y); }
+  const pad = 14;
+  const s = Math.min((w - 2 * pad) / Math.max(1e-9, maxX - minX), (h - 2 * pad) / Math.max(1e-9, maxY - minY));
+  const project = ([x, y]) => [pad + (x - minX) * s, h - pad - (y - minY) * s];
+  const accent = getComputedStyle(document.documentElement).getPropertyValue('--accent').trim();
+  ctx.strokeStyle = accent;
+  ctx.lineWidth = 1.6;
+  ctx.beginPath();
+  points.forEach((p, i) => { const [px, py] = project(p); i === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py); });
+  ctx.stroke();
+}
+
+async function runSqueeze() {
   if (!selectedFile) return;
   runBtn.disabled = true;
   statusEl.className = 'status';
@@ -189,7 +283,10 @@ runBtn.addEventListener('click', async () => {
     downloadLink.href = url;
     downloadLink.download = filename;
     resultSummary.textContent = report.summary;
-    resultDetail.textContent = report.detail.join('\n');
+    resultDetail.textContent = (report.detail || []).join('\n');
+    resultNotSpecialty.style.display = report.shape === 'general' ? 'block' : 'none';
+    renderSizes(report.raw_size, report.gzip_size, report.csa_size);
+    drawPreview(report.preview);
     resultEl.classList.add('show');
     statusEl.textContent = 'Done.';
   } catch (e) {
@@ -198,7 +295,9 @@ runBtn.addEventListener('click', async () => {
   } finally {
     runBtn.disabled = false;
   }
-});
+}
+
+runBtn.addEventListener('click', runSqueeze);
 
 /* ---- restore panel ---- */
 let restoreFile = null;
@@ -241,7 +340,7 @@ restoreBtn.addEventListener('click', async () => {
     restoreDownload.href = url;
     restoreDownload.download = filename;
     restoreSummary.textContent = report.summary;
-    restoreDetail.textContent = report.detail.join('\n');
+    restoreDetail.textContent = (report.detail || []).join('\n');
     restoreResult.classList.add('show');
     restoreStatus.textContent = 'Done.';
   } catch (e) {

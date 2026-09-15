@@ -1250,7 +1250,42 @@ against real files of all three detected shapes (general text, a real
 LiDAR-shaped point file, both lossless and `--quality`-lossy) via
 `curl` directly against the running server before this was called done --
 upload, download, and the restored/lossy file's content checked against
-the original.
+the original (numerically, not byte-for-byte: `unsqueeze` always writes
+9 decimal digits regardless of the source file's own precision, so a
+lossless round-trip's *values* match to the scale's rounding tolerance
+even though the restored text isn't byte-identical to the input -- a
+pre-existing property of `cmd_unsqueeze`, not something this app changed).
+
+**First real usability problem this surfaced and fixed**: the first
+version of this just relayed scissorc's bare text report, so a genuinely
+compressed general file (e.g. a PDF, 87.6% smaller) came back as a flat
+percentage with nothing to compare it to -- and general files aren't
+even this codec's specialty, so a first-time user trying whatever's on
+their desktop got an unremarkable, uncontextualized result and no path
+to the case this codec actually wins big on. Fixed with three real
+additions, not cosmetic ones:
+- **A live gzip -9 baseline**, computed server-side with the stdlib's own
+  `gzip` module on every upload, shown as a real size-comparison bar
+  chart (raw / gzip / CSA) instead of a lone percentage -- so "smaller"
+  always has a number to be smaller *than*.
+- **One-click synthetic sample datasets** (`/api/sample/<pose|points|gps>`,
+  generated server-side, not bundled binary assets) -- a drone-pose
+  spiral, a LiDAR-ring-style point cloud, a GPS walk -- so the first
+  thing anyone can try shows this codec's actual domain instead of
+  requiring them to already have a suitable file lying around. Measured
+  live through the real endpoint before shipping: the pose sample beats
+  gzip by CSA being smaller than gzip's *output*, not just smaller than
+  raw (146,181 -> gzip 55,306 -> CSA 15,355 bytes); the point-cloud sample
+  similarly (61,921 -> gzip 19,577 -> CSA 2,710).
+- **A trajectory/point preview** (a small canvas line plot) whenever the
+  detected shape is geo2d/geo3d/pose, built by having the server run
+  `unsqueeze` on its own freshly-produced output and parsing the restored
+  text back into points -- reusing the existing CLI round-trip rather
+  than adding a second decode path, same "one brain" principle as the
+  rest of this app. A general (non-numeric) upload now also gets an
+  explicit on-page note that it isn't this codec's specialty and the
+  gzip comparison is the fair baseline there, rather than silently
+  implying every file type is an equally strong case.
 
 **Not deployed anywhere.** This only runs locally (`127.0.0.1`) until a
 real hosting decision is made deliberately -- that's a different kind of
