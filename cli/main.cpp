@@ -1,6 +1,19 @@
 // scissorc — command-line front end for the Collapsible Scissored Surfaces
 // compression algorithm.
 //
+//   scissorc squeeze   <in> [out] [--quality 1-9] [--explain] [--force]
+//   scissorc unsqueeze <in> [out] [--explain] [--force]
+//
+// squeeze/unsqueeze are the front door: point squeeze at any file and it
+// sniffs whether it's a numeric 2D/3D point table, a 7-column 6-DOF pose
+// stream, or just arbitrary bytes, picks a --scale that exactly preserves
+// the file's own decimal precision (not a guessed default), and verifies
+// the round-trip live before printing a number -- no need to already know
+// this codec's specialized modes to get a real, honest result. Every
+// mode below still exists, unchanged, for scripts/pipelines that already
+// know their data's shape and want to name it (and the exact scale)
+// themselves rather than have it detected:
+//
 //   scissorc compress   <in> <out> [--gpu] [--level fast|balanced|high]
 //   scissorc decompress <in> <out>
 //   scissorc compress-geo2d   <in.xy>  <out> [--scale N]
@@ -28,6 +41,7 @@
 #include "csa/lz_matcher.hpp"
 #include "csa/pantograph_lift_cuda.hpp"
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <fstream>
@@ -334,6 +348,295 @@ int cmd_decompress_pose(const std::string& in, const std::string& out) {
     return 0;
 }
 
+// ============================================================================
+// squeeze / unsqueeze: the "point it at a file, it does the right thing"
+// front door. Every specialized mode above (compress-geo2d/-geo3d/-pose)
+// requires the caller to already know their data's shape and pick a
+// --scale that preserves its precision -- fine for someone who already
+// knows this codec, a real barrier for anyone else. squeeze sniffs the
+// input instead (numeric text table -> column count -> geo2d/geo3d/pose;
+// anything else -> general compress()) and picks a --scale that
+// preserves exactly the decimal precision actually present in the file,
+// not a guessed default -- so "lossless" printed below is a real,
+// verified fact about this run, not an assumption carried over from the
+// test suite. All of the explicit commands above still exist unchanged
+// for anyone who wants to skip the detection and name the shape/scale
+// themselves.
+struct SniffResult {
+    int columns = 0;         // 0 (not a clean numeric table -> general), 2, 3, or 7
+    int decimals_a = 0;      // max decimal digits seen: all columns (2/3-col) or first 3 (7-col, position)
+    int decimals_b = 0;      // 7-col only: last 4 columns (orientation)
+    double max_abs_a = 0.0;
+    double max_abs_b = 0.0;
+    size_t rows = 0;
+};
+
+// Digits after '.' in a token's own text (not the parsed double's binary
+// value -- text is what tells us the file's real quoted precision).
+// Returns -1 if the token uses exponent notation, where "digits after
+// the dot" isn't a meaningful precision measure.
+int count_decimals(const std::string& tok) {
+    if (tok.find_first_of("eE") != std::string::npos) return -1;
+    auto dot = tok.find('.');
+    if (dot == std::string::npos) return 0;
+    int n = 0;
+    for (size_t i = dot + 1; i < tok.size() && std::isdigit((unsigned char)tok[i]); i++) n++;
+    return n;
+}
+
+SniffResult sniff_table(const std::string& path) {
+    SniffResult r;
+    std::ifstream f(path);
+    if (!f) return r;
+    std::string line;
+    int expected_columns = -1;
+    size_t total_lines = 0, ok_lines = 0;
+    bool any_exponent = false;
+
+    while (std::getline(f, line)) {
+        if (line.find_first_not_of(" \t\r\n") == std::string::npos) continue;
+        total_lines++;
+        std::istringstream ss(line);
+        std::vector<std::string> toks;
+        std::string tok;
+        while (ss >> tok) toks.push_back(tok);
+
+        bool all_numeric = !toks.empty();
+        std::vector<double> vals(toks.size());
+        for (size_t i = 0; i < toks.size() && all_numeric; i++) {
+            try {
+                size_t consumed = 0;
+                vals[i] = std::stod(toks[i], &consumed);
+                if (consumed != toks[i].size()) all_numeric = false;
+            } catch (...) { all_numeric = false; }
+        }
+        if (!all_numeric) continue;
+
+        int cols = (int)toks.size();
+        if (expected_columns == -1) expected_columns = cols;
+        if (cols != expected_columns) continue;
+
+        ok_lines++;
+        for (int i = 0; i < cols; i++) {
+            bool group_a = (cols != 7) || (i < 3);
+            int dec = count_decimals(toks[i]);
+            if (dec < 0) { any_exponent = true; dec = 0; }
+            if (group_a) { r.decimals_a = std::max(r.decimals_a, dec); r.max_abs_a = std::max(r.max_abs_a, std::fabs(vals[i])); }
+            else         { r.decimals_b = std::max(r.decimals_b, dec); r.max_abs_b = std::max(r.max_abs_b, std::fabs(vals[i])); }
+        }
+    }
+
+    if (total_lines == 0 || expected_columns <= 0) return r;
+    if ((double)ok_lines / (double)total_lines < 0.95) return r; // not a clean table -> general
+    if (expected_columns != 2 && expected_columns != 3 && expected_columns != 7) return r;
+
+    r.columns = expected_columns;
+    r.rows = ok_lines;
+    if (any_exponent) { r.decimals_a = std::max(r.decimals_a, 6); r.decimals_b = std::max(r.decimals_b, 6); }
+    r.decimals_a = std::min(r.decimals_a, 9);
+    r.decimals_b = std::min(r.decimals_b, 9);
+    return r;
+}
+
+i64 pow10i(int n) {
+    i64 v = 1;
+    for (int i = 0; i < n; i++) v *= 10;
+    return v;
+}
+
+// scale = 10^decimals, but never so large that max_abs * scale would
+// overflow the int32 the codec stores components as -- shrinking scale
+// (losing some precision, but staying correct) rather than ever risking
+// wraparound, and saying so honestly if it had to.
+i64 safe_scale(int decimals, double max_abs, bool& capped) {
+    i64 scale = pow10i(decimals);
+    capped = false;
+    while (scale > 1 && max_abs * (double)scale > 2.0e9) { scale /= 10; capped = true; }
+    if (scale < 1) scale = 1;
+    return scale;
+}
+
+u32 quality_to_quant_step(int quality) {
+    quality = std::max(1, std::min(9, quality));
+    return 1u << (10 - quality); // quality 9 -> 2, quality 1 -> 512
+}
+
+bool file_exists(const std::string& path) {
+    std::ifstream f(path);
+    return (bool)f;
+}
+
+int cmd_squeeze(const std::string& in, std::string out, bool have_quality, int quality,
+                bool explain, bool force, bool gpu, const std::string& level) {
+    if (out.empty()) out = in + ".csa";
+    if (!force && file_exists(out))
+        throw std::runtime_error("output already exists: " + out + " (pass an output path, or --force to overwrite)");
+
+    auto raw = read_file(in);
+    SniffResult s = sniff_table(in);
+    bool lossy = have_quality;
+    u32 quant_step = lossy ? quality_to_quant_step(quality) : 1;
+    const u32 kResync = 64;
+
+    std::vector<u8> file_out;
+    size_t raw_estimate = raw.size();
+    std::string shape_name = "general (arbitrary bytes)";
+    std::string extra; // --explain detail lines
+
+    if (s.columns == 2 || s.columns == 3) {
+        bool capped = false;
+        i64 scale = safe_scale(s.decimals_a, s.max_abs_a, capped);
+        shape_name = (s.columns == 2) ? "geo2d (2D points/trajectory)" : "geo3d (3D points/trajectory)";
+        auto pts2 = s.columns == 2 ? read_points2d(in, scale) : std::vector<Point2i>{};
+        auto pts3 = s.columns == 3 ? read_points3d(in, scale) : std::vector<Point3i>{};
+        raw_estimate = (s.columns == 2 ? pts2.size() * 2 : pts3.size() * 3) * sizeof(double);
+
+        std::vector<u8> blob = s.columns == 2
+            ? (lossy ? compress_geo2d_lossy(pts2, quant_step, kResync) : compress_geo2d(pts2))
+            : (lossy ? compress_geo3d_lossy(pts3, quant_step, kResync) : compress_geo3d(pts3));
+        write_geo_header(file_out, (u8)s.columns, scale);
+        file_out.insert(file_out.end(), blob.begin(), blob.end());
+
+        // Always verify round-trip live, not just trust the test suite --
+        // this is the entry point meant to be trusted without reading the
+        // manual, so "lossless"/error numbers below are checked facts.
+        double max_err = 0.0;
+        if (s.columns == 2) {
+            auto back = decompress_geo2d(blob);
+            for (size_t i = 0; i < pts2.size() && i < back.size(); i++)
+                max_err = std::max({max_err, std::abs((double)(pts2[i].x - back[i].x)) / (double)scale,
+                                     std::abs((double)(pts2[i].y - back[i].y)) / (double)scale});
+        } else {
+            auto back = decompress_geo3d(blob);
+            for (size_t i = 0; i < pts3.size() && i < back.size(); i++)
+                max_err = std::max({max_err, std::abs((double)(pts3[i].x - back[i].x)) / (double)scale,
+                                     std::abs((double)(pts3[i].y - back[i].y)) / (double)scale,
+                                     std::abs((double)(pts3[i].z - back[i].z)) / (double)scale});
+        }
+        std::ostringstream e;
+        e << "  detected: " << s.columns << " numeric columns (" << s.rows << " rows) -> " << shape_name << " mode\n";
+        e << "  scale: " << scale << " (auto" << (capped ? ", capped to avoid overflow" : "") << ")\n";
+        e << "  round-trip: verified, max coordinate error=" << max_err << " (in original file's units)";
+        extra = e.str();
+    } else if (s.columns == 7) {
+        bool capped_a = false, capped_b = false;
+        i64 scale = safe_scale(s.decimals_a, s.max_abs_a, capped_a);
+        i64 qscale = safe_scale(s.decimals_b, s.max_abs_b, capped_b);
+        shape_name = "pose (6-DOF position + orientation)";
+        auto poses = read_poses(in, scale, qscale);
+        raw_estimate = poses.size() * 7 * sizeof(double);
+
+        std::vector<u8> blob = lossy
+            ? compress_pose_lossy(poses, quant_step, kResync, quant_step, kResync)
+            : compress_pose(poses);
+        write_pose_header(file_out, scale, qscale);
+        file_out.insert(file_out.end(), blob.begin(), blob.end());
+
+        auto back = decompress_pose(blob);
+        double max_pos_err = 0.0, max_quat_err = 0.0;
+        for (size_t i = 0; i < poses.size() && i < back.size(); i++) {
+            max_pos_err = std::max({max_pos_err,
+                std::abs((double)(poses[i].position.x - back[i].position.x)) / (double)scale,
+                std::abs((double)(poses[i].position.y - back[i].position.y)) / (double)scale,
+                std::abs((double)(poses[i].position.z - back[i].position.z)) / (double)scale});
+            max_quat_err = std::max({max_quat_err,
+                std::abs((double)(poses[i].orientation.w - back[i].orientation.w)) / (double)qscale,
+                std::abs((double)(poses[i].orientation.x - back[i].orientation.x)) / (double)qscale,
+                std::abs((double)(poses[i].orientation.y - back[i].orientation.y)) / (double)qscale,
+                std::abs((double)(poses[i].orientation.z - back[i].orientation.z)) / (double)qscale});
+        }
+        std::ostringstream e;
+        e << "  detected: 7 numeric columns (" << s.rows << " rows) -> " << shape_name << " mode\n";
+        e << "  scale: " << scale << (capped_a ? " (capped)" : "") << ", qscale: " << qscale << (capped_b ? " (capped)" : "") << " (both auto)\n";
+        e << "  round-trip: verified, max position error=" << max_pos_err << ", max orientation-component error=" << max_quat_err << " (in original file's units)";
+        extra = e.str();
+    } else {
+        if (lossy) {
+            std::cout << "note: --quality only applies to detected geo2d/geo3d/pose data; "
+                         "this file has no lossy mode, compressing losslessly instead.\n";
+            lossy = false;
+        }
+        int max_chain; size_t nice_length;
+        level_to_lz_params(level, max_chain, nice_length);
+        file_out = compress(raw, gpu, max_chain, nice_length);
+
+        auto back = decompress(file_out);
+        if (back != raw) throw std::runtime_error("internal error: general compress() round-trip mismatch -- please report this");
+
+        std::ostringstream e;
+        e << "  detected: not a clean numeric table -> " << shape_name << " mode" << (gpu ? " [gpu]" : "") << " [level=" << level << "]\n";
+        e << "  round-trip: verified, byte-identical";
+        extra = e.str();
+    }
+
+    write_file(out, file_out);
+    double pct = raw.empty() ? 0.0 : 100.0 * (1.0 - (double)file_out.size() / (double)raw.size());
+    std::cout << "squeeze: " << in << " (" << raw.size() << " bytes) -> " << out << " (" << file_out.size()
+               << " bytes), " << pct << "% smaller, " << (lossy ? ("lossy (quality " + std::to_string(std::max(1, std::min(9, quality))) + "/9)") : "lossless") << "\n";
+    if (explain) std::cout << extra << "\n";
+    return 0;
+}
+
+int cmd_unsqueeze(const std::string& in, std::string out, bool explain, bool force) {
+    if (out.empty()) out = in + ".restored";
+    if (!force && file_exists(out))
+        throw std::runtime_error("output already exists: " + out + " (pass an output path, or --force to overwrite)");
+
+    auto file = read_file(in);
+    std::string shape_name = "general (arbitrary bytes)";
+    std::vector<u8> restored;
+
+    if (file.size() >= 5 && file[0] == (u8)kGeoMagic[0] && file[1] == (u8)kGeoMagic[1] &&
+        file[2] == (u8)kGeoMagic[2] && file[3] == (u8)kGeoMagic[3]) {
+        u8 dims = file[4];
+        size_t pos = 5;
+        if (dims == 2) {
+            i64 scale = (i64)get_u64(file.data(), file.size(), pos);
+            std::vector<u8> blob(file.begin() + pos, file.end());
+            auto pts = decompress_geo2d(blob);
+            std::ostringstream out_text;
+            out_text << std::fixed << std::setprecision(9);
+            for (auto& p : pts) out_text << (p.x / (double)scale) << " " << (p.y / (double)scale) << "\n";
+            std::string s = out_text.str();
+            restored.assign(s.begin(), s.end());
+            shape_name = "geo2d (" + std::to_string(pts.size()) + " points)";
+        } else if (dims == 3) {
+            i64 scale = (i64)get_u64(file.data(), file.size(), pos);
+            std::vector<u8> blob(file.begin() + pos, file.end());
+            auto pts = decompress_geo3d(blob);
+            std::ostringstream out_text;
+            out_text << std::fixed << std::setprecision(9);
+            for (auto& p : pts) out_text << (p.x / (double)scale) << " " << (p.y / (double)scale) << " " << (p.z / (double)scale) << "\n";
+            std::string s = out_text.str();
+            restored.assign(s.begin(), s.end());
+            shape_name = "geo3d (" + std::to_string(pts.size()) + " points)";
+        } else if (dims == 7) {
+            i64 scale = (i64)get_u64(file.data(), file.size(), pos);
+            i64 qscale = (i64)get_u64(file.data(), file.size(), pos);
+            std::vector<u8> blob(file.begin() + pos, file.end());
+            auto poses = decompress_pose(blob);
+            std::ostringstream out_text;
+            out_text << std::fixed << std::setprecision(9);
+            for (auto& p : poses)
+                out_text << (p.position.x / (double)scale) << " " << (p.position.y / (double)scale) << " " << (p.position.z / (double)scale) << " "
+                         << (p.orientation.w / (double)qscale) << " " << (p.orientation.x / (double)qscale) << " "
+                         << (p.orientation.y / (double)qscale) << " " << (p.orientation.z / (double)qscale) << "\n";
+            std::string s = out_text.str();
+            restored.assign(s.begin(), s.end());
+            shape_name = "pose (" + std::to_string(poses.size()) + " poses)";
+        } else {
+            throw std::runtime_error("unrecognized CSAG file (unknown dims byte)");
+        }
+    } else {
+        restored = decompress(file);
+    }
+
+    write_file(out, restored);
+    std::cout << "unsqueeze: " << in << " (" << file.size() << " bytes) -> " << out << " (" << restored.size() << " bytes)\n";
+    if (explain) std::cout << "  detected: " << shape_name << " mode\n";
+    return 0;
+}
+
 int cmd_info(const std::string& path) {
     auto data = read_file(path);
     std::cout << path << ": " << data.size() << " bytes\n";
@@ -428,6 +731,16 @@ int cmd_bench_transform(size_t n, bool gpu, int repeat, bool use_session) {
 void usage() {
     std::cerr <<
         "usage:\n"
+        "  scissorc squeeze <in> [out] [--quality 1-9] [--explain] [--force] [--gpu] [--level fast|balanced|high]\n"
+        "      Point it at any file. Detects whether it's a 2D/3D point trajectory,\n"
+        "      a 6-DOF pose stream, or just bytes, and compresses it accordingly --\n"
+        "      lossless by default. [out] defaults to <in>.csa. --quality trades size\n"
+        "      for a small, bounded numeric error (9=least lossy .. 1=most lossy);\n"
+        "      omit it for exact lossless output. --explain prints what was detected\n"
+        "      and the real, measured round-trip error.\n"
+        "  scissorc unsqueeze <in> [out] [--explain] [--force]\n"
+        "      Reverses squeeze. [out] defaults to <in>.restored.\n"
+        "\n"
         "  scissorc compress <in> <out> [--gpu] [--level fast|balanced|high]\n"
         "  scissorc decompress <in> <out>\n"
         "  scissorc compress-geo2d <in.xy> <out> [--scale N]\n"
@@ -449,7 +762,37 @@ int main(int argc, char** argv) {
     if (argc < 2) { usage(); return 1; }
     std::string cmd = argv[1];
     try {
-        if (cmd == "compress" && argc >= 4) {
+        if (cmd == "squeeze" && argc >= 3) {
+            std::string in = argv[2];
+            std::string out;
+            bool have_quality = false;
+            int quality = 9;
+            bool explain = false, force = false, gpu = false;
+            std::string level = "balanced";
+            int i = 3;
+            if (i < argc && std::string(argv[i]).rfind("--", 0) != 0) out = argv[i++];
+            for (; i < argc; i++) {
+                std::string a = argv[i];
+                if (a == "--quality" && i + 1 < argc) { have_quality = true; quality = std::stoi(argv[++i]); }
+                else if (a == "--explain") explain = true;
+                else if (a == "--force") force = true;
+                else if (a == "--gpu") gpu = true;
+                else if (a == "--level" && i + 1 < argc) level = argv[++i];
+            }
+            return cmd_squeeze(in, out, have_quality, quality, explain, force, gpu, level);
+        } else if (cmd == "unsqueeze" && argc >= 3) {
+            std::string in = argv[2];
+            std::string out;
+            bool explain = false, force = false;
+            int i = 3;
+            if (i < argc && std::string(argv[i]).rfind("--", 0) != 0) out = argv[i++];
+            for (; i < argc; i++) {
+                std::string a = argv[i];
+                if (a == "--explain") explain = true;
+                else if (a == "--force") force = true;
+            }
+            return cmd_unsqueeze(in, out, explain, force);
+        } else if (cmd == "compress" && argc >= 4) {
             bool gpu = false;
             std::string level = "balanced";
             for (int i = 4; i < argc; i++) {

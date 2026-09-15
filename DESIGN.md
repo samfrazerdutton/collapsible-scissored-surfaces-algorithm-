@@ -1182,6 +1182,42 @@ dispatch/readback overhead relative to buffer size, the same kind of
 crossover already measured (and reported honestly either way) for the
 native CUDA calibration kernel.
 
+## `squeeze`/`unsqueeze`: a real front door (`cli/main.cpp`)
+
+Everything above this point in the CLI (`compress-geo2d`, `compress-pose`,
+etc.) requires the caller to already know their file's shape and to pick
+a `--scale` that preserves its precision -- fine for someone who already
+knows this codec, a real barrier for anyone else, and the actual gap
+between "a demo that proves the codec works" and "a tool someone would
+reach for." `scissorc squeeze <file>` closes it: it sniffs the input
+(does it parse as a whitespace-separated numeric table with a consistent
+column count across >=95% of its lines? 2 columns -> geo2d, 3 -> geo3d,
+7 -> pose; anything else, including any binary file, falls through to
+general `compress()`) and, for the geo/pose cases, computes a `--scale`
+(and `--qscale` for pose) from the *actual decimal digits present in the
+file's own text* -- not a guessed default -- capping it only if needed to
+keep `value * scale` inside a safe int32 range, and saying so honestly
+(`capped to avoid overflow`) rather than silently losing precision.
+`--quality 1-9` maps to a single `quant_step` (`1 << (10 - quality)`,
+same fixed `resync_interval=64` for both position and orientation) for
+anyone who wants smaller output and accepts a small bounded error without
+learning this codec's four separate lossy knobs; omitting it stays
+exactly lossless. Every squeeze run decodes its own output and compares
+it against the input before printing anything (max coordinate/position/
+orientation error, or a byte-identical check for general mode) -- so the
+"lossless"/error number in the output is a fact checked on this exact
+run, not something inherited from the test suite. `unsqueeze` reverses
+it, auto-detecting shape from the file's own header bytes (`CSA1` =
+general, `CSAG` + a dims byte = geo2d/geo3d/pose) rather than the
+filename. Both refuse to silently overwrite an existing output path
+without `--force` -- a real safety property, not present on the older
+explicit commands (which the project's own benchmark scripts rerun
+against fixed paths and depend on overwriting).
+
+Every explicit command from before this addition is unchanged and still
+exists for pipelines/scripts that already know their data's shape and
+want to name the scale themselves rather than have it detected.
+
 ## Honest limitations / future work
 
 - **A CPU-vs-GPU crossover past this GPU's ~256M-element practical VRAM

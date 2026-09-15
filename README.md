@@ -162,7 +162,16 @@ dedicated CPU-vs-GPU crossover measurement from 100K to 256M elements
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 
-# Round-trip a file (--level fast|balanced|high trades speed for ratio)
+# Point it at any file -- detects point/pose data vs. plain bytes, picks
+# a lossless scale automatically, verifies the round-trip before it prints
+# a number. This is the front door; see `scissorc squeeze` in DESIGN.md
+# for --quality (bounded lossy) and --explain (what got detected/measured).
+build/scissorc.exe squeeze   input.csv
+build/scissorc.exe unsqueeze input.csv.csa
+
+# The explicit modes below still exist, unchanged, for scripts that
+# already know their data's shape (--level fast|balanced|high trades
+# speed for ratio on general byte streams)
 build/scissorc.exe compress   input.bin  out.csa --level balanced
 build/scissorc.exe decompress out.csa    roundtrip.bin
 
