@@ -368,7 +368,8 @@ struct SniffResult {
     int decimals_b = 0;      // 7-col only: last 4 columns (orientation)
     double max_abs_a = 0.0;
     double max_abs_b = 0.0;
-    size_t rows = 0;
+    size_t rows = 0;         // ok_lines: non-blank lines matching the detected column count
+    size_t total_lines = 0;  // all non-blank lines considered, whether or not they matched
 };
 
 // Digits after '.' in a token's own text (not the parsed double's binary
@@ -426,12 +427,13 @@ SniffResult sniff_table(const std::string& path) {
         }
     }
 
+    r.total_lines = total_lines;
+    r.rows = ok_lines; // set even on the "not classified" paths below, so a caller (inspect) can still report a real match-rate diagnostic
     if (total_lines == 0 || expected_columns <= 0) return r;
     if ((double)ok_lines / (double)total_lines < 0.95) return r; // not a clean table -> general
     if (expected_columns != 2 && expected_columns != 3 && expected_columns != 7) return r;
 
     r.columns = expected_columns;
-    r.rows = ok_lines;
     if (any_exponent) { r.decimals_a = std::max(r.decimals_a, 6); r.decimals_b = std::max(r.decimals_b, 6); }
     r.decimals_a = std::min(r.decimals_a, 9);
     r.decimals_b = std::min(r.decimals_b, 9);
@@ -644,6 +646,146 @@ int cmd_info(const std::string& path) {
     return 0;
 }
 
+const char* mode_name(u8 mode) {
+    switch ((Mode)mode) {
+        case Mode::Raw: return "Raw";
+        case Mode::General: return "General";
+        case Mode::Geo2D: return "Geo2D";
+        case Mode::Geo3D: return "Geo3D";
+        case Mode::GeneralLZ: return "GeneralLZ";
+        case Mode::GeneralBWT: return "GeneralBWT";
+        case Mode::Pose: return "Pose";
+        default: return "unknown";
+    }
+}
+
+// Reports exactly the real, documented fields (FORMAT.md's Layer 2 "CSAG"
+// header and Layer 1 "CSA1" magic+mode byte) -- nothing past the mode byte
+// is decoded here, since the mode-specific payload isn't byte-level
+// specified in FORMAT.md either; inventing a deeper breakdown here would
+// just be guessing. For a file that isn't a recognized .csa at all, falls
+// back to the same sniff_table() squeeze itself uses, so "what would
+// squeeze do with this" is answerable without actually compressing.
+int cmd_inspect(const std::string& path) {
+    auto file = read_file(path);
+    std::cout << "inspect: " << path << " (" << file.size() << " bytes)\n";
+
+    bool has_geo_header = file.size() >= 5 && file[0] == (u8)kGeoMagic[0] && file[1] == (u8)kGeoMagic[1] &&
+                          file[2] == (u8)kGeoMagic[2] && file[3] == (u8)kGeoMagic[3];
+    bool has_csa1_header = !has_geo_header && file.size() >= 5 &&
+                           file[0] == 'C' && file[1] == 'S' && file[2] == 'A' && file[3] == '1';
+
+    if (has_geo_header) {
+        u8 dims = file[4];
+        size_t pos = 5;
+        const char* dims_name = dims == 2 ? "geo2d" : dims == 3 ? "geo3d" : dims == 7 ? "pose" : "unknown";
+        std::cout << "layer 2 (CLI/browser convention): magic=\"CSAG\", dims=" << (int)dims << " (" << dims_name << ")";
+        if (dims == 2 || dims == 3 || dims == 7) {
+            if (file.size() < pos + 8) { std::cout << "\n  TRUNCATED: missing scale field\n"; return 1; }
+            i64 scale = (i64)get_u64(file.data(), file.size(), pos);
+            std::cout << ", scale=" << scale;
+            if (dims == 7) {
+                if (file.size() < pos + 8) { std::cout << "\n  TRUNCATED: missing qscale field\n"; return 1; }
+                i64 qscale = (i64)get_u64(file.data(), file.size(), pos);
+                std::cout << ", qscale=" << qscale;
+            }
+        } else {
+            std::cout << "\n  unrecognized dims byte -- not a value this inspector's Layer 2 knows (2/3/7)\n";
+            return 1;
+        }
+        std::cout << "\n";
+        file.erase(file.begin(), file.begin() + (long)pos);
+        has_csa1_header = file.size() >= 5 && file[0] == 'C' && file[1] == 'S' && file[2] == 'A' && file[3] == '1';
+    }
+
+    if (has_csa1_header) {
+        u8 mode = file[4];
+        std::cout << "layer 1 (library container): magic=\"CSA1\", mode=" << (int)mode << " (" << mode_name(mode) << ")\n";
+        std::cout << "payload: " << (file.size() - 5) << " bytes (mode-specific serialized result; not further decoded by inspect)\n";
+        return 0;
+    }
+    if (has_geo_header) {
+        // had a CSAG header but the remainder wasn't a CSA1 blob -- a real, reportable inconsistency, not silently ignored.
+        std::cout << "  WARNING: CSAG header present but no CSA1 magic follows it -- file may be truncated or corrupted\n";
+        return 1;
+    }
+
+    std::cout << "not a recognized .csa file (no CSAG or CSA1 magic) -- treating as raw squeeze input:\n";
+    SniffResult s = sniff_table(path);
+    if (s.total_lines == 0) {
+        std::cout << "  could not read any non-blank lines from this file\n";
+        return 0;
+    }
+    double confidence = s.total_lines ? 100.0 * (double)s.rows / (double)s.total_lines : 0.0;
+    if (s.columns == 0) {
+        std::cout << "  detected shape: general (arbitrary bytes) -- would fall back to compress()\n";
+        std::cout << "  numeric-table match rate: " << s.rows << " / " << s.total_lines << " lines ("
+                  << std::fixed << std::setprecision(1) << confidence << "% -- below the 95% threshold squeeze() requires)\n";
+        return 0;
+    }
+    const char* shape = s.columns == 2 ? "geo2d" : s.columns == 3 ? "geo3d" : "pose (6-DOF)";
+    std::cout << "  detected shape: " << shape << " (" << s.columns << " numeric columns)\n";
+    std::cout << "  confidence: " << s.rows << " / " << s.total_lines << " lines matched ("
+              << std::fixed << std::setprecision(1) << confidence << "%)\n";
+    std::cout << "  decimal precision: position=" << s.decimals_a << (s.columns == 7 ? ", orientation=" + std::to_string(s.decimals_b) : "") << "\n";
+    std::ostringstream max_abs_line;
+    max_abs_line << std::fixed << std::setprecision(6) << "  max abs value: position=" << s.max_abs_a;
+    if (s.columns == 7) max_abs_line << ", orientation=" << s.max_abs_b;
+    std::cout << max_abs_line.str() << "\n";
+    return 0;
+}
+
+// Structural verification of a .csa file on its own, without the original
+// input to diff against: attempts the same decode `unsqueeze` would, and
+// reports success (with the real decoded record count) or the exact
+// exception the decoder threw. This is NOT the same claim as "matches the
+// original bit-for-bit" -- that already happens automatically inside
+// squeeze() itself (see cmd_squeeze's own round-trip check) and needs the
+// original file, which a standalone .csa doesn't carry. What this can
+// honestly promise: the file decodes without the decoder detecting
+// internal inconsistency -- exactly the guarantee FORMAT.md's own
+// "known gap: no CRC" section describes, no more and no less.
+int cmd_verify(const std::string& path) {
+    auto file = read_file(path);
+    try {
+        if (file.size() >= 5 && file[0] == (u8)kGeoMagic[0] && file[1] == (u8)kGeoMagic[1] &&
+            file[2] == (u8)kGeoMagic[2] && file[3] == (u8)kGeoMagic[3]) {
+            u8 dims = file[4];
+            size_t pos = 5;
+            if (dims == 2) {
+                i64 scale = (i64)get_u64(file.data(), file.size(), pos);
+                (void)scale;
+                std::vector<u8> blob(file.begin() + (long)pos, file.end());
+                auto pts = decompress_geo2d(blob);
+                std::cout << "verify: " << path << " -- OK, decoded geo2d (" << pts.size() << " points), " << file.size() << " bytes\n";
+            } else if (dims == 3) {
+                i64 scale = (i64)get_u64(file.data(), file.size(), pos);
+                (void)scale;
+                std::vector<u8> blob(file.begin() + (long)pos, file.end());
+                auto pts = decompress_geo3d(blob);
+                std::cout << "verify: " << path << " -- OK, decoded geo3d (" << pts.size() << " points), " << file.size() << " bytes\n";
+            } else if (dims == 7) {
+                i64 scale = (i64)get_u64(file.data(), file.size(), pos);
+                i64 qscale = (i64)get_u64(file.data(), file.size(), pos);
+                (void)scale; (void)qscale;
+                std::vector<u8> blob(file.begin() + (long)pos, file.end());
+                auto poses = decompress_pose(blob);
+                std::cout << "verify: " << path << " -- OK, decoded pose (" << poses.size() << " poses), " << file.size() << " bytes\n";
+            } else {
+                std::cout << "verify: " << path << " -- FAILED: unrecognized CSAG dims byte (" << (int)dims << ")\n";
+                return 1;
+            }
+        } else {
+            auto restored = decompress(file);
+            std::cout << "verify: " << path << " -- OK, decoded general (" << restored.size() << " bytes), " << file.size() << " bytes\n";
+        }
+        return 0;
+    } catch (const std::exception& e) {
+        std::cout << "verify: " << path << " -- FAILED: " << e.what() << "\n";
+        return 1;
+    }
+}
+
 // Diagnostic: isolates lz_parse's match-finding time from lz_encode's
 // entropy-coding time, to find out which stage actually dominates a slow
 // compress() call instead of guessing.
@@ -740,6 +882,15 @@ void usage() {
         "      and the real, measured round-trip error.\n"
         "  scissorc unsqueeze <in> [out] [--explain] [--force]\n"
         "      Reverses squeeze. [out] defaults to <in>.restored.\n"
+        "  scissorc inspect <file>\n"
+        "      Reports what squeeze/unsqueeze would actually do with this file --\n"
+        "      the detected shape and confidence for a raw input, or the real\n"
+        "      CSAG/CSA1 header fields (dims, scale, mode) for a .csa file --\n"
+        "      without compressing or decompressing anything.\n"
+        "  scissorc verify <file.csa>\n"
+        "      Attempts to decode a .csa file on its own (no original to diff\n"
+        "      against) and reports success with the decoded record count, or\n"
+        "      the exact decode error. Exit code 1 on failure.\n"
         "\n"
         "  scissorc compress <in> <out> [--gpu] [--level fast|balanced|high]\n"
         "  scissorc decompress <in> <out>\n"
@@ -861,6 +1012,10 @@ int main(int argc, char** argv) {
                                             quat_quant_step, quat_resync_interval);
         } else if (cmd == "info" && argc >= 3) {
             return cmd_info(argv[2]);
+        } else if (cmd == "inspect" && argc >= 3) {
+            return cmd_inspect(argv[2]);
+        } else if (cmd == "verify" && argc >= 3) {
+            return cmd_verify(argv[2]);
         } else if (cmd == "bench-lz" && argc >= 3) {
             return cmd_bench_lz(argv[2]);
         } else if (cmd == "bench-transform" && argc >= 3) {

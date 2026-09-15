@@ -1597,6 +1597,89 @@ a real `<canvas>` renders, and four full-resolution screenshots (hero,
 architecture diagram, developer code window, applications grid) were
 actually looked at before shipping -- not skipped this time.
 
+### Format Inspector, `inspect`/`verify` commands, and Python SDK polish
+
+Following the premium redesign, the next ask was a 114-section platform
+brief (multi-page app routing, a packet-level replay engine, ROI
+calculator, fuzzing infrastructure, ROS2-in-browser, PWA/offline mode,
+cross-language CI gates, and more) framed as turning this project into
+full spatial-data infrastructure. That brief is a real, multi-quarter
+roadmap, not a single-session task, and attempting a shallow pass over
+all of it would have directly violated its own stated core rule: don't
+fake functionality to look complete. Audited the repository first
+(bindings for Python/Rust/Go/C# already real and non-trivial, a real
+ROS2 bridge, a real local webapp shelling out to `scissorc` rather than
+reimplementing its logic, CI already running the C++/Python/CLI matrix)
+and proposed three concretely buildable slices that fit this project's
+actual static-site-plus-native-core architecture, rather than guessing;
+the user picked all three: a real `.csa` format inspector, new CLI
+`inspect`/`verify` subcommands, and Python SDK polish.
+
+**`scissorc inspect <file>` / `scissorc verify <file.csa>`** (`cli/main.cpp`):
+`inspect` reports exactly the fields FORMAT.md documents and nothing
+more -- the real `sniff_table()` heuristic's detected shape and a genuine
+confidence percentage (`ok_lines / total_lines`, which required adding a
+`total_lines` field to the existing `SniffResult` struct, populated on
+every code path including the ones that fall back to "general") for a
+raw input file, or the real CSAG/CSA1 header fields (dims, scale,
+qscale, mode) for an actual `.csa` file. It deliberately does not decode
+past the mode byte, since FORMAT.md itself doesn't specify the
+mode-specific payload layouts -- inventing a deeper breakdown would be
+guessing, which is exactly the failure mode the brief called out by
+name. `verify` attempts the same decode `unsqueeze` does and reports
+success with the real decoded record count, or the decoder's own
+exception message, with exit code 1 on failure -- explicitly documented
+as a *structural* check (the decoder didn't detect internal
+inconsistency), not a claim of bit-for-bit fidelity against some
+original file, since a standalone `.csa` has no original to diff
+against. Verified against real output: `squeeze`'d a real pose file,
+`inspect`ed both the raw input (confidence: 100%) and the resulting
+`.csa` (correct dims/scale/qscale/mode), `verify`'d it (OK, correct pose
+count), then truncated the file to 20 bytes and confirmed `verify`
+reports FAILED with exit code 1 rather than silently succeeding. Full
+`csa_tests`/`csa_capi_test` suites re-run clean (1,619 + 30 checks) after
+the `SniffResult` change, confirming no existing caller was affected.
+
+**Python SDK** (`bindings/python/csa.py`): added type hints across every
+public function (previously partial), a real `__version__` kept in sync
+with `pyproject.toml` by hand (documented as such, not claimed
+automatic), and pure-Python `csa.inspect(data)` / `csa.verify(data)`
+functions -- deliberately implemented as plain byte parsing against the
+same CSAG/CSA1 header fields, not as new C ABI exports, since the header
+fields are outer framing the Python layer can already see in the raw
+bytes it's handed; no `libcsa`/WASM rebuild required. `verify()` reuses
+the module's own existing `decompress_geo2d`/`decompress_geo3d`/
+`decompress_pose`/`decompress` functions, so there's one decode path,
+not two. Added six new checks to `test_bindings.py` covering both the
+CSAG-wrapped and bare-Layer-1 cases plus two malformed-input cases
+(no recognized magic; truncated CSAG header), and re-ran the full `pip
+install .` smoke test in a fresh venv (matching `ci.yml` exactly) to
+confirm the freshly built wheel exposes `inspect`/`verify` correctly,
+not just the dev checkout.
+
+**Format Inspector** (`docs/index.html`): a new panel, upload any `.csa`
+file and see a human-readable field list plus a byte-offset hex dump,
+header bytes highlighted separately from payload bytes -- both driven by
+a JS port of the *exact same* header-parsing logic just written in
+`cmd_inspect`/`csa.inspect()` (same field names, same magic checks, same
+"don't decode past the mode byte" boundary), so this is a third,
+independently-checkable implementation of the same real format, not a
+new one invented for the page. A "Verify" button reuses the page's
+already-existing, already-verified `unsqueeze` Worker path rather than
+adding a second decode implementation in JS. Verified two ways: extended
+the existing `worker_threads`-backed page harness with a real squeeze
+run's actual output (captured via a `Blob`-constructor hook, not a
+fabricated byte string) fed back through the new upload path, covering
+both the success case and a deliberately truncated file; then a genuine
+real-browser pass with `puppeteer-core` -- downloaded the actual `.csa`
+the page's own boot sequence produced via its real `blob:` URL, uploaded
+it through a real `<input type=file>` with Puppeteer's file-chooser API
+(not a simulated DOM event), and confirmed the parsed fields, hex dump,
+and Verify button all matched exactly what the CLI and Python reported
+for equivalent files -- including a screenshot of the rendered hex dump
+showing the format's own documented "CSAG ... CSA1" double-magic
+artifact in the actual byte content, not just asserted in text.
+
 ## Local web app (`webapp/`)
 
 The one thing `demo/csa_demo.html` (the WASM Artifact) structurally

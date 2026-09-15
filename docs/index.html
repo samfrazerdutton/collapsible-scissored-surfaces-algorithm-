@@ -236,6 +236,26 @@
   .restore-result.show { display: block; }
   .controls { display: flex; align-items: center; gap: 14px; margin: 16px 0; flex-wrap: wrap; }
 
+  /* ---------------------------------------------------------------- format inspector */
+  .inspector { padding: 24px; }
+  .inspector-fields { display: none; font-family: var(--font-mono); font-size: 12px; margin-top: 16px; }
+  .inspector-fields.show { display: block; }
+  .inspector-fields .row { display: flex; justify-content: space-between; gap: 12px; padding: 6px 0; border-top: 1px solid var(--border); }
+  .inspector-fields .row:first-child { border-top: none; }
+  .inspector-fields .row span:first-child { color: var(--text-dim); }
+  .inspector-fields .row b { color: var(--accent); font-variant-numeric: tabular-nums; font-weight: 500; }
+  .inspector-hex { display: none; font-family: var(--font-mono); font-size: 11px; margin-top: 16px; overflow-x: auto; border-top: 1px solid var(--border); padding-top: 16px; }
+  .inspector-hex.show { display: block; }
+  .inspector-hex .hexrow { white-space: pre; color: var(--text-faint); line-height: 1.8; }
+  .inspector-hex .hexrow .offset { color: var(--text-faint); }
+  .inspector-hex .hexrow .bytes.header { color: var(--accent); }
+  .inspector-hex .hexrow .bytes.payload { color: var(--text-dim); }
+  .inspector-hex .hexrow .ascii { color: var(--text-faint); }
+  .inspector-legend { display: flex; gap: 16px; font-family: var(--font-mono); font-size: 10.5px; color: var(--text-faint); margin-top: 10px; }
+  .inspector-legend span::before { content: "\25A0"; margin-right: 5px; }
+  .inspector-legend span.header::before { color: var(--accent); }
+  .inspector-legend span.payload::before { color: var(--text-dim); }
+
   /* ---------------------------------------------------------------- break the codec */
   .break-codec { padding: 24px; }
   .pathological { display: flex; gap: 6px; flex-wrap: wrap; margin: 16px 0; }
@@ -561,6 +581,26 @@
         <div class="summary" id="restore-summary"></div>
         <div class="detail" id="restore-detail"></div>
         <a class="download" id="restore-download" href="#">Download</a>
+      </div>
+    </div>
+
+    <div class="panel inspector" style="margin-top:20px">
+      <h3 class="block-title">Format Inspector</h3>
+      <p class="block-sub">Upload any <code>.csa</code> file (one you just produced above, or any other) to see the
+        real wire-format header fields &mdash; only the fields <a class="inline-link" href="https://github.com/samfrazerdutton/collapsible-scissored-surfaces-algorithm-/blob/main/FORMAT.md" target="_blank" rel="noopener">FORMAT.md</a>
+        actually documents, parsed the same way the CLI's <code>scissorc inspect</code> and the Python
+        <code>csa.inspect()</code> function do. Nothing past the mode byte is decoded here &mdash; the
+        mode-specific payload isn't byte-level specified either, so this doesn't guess at it.</p>
+      <div class="controls">
+        <input type="file" id="inspector-input" style="display:block">
+        <button class="run secondary" id="inspector-verify-btn" disabled>Verify (real decode)</button>
+      </div>
+      <div class="status" id="inspector-status"></div>
+      <div class="inspector-fields" id="inspector-fields"></div>
+      <div class="inspector-hex" id="inspector-hex"></div>
+      <div class="inspector-legend" id="inspector-legend" style="display:none">
+        <span class="header">header bytes</span>
+        <span class="payload">payload bytes (not decoded here)</span>
       </div>
     </div>
 
@@ -1454,6 +1494,126 @@ restoreBtn.addEventListener('click', async () => {
   }
 });
 
+/* ================= format inspector (pure byte parsing, mirrors cli/main.cpp's ================= */
+/* cmd_inspect and bindings/python/csa.py's inspect() -- see FORMAT.md */
+const MODE_NAMES = { 0: 'Raw', 1: 'General', 2: 'Geo2D', 3: 'Geo3D', 4: 'GeneralLZ', 5: 'GeneralBWT', 6: 'Pose' };
+const DIMS_SHAPES = { 2: 'geo2d', 3: 'geo3d', 7: 'pose' };
+
+function parseCsaHeader(bytes) {
+  function magic(offset, str) {
+    if (bytes.length < offset + str.length) return false;
+    for (let i = 0; i < str.length; i++) if (bytes[offset + i] !== str.charCodeAt(i)) return false;
+    return true;
+  }
+  function readU64LE(pos) {
+    if (pos + 8 > bytes.length) throw new Error('truncated .csa file: expected 8 more bytes for a u64 field');
+    let v = 0n;
+    for (let i = 0; i < 8; i++) v |= BigInt(bytes[pos + i]) << BigInt(8 * i);
+    return [v, pos + 8];
+  }
+
+  if (magic(0, 'CSAG')) {
+    const dims = bytes[4];
+    if (!(dims in DIMS_SHAPES)) throw new Error('unrecognized CSAG dims byte: ' + dims);
+    let pos = 5, scale, qscale;
+    [scale, pos] = readU64LE(pos);
+    const result = { layer: 2, dims, shape: DIMS_SHAPES[dims], scale };
+    if (dims === 7) { [qscale, pos] = readU64LE(pos); result.qscale = qscale; }
+    if (bytes.length < pos + 5 || !magic(pos, 'CSA1'))
+      throw new Error('CSAG header present but no CSA1 magic follows it -- file may be truncated or corrupted');
+    const mode = bytes[pos + 4];
+    result.mode = mode;
+    result.modeName = MODE_NAMES[mode] || 'unknown';
+    result.payloadBytes = bytes.length - pos - 5;
+    result.headerBytes = pos + 5;
+    return result;
+  }
+  if (magic(0, 'CSA1')) {
+    const mode = bytes[4];
+    return { layer: 1, mode, modeName: MODE_NAMES[mode] || 'unknown', payloadBytes: bytes.length - 5, headerBytes: 5 };
+  }
+  throw new Error('not a recognized .csa file (no CSAG or CSA1 magic)');
+}
+
+function renderHexDump(bytes, headerBytes) {
+  const showBytes = Math.min(bytes.length, Math.max(headerBytes + 16, 48));
+  const lines = [];
+  for (let row = 0; row < showBytes; row += 16) {
+    const rowBytes = [];
+    let ascii = '';
+    for (let i = row; i < Math.min(row + 16, showBytes); i++) {
+      const b = bytes[i];
+      const cls = i < headerBytes ? 'header' : 'payload';
+      rowBytes.push(`<span class="bytes ${cls}">${b.toString(16).padStart(2, '0')}</span>`);
+      ascii += (b >= 32 && b < 127) ? String.fromCharCode(b) : '.';
+    }
+    const offset = row.toString(16).padStart(8, '0');
+    lines.push(`<div class="hexrow"><span class="offset">${offset}</span>  ${rowBytes.join(' ')}  <span class="ascii">${ascii}</span></div>`);
+  }
+  if (showBytes < bytes.length) lines.push(`<div class="hexrow">&hellip; ${(bytes.length - showBytes).toLocaleString()} more bytes not shown</div>`);
+  return lines.join('');
+}
+
+const inspectorInput = document.getElementById('inspector-input');
+const inspectorStatus = document.getElementById('inspector-status');
+const inspectorFields = document.getElementById('inspector-fields');
+const inspectorHex = document.getElementById('inspector-hex');
+const inspectorLegend = document.getElementById('inspector-legend');
+const inspectorVerifyBtn = document.getElementById('inspector-verify-btn');
+let inspectorFile = null;
+
+inspectorInput.addEventListener('change', async () => {
+  if (!inspectorInput.files.length) return;
+  inspectorFile = inspectorInput.files[0];
+  inspectorVerifyBtn.disabled = !engineReady;
+  inspectorStatus.className = 'status';
+  inspectorFields.classList.remove('show');
+  inspectorHex.classList.remove('show');
+  inspectorLegend.style.display = 'none';
+  try {
+    const bytes = new Uint8Array(await inspectorFile.arrayBuffer());
+    const info = parseCsaHeader(bytes);
+    const rows = [];
+    rows.push(`<div class="row"><span>file</span><b>${inspectorFile.name} (${bytes.length.toLocaleString()} bytes)</b></div>`);
+    rows.push(`<div class="row"><span>layer</span><b>${info.layer} (${info.layer === 2 ? 'CSAG -- CLI/browser convention' : 'CSA1 -- library container'})</b></div>`);
+    if (info.layer === 2) {
+      rows.push(`<div class="row"><span>dims / shape</span><b>${info.dims} (${info.shape})</b></div>`);
+      rows.push(`<div class="row"><span>scale</span><b>${info.scale}</b></div>`);
+      if ('qscale' in info) rows.push(`<div class="row"><span>qscale</span><b>${info.qscale}</b></div>`);
+    }
+    rows.push(`<div class="row"><span>mode</span><b>${info.mode} (${info.modeName})</b></div>`);
+    rows.push(`<div class="row"><span>payload</span><b>${info.payloadBytes.toLocaleString()} bytes (not decoded here)</b></div>`);
+    inspectorFields.innerHTML = rows.join('');
+    inspectorFields.classList.add('show');
+    inspectorHex.innerHTML = renderHexDump(bytes, info.headerBytes);
+    inspectorHex.classList.add('show');
+    inspectorLegend.style.display = 'flex';
+    inspectorStatus.textContent = 'Parsed header. Click "Verify" to actually decode the payload.';
+  } catch (e) {
+    inspectorStatus.className = 'status err';
+    inspectorStatus.textContent = 'Error: ' + e.message;
+  }
+});
+
+inspectorVerifyBtn.addEventListener('click', async () => {
+  if (!inspectorFile || !engineReady) return;
+  inspectorVerifyBtn.disabled = true;
+  inspectorStatus.className = 'status';
+  inspectorStatus.textContent = 'Verifying (real decode, in the Worker)...';
+  try {
+    // Reuses the exact same unsqueeze() worker path the restore panel calls
+    // above -- no separate "verify" logic to drift out of sync with it.
+    const r = await callWorker('unsqueeze', inspectorFile, null, null);
+    inspectorStatus.className = 'status';
+    inspectorStatus.textContent = `Verify: OK -- decoded ${r.detail.find(d => d.startsWith('detected:')) || r.shape}, ${r.blob.length.toLocaleString()} bytes restored`;
+  } catch (e) {
+    inspectorStatus.className = 'status err';
+    inspectorStatus.textContent = 'Verify: FAILED -- ' + e.message;
+  } finally {
+    inspectorVerifyBtn.disabled = false;
+  }
+});
+
 /* ================= sample datasets (generated on the main thread; the ================= */
 /* worker only ever sees them as ordinary uploaded files) */
 function makePoseSample(n = 2000) {
@@ -1647,6 +1807,7 @@ async function boot() {
   engineReady = true;
   runBtn.disabled = !selectedFile;
   restoreBtn.disabled = !restoreFile;
+  inspectorVerifyBtn.disabled = !inspectorFile;
   updateStatusStrip();
   setSelectedFile(SAMPLES.pose());
   await runSqueeze();

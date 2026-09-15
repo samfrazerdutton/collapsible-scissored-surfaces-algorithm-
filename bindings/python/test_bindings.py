@@ -155,6 +155,49 @@ def test_error_handling():
         check(len(str(e)) > 0, "CsaError has a message")
 
 
+def test_inspect_and_verify():
+    # Layer 2 (CSAG) case: compress_geo3d doesn't add Layer 2 framing itself
+    # (that's a CLI/browser-only convention -- see FORMAT.md) so build a
+    # real Layer-2-wrapped blob the same way cli/main.cpp's squeeze does.
+    import struct as _struct
+    points = [(1000, 2000, 3000), (1100, 2100, 3100), (1200, 2200, 3200)]
+    layer1 = csa.compress_geo3d(points)
+    scale = 1000
+    wrapped = b"CSAG" + bytes([3]) + _struct.pack("<Q", scale) + layer1
+
+    info = csa.inspect(wrapped)
+    check(info["layer"] == 2, "inspect: geo3d wrapped blob is layer 2")
+    check(info["dims"] == 3 and info["shape"] == "geo3d", "inspect: dims/shape match")
+    check(info["scale"] == scale, "inspect: scale round-trips")
+    check("qscale" not in info, "inspect: qscale absent for dims=3")
+    check(info["mode_name"] == "Geo3D", "inspect: mode_name matches Layer 1 mode byte")
+
+    result = csa.verify(wrapped)
+    check(result["shape"] == "geo3d" and result["count"] == len(points), f"verify: geo3d decodes correctly ({result})")
+
+    # Bare Layer 1 (general-mode) blob: no CSAG wrapper at all.
+    general_blob = csa.compress(b"some arbitrary bytes, not a numeric table" * 20)
+    info_general = csa.inspect(general_blob)
+    check(info_general["layer"] == 1, "inspect: general blob is bare layer 1")
+    check(info_general["mode_name"] in ("General", "GeneralLZ", "GeneralBWT", "Raw"), "inspect: general mode_name is a real Mode value")
+    result_general = csa.verify(general_blob)
+    check(result_general["shape"] == "general", "verify: general blob reports shape=general")
+
+    # Malformed input: neither magic present.
+    try:
+        csa.inspect(b"not a csa file at all")
+        check(False, "expected CsaError for data with no recognized magic")
+    except csa.CsaError:
+        pass
+
+    # Truncated CSAG header (magic + dims byte but no scale field).
+    try:
+        csa.inspect(b"CSAG" + bytes([3]) + b"\x00\x00\x00")
+        check(False, "expected CsaError for truncated CSAG header")
+    except csa.CsaError:
+        pass
+
+
 def main():
     test_general()
     test_geo2d()
@@ -162,6 +205,7 @@ def main():
     test_geo3d_lossy()
     test_pose_lossy()
     test_error_handling()
+    test_inspect_and_verify()
     print(f"cuda_available() = {csa.cuda_available()}")
     print(f"{checks} checks, {failures} failures")
     sys.exit(1 if failures else 0)
