@@ -1535,6 +1535,68 @@ harness -- worth remembering next time a DESIGN.md entry says
 "unverified pending a real look": it means exactly that, and it should
 get one before, not after, it ships.
 
+### Premium product redesign: restrained, editorial, no functional changes
+
+Immediately after the import-map fix above, the user asked for a full
+visual ground-up redesign against a very specific brief: look like a
+serious Silicon Valley hardware/software product (Apple/NVIDIA/Linear/
+Stripe register, explicitly not generic AI-SaaS glassmorphism/gradients/
+glow), restrained near-black/graphite neutrals with exactly one accent
+color used sparingly, Inter + IBM Plex Mono typography, a real nav bar,
+an editorial scroll narrative instead of "heading + three cards"
+sections, dense spec-sheet data instead of colorful metric cards, and a
+hover-interactive architecture diagram -- all without inventing
+functionality, fabricating metrics, or breaking anything already
+verified.
+
+**Scope discipline**: this was deliberately a presentation-layer-only
+change. The entire `<script type="importmap">` and `<script
+type="module">` blocks -- the Worker protocol, the Three.js scene, the
+compute/UI-wiring logic, and the embedded base64 WASM worker source --
+were carried through **byte-for-byte** from the already-verified prior
+version, confirmed at the end with `html.endsWith(previouslyVerifiedTail)
+=== true`. Only the CSS and HTML structure changed: new color/type
+tokens, a new nav, hero copy matching the brief's own suggested
+headline ("Compressing the physical world for machines that move
+through it"), the same five sections rewritten into a numbered
+narrative arc (Problem/Bottleneck/Approach+Codec/Result/Proof/
+Applications/Engine/Developer/Future), a real developer code-window
+section using only real, verified commands and API names (`scissorc
+squeeze`/`unsqueeze`, `pip install .`, `csa.compress_pose`/
+`compress_pose_lossy` from `bindings/python/csa.py`; deliberately not a
+`pip install <package>` PyPI command, since a PyPI check during this
+pass confirmed the package isn't published there), and a small
+spec-sheet block reporting the repo's real, checked license
+(Apache-2.0, from `LICENSE`) and version (`0.1.0`, from
+`pyproject.toml`) rather than inventing GitHub star counts or fake
+"trusted by" logos the brief explicitly warned against.
+
+**The one real constraint this discipline created**: every one of the
+59 element ids the verified JS references (`getElementById`/scoped
+`querySelector` calls) had to survive in the new markup with identical
+semantics, since the JS itself was not being touched or re-verified at
+the compute level. Extracted that exact id list from the shipped JS
+programmatically and diffed it against the new HTML before shipping --
+zero missing. This included keeping the six-chip status strip (Engine/
+Worker/Memory/Network/Data/3D Render) that `updateStatusStrip()`
+unconditionally writes into on every call (including one at module load
+time, before `engineReady` is even set): dropping those elements outright
+in an earlier draft of the redesign would have reintroduced a real bug
+identical in spirit to the import-map failure -- a `TypeError` on a
+null element reference breaking the whole script on load -- caught by
+running the id cross-check before shipping, not after.
+
+**Verification**: re-ran both established harnesses against the new
+markup (the full-page `worker_threads`-backed harness confirming preset
+clicks, view-mode switching, Break-the-Codec run, and the Edge Link
+Simulator's packetized custom-bitrate math all still work byte-for-byte
+identically to before), plus a real headless-Chrome pass (`puppeteer-core`
+against the local Chrome install, same tool used to diagnose the
+import-map bug) served from a local static server: zero console errors,
+a real `<canvas>` renders, and four full-resolution screenshots (hero,
+architecture diagram, developer code window, applications grid) were
+actually looked at before shipping -- not skipped this time.
+
 ## Local web app (`webapp/`)
 
 The one thing `demo/csa_demo.html` (the WASM Artifact) structurally
