@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CSA Squeeze</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<style>
+  :root {
+    --bg: #f3f5f7; --surface: #ffffff; --surface-2: #eef1f4; --border: #d7dee4;
+    --text: #16202b; --text-dim: #576775; --accent: #1c8fa3; --accent-2: #a8641a;
+    --good: #2f9e5b; --bad: #c94f43;
+    --font-display: 'IBM Plex Sans', system-ui, sans-serif;
+    --font-mono: 'IBM Plex Mono', ui-monospace, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0b0f14; --surface: #121821; --surface-2: #1a222d; --border: #26313d;
+      --text: #e7edf3; --text-dim: #8fa0b0; --accent: #5ec8d8; --accent-2: #e8a34d;
+      --good: #6fcf97; --bad: #e0857c;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font-family: var(--font-display); line-height: 1.5; }
+  .wrap { max-width: 720px; margin: 0 auto; padding: 40px 20px 64px; }
+  .eyebrow { font-family: var(--font-mono); font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: var(--accent); }
+  h1 { font-size: 28px; margin: 4px 0 8px; letter-spacing: -0.01em; }
+  p.thesis { color: var(--text-dim); font-size: 15px; max-width: 60ch; margin: 0 0 28px; }
+
+  .dropzone {
+    border: 2px dashed var(--border); border-radius: 12px; padding: 40px 20px;
+    text-align: center; cursor: pointer; background: var(--surface); transition: border-color .15s, background .15s;
+  }
+  .dropzone.drag { border-color: var(--accent); background: var(--surface-2); }
+  .dropzone .big { font-size: 16px; font-weight: 600; margin-bottom: 6px; }
+  .dropzone .small { font-size: 13px; color: var(--text-dim); }
+  input[type=file] { display: none; }
+
+  .controls { display: flex; align-items: center; gap: 14px; margin: 18px 0; flex-wrap: wrap; }
+  .quality-row { display: flex; align-items: center; gap: 10px; flex: 1; min-width: 220px; }
+  .quality-row label { font-size: 13px; color: var(--text-dim); white-space: nowrap; }
+  input[type=range] { flex: 1; accent-color: var(--accent); }
+  #quality-value { font-family: var(--font-mono); font-size: 13px; min-width: 90px; text-align: right; }
+
+  button.run {
+    font-family: var(--font-display); font-weight: 600; font-size: 14px;
+    background: var(--accent); color: #06222a; border: none; border-radius: 8px;
+    padding: 10px 18px; cursor: pointer;
+  }
+  button.run:disabled { opacity: .5; cursor: wait; }
+  button.secondary { background: var(--surface-2); color: var(--text); border: 1px solid var(--border); }
+
+  .status { font-family: var(--font-mono); font-size: 13px; color: var(--text-dim); margin: 10px 0; min-height: 18px; }
+  .status.err { color: var(--bad); }
+
+  .result { display: none; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 18px; margin-top: 16px; }
+  .result.show { display: block; }
+  .result .summary { font-size: 15px; font-weight: 600; margin-bottom: 8px; }
+  .result .detail { font-family: var(--font-mono); font-size: 12.5px; color: var(--text-dim); white-space: pre-wrap; margin-bottom: 14px; }
+  a.download {
+    display: inline-block; font-family: var(--font-display); font-weight: 600; font-size: 14px;
+    background: var(--good); color: #062a15; border-radius: 8px; padding: 9px 16px; text-decoration: none;
+  }
+
+  .restore-row { margin-top: 36px; padding-top: 20px; border-top: 1px solid var(--border); }
+  .restore-row h2 { font-size: 14px; text-transform: uppercase; letter-spacing: .05em; color: var(--text-dim); margin: 0 0 10px; }
+
+  footer { margin-top: 40px; font-size: 12.5px; color: var(--text-dim); max-width: 60ch; }
+  code { font-family: var(--font-mono); background: var(--surface-2); padding: 1px 5px; border-radius: 4px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <span class="eyebrow">CSA &middot; local tool</span>
+  <h1>Squeeze</h1>
+  <p class="thesis">Drop any file. It detects whether it's a 2D/3D point trajectory, a 6-DOF pose stream, or just bytes, compresses it accordingly, and verifies the round-trip before handing you the result &mdash; lossless by default.</p>
+
+  <div class="dropzone" id="dropzone">
+    <div class="big">Drop a file here, or click to choose one</div>
+    <div class="small">Any file. Numeric point/pose tables get a specialized transform automatically.</div>
+    <input type="file" id="file-input">
+  </div>
+
+  <div class="controls">
+    <div class="quality-row">
+      <label for="quality">Quality</label>
+      <input type="range" id="quality" min="0" max="9" value="0" step="1">
+      <span id="quality-value">lossless</span>
+    </div>
+    <button class="run" id="run-btn" disabled>Squeeze</button>
+  </div>
+
+  <div class="status" id="status"></div>
+
+  <div class="result" id="result">
+    <div class="summary" id="result-summary"></div>
+    <div class="detail" id="result-detail"></div>
+    <a class="download" id="download-link" href="#">Download</a>
+  </div>
+
+  <div class="restore-row">
+    <h2>Restore a .csa file</h2>
+    <div class="controls">
+      <input type="file" id="restore-input" style="display:block">
+      <button class="run secondary" id="restore-btn" disabled>Unsqueeze</button>
+    </div>
+    <div class="status" id="restore-status"></div>
+    <div class="result" id="restore-result">
+      <div class="summary" id="restore-summary"></div>
+      <div class="detail" id="restore-detail"></div>
+      <a class="download" id="restore-download" href="#">Download</a>
+    </div>
+  </div>
+
+  <footer>
+    Runs entirely on this machine &mdash; your file never leaves it. This is a thin front end over
+    <code>scissorc squeeze</code>/<code>unsqueeze</code>; see <code>DESIGN.md</code> in the repository
+    for what "quality" actually changes and how the detected shape/scale gets picked.
+  </footer>
+</div>
+
+<script>
+"use strict";
+
+let selectedFile = null;
+
+const dropzone = document.getElementById('dropzone');
+const fileInput = document.getElementById('file-input');
+const runBtn = document.getElementById('run-btn');
+const qualitySlider = document.getElementById('quality');
+const qualityValue = document.getElementById('quality-value');
+const statusEl = document.getElementById('status');
+const resultEl = document.getElementById('result');
+const resultSummary = document.getElementById('result-summary');
+const resultDetail = document.getElementById('result-detail');
+const downloadLink = document.getElementById('download-link');
+
+dropzone.addEventListener('click', () => fileInput.click());
+dropzone.addEventListener('dragover', e => { e.preventDefault(); dropzone.classList.add('drag'); });
+dropzone.addEventListener('dragleave', () => dropzone.classList.remove('drag'));
+dropzone.addEventListener('drop', e => {
+  e.preventDefault();
+  dropzone.classList.remove('drag');
+  if (e.dataTransfer.files.length) setSelectedFile(e.dataTransfer.files[0]);
+});
+fileInput.addEventListener('change', () => { if (fileInput.files.length) setSelectedFile(fileInput.files[0]); });
+
+function setSelectedFile(f) {
+  selectedFile = f;
+  dropzone.querySelector('.big').textContent = f.name;
+  dropzone.querySelector('.small').textContent = `${f.size.toLocaleString()} bytes -- click to choose a different file`;
+  runBtn.disabled = false;
+  resultEl.classList.remove('show');
+  statusEl.textContent = '';
+}
+
+qualitySlider.addEventListener('input', () => {
+  const v = parseInt(qualitySlider.value, 10);
+  qualityValue.textContent = v === 0 ? 'lossless' : `lossy (${v}/9)`;
+});
+
+runBtn.addEventListener('click', async () => {
+  if (!selectedFile) return;
+  runBtn.disabled = true;
+  statusEl.className = 'status';
+  statusEl.textContent = 'Compressing...';
+  resultEl.classList.remove('show');
+
+  const fd = new FormData();
+  fd.append('file', selectedFile);
+  const q = parseInt(qualitySlider.value, 10);
+  if (q > 0) fd.append('quality', String(q));
+
+  try {
+    const resp = await fetch('/api/squeeze', { method: 'POST', body: fd });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({ error: `HTTP ${resp.status}` }));
+      throw new Error(err.error || `HTTP ${resp.status}`);
+    }
+    const reportHeader = resp.headers.get('X-Csa-Report');
+    const report = reportHeader ? JSON.parse(reportHeader) : { summary: '', detail: [] };
+    const blob = await resp.blob();
+    const disposition = resp.headers.get('Content-Disposition') || '';
+    const match = disposition.match(/filename="([^"]+)"/);
+    const filename = match ? match[1] : (selectedFile.name + '.csa');
+
+    const url = URL.createObjectURL(blob);
+    downloadLink.href = url;
+    downloadLink.download = filename;
+    resultSummary.textContent = report.summary;
+    resultDetail.textContent = report.detail.join('\n');
+    resultEl.classList.add('show');
+    statusEl.textContent = 'Done.';
+  } catch (e) {
+    statusEl.className = 'status err';
+    statusEl.textContent = 'Error: ' + e.message;
+  } finally {
+    runBtn.disabled = false;
+  }
+});
+
+/* ---- restore panel ---- */
+let restoreFile = null;
+const restoreInput = document.getElementById('restore-input');
+const restoreBtn = document.getElementById('restore-btn');
+const restoreStatus = document.getElementById('restore-status');
+const restoreResult = document.getElementById('restore-result');
+const restoreSummary = document.getElementById('restore-summary');
+const restoreDetail = document.getElementById('restore-detail');
+const restoreDownload = document.getElementById('restore-download');
+
+restoreInput.addEventListener('change', () => {
+  if (restoreInput.files.length) { restoreFile = restoreInput.files[0]; restoreBtn.disabled = false; }
+});
+
+restoreBtn.addEventListener('click', async () => {
+  if (!restoreFile) return;
+  restoreBtn.disabled = true;
+  restoreStatus.className = 'status';
+  restoreStatus.textContent = 'Restoring...';
+  restoreResult.classList.remove('show');
+
+  const fd = new FormData();
+  fd.append('file', restoreFile);
+
+  try {
+    const resp = await fetch('/api/unsqueeze', { method: 'POST', body: fd });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({ error: `HTTP ${resp.status}` }));
+      throw new Error(err.error || `HTTP ${resp.status}`);
+    }
+    const reportHeader = resp.headers.get('X-Csa-Report');
+    const report = reportHeader ? JSON.parse(reportHeader) : { summary: '', detail: [] };
+    const blob = await resp.blob();
+    const disposition = resp.headers.get('Content-Disposition') || '';
+    const match = disposition.match(/filename="([^"]+)"/);
+    const filename = match ? match[1] : (restoreFile.name + '.restored');
+
+    const url = URL.createObjectURL(blob);
+    restoreDownload.href = url;
+    restoreDownload.download = filename;
+    restoreSummary.textContent = report.summary;
+    restoreDetail.textContent = report.detail.join('\n');
+    restoreResult.classList.add('show');
+    restoreStatus.textContent = 'Done.';
+  } catch (e) {
+    restoreStatus.className = 'status err';
+    restoreStatus.textContent = 'Error: ' + e.message;
+  } finally {
+    restoreBtn.disabled = false;
+  }
+});
+</script>
+</body>
+</html>

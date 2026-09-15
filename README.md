@@ -8,7 +8,13 @@ client-side, against a live gzip baseline -- plus a real WebGPU compute
 port of the interleaved rANS decode (one GPU thread per lane,
 correctness-verified against the CPU output live in your browser). See
 `DESIGN.md`'s "In-browser demo" and "WebGPU rANS decode" sections for how
-it's built and what it does and doesn't prove.
+it's built and what it does and doesn't prove. The Artifact demo can't
+hand a file back to you, though (browser sandbox restriction) -- for
+that, run the real local app in `webapp/` (`pip install -r
+webapp/requirements.txt && python webapp/server.py`, then open
+`http://127.0.0.1:8000/`): drop in your own file, get a real compressed
+file back via a normal download, or drop a `.csa` file in to restore it.
+See `DESIGN.md`'s "Local web app" section.
 
 A lossless compression codec built directly from a mechanical-metamaterials
 idea: Harvard SEAS's "pantograph lattices" -- networks of scissor-jointed

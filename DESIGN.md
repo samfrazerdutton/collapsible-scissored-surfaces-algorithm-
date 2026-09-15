@@ -1218,6 +1218,45 @@ Every explicit command from before this addition is unchanged and still
 exists for pipelines/scripts that already know their data's shape and
 want to name the scale themselves rather than have it detected.
 
+## Local web app (`webapp/`)
+
+The one thing `demo/csa_demo.html` (the WASM Artifact) structurally
+cannot do: hand a real file back to whoever is using it -- Artifacts run
+in a sandbox that blocks every download path, by design, regardless of
+what the page's own JS tries. `webapp/` is a real, ordinary local web
+app (Flask + a plain HTML/JS front end) that closes that gap: drop a
+file in a real (non-sandboxed) browser tab, get a real compressed file
+back via a normal download, or drop a `.csa` file in to restore it.
+
+Deliberately a thin transport layer, not a second brain: `webapp/server.py`
+shells out to the already-built `scissorc` binary (`squeeze`/`unsqueeze`)
+rather than reimplementing the sniffing/scale-picking logic in Python, so
+there is exactly one place that logic lives and exactly one place it's
+tested. The server's only real jobs are (1) save the upload to a temp
+file, (2) run the CLI, (3) relay its stdout report (with the server's own
+temp-directory paths swapped back out for the filename the user actually
+typed, so no local filesystem detail leaks into the browser) and its
+output file back as a normal HTTP response with a real
+`Content-Disposition: attachment` header.
+
+Run it:
+```
+cd webapp
+pip install -r requirements.txt
+python server.py
+```
+then open `http://127.0.0.1:8000/` in a browser. Verified end-to-end
+against real files of all three detected shapes (general text, a real
+LiDAR-shaped point file, both lossless and `--quality`-lossy) via
+`curl` directly against the running server before this was called done --
+upload, download, and the restored/lossy file's content checked against
+the original.
+
+**Not deployed anywhere.** This only runs locally (`127.0.0.1`) until a
+real hosting decision is made deliberately -- that's a different kind of
+decision (cost, exposure, which files a stranger could send it) than
+anything in this section, and isn't one to make silently.
+
 ## Honest limitations / future work
 
 - **A CPU-vs-GPU crossover past this GPU's ~256M-element practical VRAM
