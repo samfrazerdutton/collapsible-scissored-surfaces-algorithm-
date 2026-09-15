@@ -1284,6 +1284,78 @@ from a branch" -> Branch: `main`, folder: `/docs`), at
 `https://<owner>.github.io/<repo>/` -- no server, no cost, updates
 automatically on every push to `main` that touches `docs/`.
 
+### Positioning pivot and Three.js/Web Worker rebuild
+
+The deployed page still read as boring. The specific ask that followed
+was a full "Silicon Valley startup" rebuild -- React/Next.js/Three.js,
+an "Edge-Native Spatial Telemetry Codec" narrative for autonomous drone
+swarms, a simulated network race against gzip, and a marketing-copy list
+including claims like "vastly outperforming gzip" and "viable for
+embedded RTOS on drone hardware." Adopted the real, buildable parts of
+that; declined the parts that would have made the page say something
+false:
+
+- **Kept, because it's true and already measured**: framing this as
+  compression for 6-DOF pose streams and point clouds -- the actual
+  domain this project's real benchmarks (`REAL_POSE_BENCHMARK.md`) show
+  it winning at, often by a wide margin. Real WebGL rendering of the
+  reconstructed trajectory/point cloud (Three.js, ES modules from
+  jsdelivr, no build step) instead of a flat 2D canvas line. A real Web
+  Worker running the WASM engine off the main thread, so the 3D view's
+  render loop doesn't freeze during compression -- genuinely necessary
+  now that there's a continuous animation loop to protect, not present
+  before. A simulated transmission-time "race" against gzip at a chosen
+  bandwidth (LoRa/degraded-5G/satellite), explicitly labeled as
+  illustrative/simulated, not implied as a live network test.
+- **Declined**: "vastly outperforms gzip" as an unqualified claim --
+  false; this codec loses to general-purpose compressors on ordinary
+  files and loses decisively to the specialized LASzip codec on real
+  LiDAR data (`REAL_GEO_BENCHMARK.md`). "Viable for embedded RTOS on
+  drone hardware" and "zero-trust infrastructure" -- neither has been
+  built or tested for that target. Replaced with a narrower, true,
+  verifiable claim instead: the compression hot path runs in WASM linear
+  memory with manual malloc/free, not JS object allocation, so there's
+  no GC pause during compression -- a real fact about this codebase, not
+  a leap to what it would take to run on real drone flight hardware. The
+  full React/Next.js/Tailwind rewrite -- declined structurally: it would
+  trade the "one static file, free GitHub Pages hosting, zero build
+  step" property this page already has for a real build pipeline and
+  likely a different host, for a page whose actual job (drop a file,
+  watch it compress, download the result) doesn't need a framework.
+
+**Architecture**: the compiled WASM module and every compute function
+(`sniffTable`/`safeScale`/`squeeze`/`unsqueeze`, unchanged from the
+earlier version) now live entirely inside a Web Worker, embedded as a
+base64 string decoded via `TextDecoder` (not naive `atob`, since
+Emscripten's `SINGLE_FILE` build embeds the wasm binary as a raw
+binary-string literal with real non-ASCII byte values -- a UTF-8-unsafe
+`atob`-only round-trip would have silently corrupted it) into a `Blob`
+that becomes the Worker's source. The main thread only ever sees
+`{blob, filename, summary, detail, shape, rawSize, gzipSize, csaSize,
+preview}` come back over `postMessage`, with the compressed payload's
+`ArrayBuffer` transferred (zero-copy). `preview` points gained a third
+(z) coordinate for the 3D view (previously just x/y for the flat canvas
+plot).
+
+**Verified before being trusted, not just read through, including the
+part added this round that's hardest to get right (Worker creation from
+a Blob URL)**: built a Node harness that stubs `Worker`/`Blob`/
+`URL.createObjectURL` to route through a *real* `worker_threads` process
+running the *actual* embedded worker source (extracted from the shipped
+HTML file, not a copy), stubbed Three.js/OrbitControls/DOM/canvas with
+minimal fakes, and ran the entire page module script -- boot sequence,
+auto-demo, hero stat, size bars, and the transmission-race arithmetic --
+end to end. Caught one real stub-only issue along the way (a fake
+`<select>` defaulting to `value:'0'` instead of its `selected` option,
+producing `Infinity` in the race's time calculation) and confirmed it
+was a test-harness gap, not a page bug, by seeding a realistic value and
+re-running: the race then produced correct, real arithmetic (1.7s
+gzip / 480ms CSA at 256kbps for the pose sample -- checks out exactly
+against `55306*8/256000` and `15349*8/256000`). The one thing this
+verification *cannot* cover without a real browser: whether the actual
+WebGL rendering looks right. That's the one part of this change that's
+unverified pending a real look.
+
 ## Local web app (`webapp/`)
 
 The one thing `demo/csa_demo.html` (the WASM Artifact) structurally

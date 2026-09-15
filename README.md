@@ -11,13 +11,17 @@ correctness-verified against the CPU output live in your browser). See
 it's built and what it does and doesn't prove. The Artifact demo can't
 hand a file back to you, though (browser sandbox restriction) -- two
 real ways around that:
-- **`docs/index.html`** -- no backend at all, just a static HTML
-  file (open it directly, or `python -m http.server` from `docs/`
-  and visit `http://127.0.0.1:8000/`): drop in your own file, get a real
-  compressed file back via a normal download. Same WASM core, but with
-  the CLI's `squeeze` auto-detection ported to JS and no sandbox, so
-  downloads actually work. This is the one that could be hosted anywhere
-  static files are served (GitHub Pages, etc.) with zero server cost.
+- **[`docs/index.html`](https://samfrazerdutton.github.io/collapsible-scissored-surfaces-algorithm-/)**
+  -- no backend at all, just a static HTML file, live on GitHub Pages for
+  free. The WASM engine runs in a Web Worker; a Three.js view renders the
+  reconstructed trajectory/point cloud in 3D while it does. Drop in your
+  own file (or try a sample), get a real compressed file back via a
+  normal download -- something the Artifact demo above structurally
+  can't do. See `DESIGN.md`'s "Zero-backend browser app" section for
+  what's real here (the measured numbers, the Worker architecture) vs.
+  explicitly not claimed (this isn't tested on embedded/RTOS hardware,
+  and it does *not* "vastly outperform gzip" universally -- see
+  `REAL_GEO_BENCHMARK.md` for where it honestly loses).
 - **`webapp/`** -- a real local Flask app (`pip install -r
   webapp/requirements.txt && python webapp/server.py`, then open
   `http://127.0.0.1:8000/`) that shells out to the native `scissorc`
