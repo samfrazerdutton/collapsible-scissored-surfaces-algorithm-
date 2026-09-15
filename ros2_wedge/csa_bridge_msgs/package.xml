@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>csa_bridge_msgs</name>
+  <version>0.1.0</version>
+  <description>
+    Message definitions for csa_bridge: CompressedPoseBatch, a batch of
+    6-DOF poses compressed with CSA (github.com/&lt;owner&gt;/collapsible-scissored-surfaces-algorithm-)
+    for the specific bandwidth-constrained link a real ROS2 PoseStamped +
+    MCAP/zstd pipeline measurably loses on. Split into its own package
+    because rosidl message generation needs ament_cmake, while csa_bridge
+    itself is a plain ament_python package.
+  </description>
+  <maintainer email="noreply@example.com">CSA project</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <buildtool_depend>rosidl_default_generators</buildtool_depend>
+
+  <depend>std_msgs</depend>
+  <exec_depend>rosidl_default_runtime</exec_depend>
+  <member_of_group>rosidl_interface_packages</member_of_group>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

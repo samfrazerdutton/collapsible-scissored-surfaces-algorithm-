@@ -1,0 +1,35 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>csa_bridge</name>
+  <version>0.1.0</version>
+  <description>
+    Drop-in CSA compression for one bandwidth-constrained pose topic:
+    subscribes to geometry_msgs/msg/PoseStamped, batches and compresses
+    with the real CSA C++ codec (via bindings/python/csa.py's ctypes
+    wrapper around libcsa, not a reimplementation), publishes
+    csa_bridge_msgs/msg/CompressedPoseBatch; a matching decompressor node
+    turns it back into an ordinary PoseStamped stream on the receiving
+    end. Sits alongside your existing rosbag2/MCAP recording of the
+    source topic, not instead of it -- see this package's README.md for
+    why (and the real, measured numbers in ADVERSARIAL_BENCHMARK.md
+    showing where MCAP's own default zstd compression loses badly on
+    exactly this kind of data).
+  </description>
+  <maintainer email="noreply@example.com">CSA project</maintainer>
+  <license>MIT</license>
+
+  <depend>rclpy</depend>
+  <depend>geometry_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>csa_bridge_msgs</depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
