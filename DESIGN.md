@@ -1102,10 +1102,18 @@ struct-by-value C return into a hidden pointer parameter that JS's
 `cwrap`/`ccall` have no way to know about. `demo/csa_demo.html` embeds
 the compiled module (`-s SINGLE_FILE=1` inlines the wasm binary as base64
 directly in the JS, so the whole page is one self-contained file) plus
-three real sample datasets (a KITTI vehicle trajectory, a synthetic
-LiDAR ring scan, a slice of real C++ source) and runs the actual codec
-against them live, client-side, alongside the browser's native
-`CompressionStream('gzip')` as a live baseline.
+three real sample datasets -- a KITTI vehicle trajectory, a real captured
+airborne LiDAR scan (`autzen/stadium-utm.laz` from PDAL's public
+test-data repository, 693,895 points, full resolution, decoded via
+`laspy`/`lazrs` and embedded as the same raw scaled integers LASzip
+itself stores; see `REAL_GEO_BENCHMARK.md` for the specialized-competitor
+comparison on this exact file), and a slice of real C++ source -- and
+runs the actual codec against them live, client-side, alongside the
+browser's native `CompressionStream('gzip')` as a live baseline. The
+point-cloud canvas splats points directly into an `ImageData` buffer
+rather than one `arc()` call per point -- the only way to draw 693,895
+points at interactive speed, the same technique real point-cloud viewers
+use for dense preview thumbnails.
 
 **One real correctness bug this surfaced, fixed, and worth recording**:
 `rans_coder.cpp`'s lane parallelism uses `std::thread`, which links fine
@@ -1126,9 +1134,53 @@ and ~2.32x/3.65x (8 lanes) encode/decode speedup already measured on the
 native desktop build above -- the page says so directly rather than
 implying a speedup that isn't actually happening in that tab.
 
-Not yet done: a GPU-in-browser path (WebGPU compute for, e.g., the
-interleaved rANS decode) -- a real further step, not attempted this
-round.
+### WebGPU rANS decode: a genuine in-browser parallel port (built)
+
+The natural GPU target the CPU-thread-per-lane design was always meant
+to generalize to: `rans_decode_lane`'s inner loop ported directly to a
+WGSL compute shader (inlined in `demo/csa_demo.html`), one GPU thread
+(invocation) per lane, each running the identical sequential decode over
+its own byte range -- exactly the technique real GPU entropy coders use,
+now actually running on a real GPU instead of only on CPU threads. Reuses
+`encode_interleaved_rans`'s own wire format directly (parsed in JS --
+`parseRansBlob`) rather than adding any new C++/WASM surface, since this
+project already fully controls and tests that format.
+
+Two real engineering problems solved to make this correct, not just
+plausible:
+- **Cross-lane write safety without atomics.** The GPU output buffer
+  stores one `u32` per decoded *byte* (not four bytes packed per word),
+  so no two lanes' writes can ever land in the same 32-bit word --
+  trading 4x output memory for completely eliminating the sub-word
+  read-modify-write hazard a packed byte buffer would need atomics to
+  handle safely. The read-only input blob stays tightly packed (4
+  bytes/word, unpacked in-shader with plain shifts), since concurrent
+  reads of the same word are never a hazard.
+- **`meta` is a reserved WGSL keyword.** A real compile-time catch from
+  testing against the actual Dawn WebGPU implementation (via Node +
+  the `webgpu` npm package) before ever shipping this to a browser tab --
+  renamed to `laneInfo`.
+
+**Correctness verified before any timing was trusted** (this project's
+standing rule, applied here exactly as it was for the CUDA calibration
+kernel): the WGSL shader's decode was run against real CSA-encoded blobs
+at 1/4/8/32 lanes through Dawn (Google's WebGPU implementation, via the
+`webgpu` npm package) in Node, byte-compared against the original input --
+bit-exact at every lane count. The demo re-verifies this live, in
+whatever browser is actually running it, comparing the GPU decode output
+against the same buffer's WASM CPU decode before showing a single timing
+number.
+
+**Honest scope**: only the decode path is GPU-ported (the natural
+target -- decode's per-lane loop is embarrassingly parallel across
+lanes, same as encode, but decode is the side this session's WASM port
+already couldn't parallelize at all in-browser). Encode stays WASM/CPU.
+Whatever crossover point (or lack of one) a given browser/GPU shows
+between CPU and GPU decode time is a real, live measurement the page
+makes on its own device -- not asserted here, since it depends on GPU
+dispatch/readback overhead relative to buffer size, the same kind of
+crossover already measured (and reported honestly either way) for the
+native CUDA calibration kernel.
 
 ## Honest limitations / future work
 
