@@ -50,7 +50,14 @@ on realistic (not maximally repetitive) text/log/telemetry files,
 of real, unmodified C++ source code, not text written for this project --
 `REAL_GEO_BENCHMARK.md` and `REAL_POSE_BENCHMARK.md` for the geometric/
 6-DOF modes against real specialized competitors and real ground-truth
-tracking data (not synthetic shapes), and `GPU_BENCHMARKS.md` for a
+tracking data (not synthetic shapes), `ADVERSARIAL_BENCHMARK.md` for the
+two real competitors those don't cover -- MCAP+zstd (the real ROS2/
+Foxglove default for pose/telemetry logging: real `PoseStamped` messages
+lose to CSA by 78-88% on all three real datasets, and lose to *doing
+nothing* on two of three, real message-framing overhead included, not
+stripped out) and Draco (Google's point-cloud codec: beats CSA on ratio
+only at its roughest setting, and drops real points at every setting
+tested here, including its finest) -- and `GPU_BENCHMARKS.md` for a
 dedicated CPU-vs-GPU crossover measurement from 100K to 256M elements
 (nothing in any of those files is hand-typed).
 
