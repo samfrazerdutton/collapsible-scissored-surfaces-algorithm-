@@ -21,6 +21,19 @@ endif()
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# csa_core is a static library linked into both scissorc (a plain
+# executable, doesn't care) and csa_capi (a *shared* library, which does
+# care): on Linux/GCC, a static lib built without -fPIC fails to link
+# into a .so with "relocation ... can not be used when making a shared
+# object" the moment it contains anything using the initial-exec TLS
+# model, which src/codec.cpp's `static thread_local CudaLiftSession
+# session` does. Harmless on MSVC (no such PIC/non-PIC distinction there),
+# so this is set unconditionally rather than gated per-platform. Found by
+# reproducing the CI Linux build locally (WSL) after ci.yml's first real
+# run failed here -- not something the Windows/MSVC development this
+# project used throughout would ever surface on its own.
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
 if(MSVC)
     add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:/W4>" "$<$<COMPILE_LANGUAGE:CXX>:/permissive->")
 else()
