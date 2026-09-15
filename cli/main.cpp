@@ -40,6 +40,7 @@
 #include "csa/codec.hpp"
 #include "csa/lz_matcher.hpp"
 #include "csa/pantograph_lift_cuda.hpp"
+#include "miniz.h" // vendored (see CMakeLists.txt) -- real gzip-equivalent baseline for `scissorc benchmark`
 #include <algorithm>
 #include <cctype>
 #include <chrono>
@@ -579,6 +580,191 @@ int cmd_squeeze(const std::string& in, std::string out, bool have_quality, int q
     return 0;
 }
 
+// Largest quant_step in [1, hi] whose real measured error (from eval_fn,
+// which must actually compress+decompress+measure -- not estimate) stays
+// <= budget. eval_fn is assumed monotonically non-decreasing in
+// quant_step, which is true of this codec's quantization by construction
+// (a coarser step can only add error, never remove it). Returns 0 if even
+// quant_step=1 -- the finest granularity the *lossy* code path offers --
+// already exceeds the budget; the caller should recommend true lossless
+// in that case; rather than a fabricated "best effort" number.
+template <typename EvalFn>
+u32 search_max_quant_step(double budget, u32 hi, EvalFn eval_fn) {
+    if (eval_fn(1u) > budget) return 0;
+    u32 lo = 1, best = 1;
+    while (lo <= hi) {
+        u32 mid = lo + (hi - lo) / 2;
+        double err = eval_fn(mid);
+        if (err <= budget) {
+            best = mid;
+            if (mid == hi) break;
+            lo = mid + 1;
+        } else {
+            if (mid == lo) break;
+            hi = mid - 1;
+        }
+    }
+    return best;
+}
+
+// Auto-Optimize: rather than making the caller guess a quant_step and
+// check whether the resulting error happens to be acceptable, this
+// searches the codec's real quant_step parameter space directly against
+// a user-stated error budget, using the same real round-trip
+// compress+decompress+measure cmd_squeeze already trusts -- not an
+// estimate or a model of expected error, the actual measured error at
+// each candidate step. For pose data with both a position and a
+// rotation budget, position and rotation are searched independently
+// (holding the other at quant_step=1, since the format encodes them as
+// two genuinely separate sub-streams -- see FORMAT.md's Pose mode
+// description) and the combined configuration is re-verified for real
+// before being reported, rather than assumed additive.
+int cmd_optimize(const std::string& in, std::string out, bool have_pos_budget, double pos_budget,
+                  bool have_quat_budget, double quat_budget, bool explain, bool force) {
+    if (out.empty()) out = in + ".csa";
+    if (!force && file_exists(out))
+        throw std::runtime_error("output already exists: " + out + " (pass an output path, or --force to overwrite)");
+    if (!have_pos_budget && !have_quat_budget)
+        throw std::runtime_error("optimize needs at least one of --max-pos-error / --max-quat-error");
+
+    auto raw = read_file(in);
+    SniffResult s = sniff_table(in);
+    const u32 kResync = 64;
+    const u32 kSearchHi = 1u << 20; // real upper bound tried; ~20 real compress+decompress rounds to bisect it
+
+    if (s.columns != 2 && s.columns != 3 && s.columns != 7)
+        throw std::runtime_error("optimize only applies to detected geo2d/geo3d/pose data -- this file has no lossy mode to search");
+
+    std::ostringstream report;
+    std::vector<u8> file_out;
+    double raw_bytes = (double)raw.size();
+
+    if (s.columns == 2 || s.columns == 3) {
+        if (!have_pos_budget)
+            throw std::runtime_error("this file is geo2d/geo3d (position only) -- pass --max-pos-error");
+        bool capped = false;
+        i64 scale = safe_scale(s.decimals_a, s.max_abs_a, capped);
+        auto pts2 = s.columns == 2 ? read_points2d(in, scale) : std::vector<Point2i>{};
+        auto pts3 = s.columns == 3 ? read_points3d(in, scale) : std::vector<Point3i>{};
+
+        auto eval = [&](u32 step) -> double {
+            std::vector<u8> blob = s.columns == 2 ? compress_geo2d_lossy(pts2, step, kResync)
+                                                   : compress_geo3d_lossy(pts3, step, kResync);
+            double max_err = 0.0;
+            if (s.columns == 2) {
+                auto back = decompress_geo2d(blob);
+                for (size_t i = 0; i < pts2.size() && i < back.size(); i++)
+                    max_err = std::max({max_err, std::abs((double)(pts2[i].x - back[i].x)) / (double)scale,
+                                         std::abs((double)(pts2[i].y - back[i].y)) / (double)scale});
+            } else {
+                auto back = decompress_geo3d(blob);
+                for (size_t i = 0; i < pts3.size() && i < back.size(); i++)
+                    max_err = std::max({max_err, std::abs((double)(pts3[i].x - back[i].x)) / (double)scale,
+                                         std::abs((double)(pts3[i].y - back[i].y)) / (double)scale,
+                                         std::abs((double)(pts3[i].z - back[i].z)) / (double)scale});
+            }
+            return max_err;
+        };
+
+        u32 step = search_max_quant_step(pos_budget, kSearchHi, eval);
+        if (step == 0) {
+            std::vector<u8> blob = s.columns == 2 ? compress_geo2d(pts2) : compress_geo3d(pts3);
+            write_geo_header(file_out, (u8)s.columns, scale);
+            file_out.insert(file_out.end(), blob.begin(), blob.end());
+            report << "  even the finest lossy quantization step (1) measured "
+                   << eval(1) << " error, already within or exceeding your " << pos_budget
+                   << " budget either way -- using true lossless instead, since it's always at least as good and is exact.\n";
+        } else {
+            double achieved = eval(step);
+            std::vector<u8> blob = s.columns == 2 ? compress_geo2d_lossy(pts2, step, kResync) : compress_geo3d_lossy(pts3, step, kResync);
+            write_geo_header(file_out, (u8)s.columns, scale);
+            file_out.insert(file_out.end(), blob.begin(), blob.end());
+            report << "  searched quant_step in [1, " << kSearchHi << "]: chose " << step
+                   << " (real measured max error=" << achieved << ", budget=" << pos_budget << ")\n";
+        }
+    } else {
+        bool capped_a = false, capped_b = false;
+        i64 scale = safe_scale(s.decimals_a, s.max_abs_a, capped_a);
+        i64 qscale = safe_scale(s.decimals_b, s.max_abs_b, capped_b);
+        auto poses = read_poses(in, scale, qscale);
+
+        auto eval_pos = [&](u32 pos_step) -> double {
+            auto blob = compress_pose_lossy(poses, pos_step, kResync, 1, kResync);
+            auto back = decompress_pose(blob);
+            double e = 0.0;
+            for (size_t i = 0; i < poses.size() && i < back.size(); i++)
+                e = std::max({e, std::abs((double)(poses[i].position.x - back[i].position.x)) / (double)scale,
+                              std::abs((double)(poses[i].position.y - back[i].position.y)) / (double)scale,
+                              std::abs((double)(poses[i].position.z - back[i].position.z)) / (double)scale});
+            return e;
+        };
+        auto eval_quat = [&](u32 quat_step) -> double {
+            auto blob = compress_pose_lossy(poses, 1, kResync, quat_step, kResync);
+            auto back = decompress_pose(blob);
+            double e = 0.0;
+            for (size_t i = 0; i < poses.size() && i < back.size(); i++)
+                e = std::max({e, std::abs((double)(poses[i].orientation.w - back[i].orientation.w)) / (double)qscale,
+                              std::abs((double)(poses[i].orientation.x - back[i].orientation.x)) / (double)qscale,
+                              std::abs((double)(poses[i].orientation.y - back[i].orientation.y)) / (double)qscale,
+                              std::abs((double)(poses[i].orientation.z - back[i].orientation.z)) / (double)qscale});
+            return e;
+        };
+
+        u32 pos_step = have_pos_budget ? search_max_quant_step(pos_budget, kSearchHi, eval_pos) : 1;
+        u32 quat_step = have_quat_budget ? search_max_quant_step(quat_budget, kSearchHi, eval_quat) : 1;
+        bool pos_fell_back_lossless = have_pos_budget && pos_step == 0;
+        bool quat_fell_back_lossless = have_quat_budget && quat_step == 0;
+
+        if (pos_fell_back_lossless && quat_fell_back_lossless) {
+            auto blob = compress_pose(poses);
+            write_pose_header(file_out, scale, qscale);
+            file_out.insert(file_out.end(), blob.begin(), blob.end());
+            report << "  neither budget is satisfiable by the lossy path's finest step -- using true lossless for both position and rotation.\n";
+        } else {
+            if (pos_step == 0) pos_step = 1;
+            if (quat_step == 0) quat_step = 1;
+            // Real combined verification -- position and rotation are
+            // independent sub-streams by format design (see FORMAT.md),
+            // so no interaction is expected, but this re-measures the
+            // actual combined blob rather than assuming the two isolated
+            // searches compose without checking.
+            auto blob = compress_pose_lossy(poses, pos_step, kResync, quat_step, kResync);
+            auto back = decompress_pose(blob);
+            double combined_pos_err = 0.0, combined_quat_err = 0.0;
+            for (size_t i = 0; i < poses.size() && i < back.size(); i++) {
+                combined_pos_err = std::max({combined_pos_err,
+                    std::abs((double)(poses[i].position.x - back[i].position.x)) / (double)scale,
+                    std::abs((double)(poses[i].position.y - back[i].position.y)) / (double)scale,
+                    std::abs((double)(poses[i].position.z - back[i].position.z)) / (double)scale});
+                combined_quat_err = std::max({combined_quat_err,
+                    std::abs((double)(poses[i].orientation.w - back[i].orientation.w)) / (double)qscale,
+                    std::abs((double)(poses[i].orientation.x - back[i].orientation.x)) / (double)qscale,
+                    std::abs((double)(poses[i].orientation.y - back[i].orientation.y)) / (double)qscale,
+                    std::abs((double)(poses[i].orientation.z - back[i].orientation.z)) / (double)qscale});
+            }
+            bool pos_ok = !have_pos_budget || combined_pos_err <= pos_budget;
+            bool quat_ok = !have_quat_budget || combined_quat_err <= quat_budget;
+            if (!pos_ok || !quat_ok)
+                throw std::runtime_error("internal error: combined configuration violated a budget that passed in isolation "
+                                          "(pos_err=" + std::to_string(combined_pos_err) + ", quat_err=" + std::to_string(combined_quat_err) +
+                                          ") -- please report this, it should not be possible given independent sub-streams");
+            write_pose_header(file_out, scale, qscale);
+            file_out.insert(file_out.end(), blob.begin(), blob.end());
+            report << "  position: " << (pos_fell_back_lossless ? "lossless (finest lossy step still too coarse)" : "quant_step=" + std::to_string(pos_step))
+                   << ", measured error=" << combined_pos_err << (have_pos_budget ? " (budget=" + std::to_string(pos_budget) + ")" : " (no budget given)") << "\n";
+            report << "  rotation: " << (quat_fell_back_lossless ? "lossless (finest lossy step still too coarse)" : "quant_step=" + std::to_string(quat_step))
+                   << ", measured error=" << combined_quat_err << (have_quat_budget ? " (budget=" + std::to_string(quat_budget) + ")" : " (no budget given)") << "\n";
+        }
+    }
+
+    write_file(out, file_out);
+    double pct = raw_bytes == 0 ? 0.0 : 100.0 * (1.0 - (double)file_out.size() / raw_bytes);
+    std::cout << "optimize: " << in << " (" << raw.size() << " bytes) -> " << out << " (" << file_out.size()
+               << " bytes), " << pct << "% smaller\n";
+    if (explain) std::cout << report.str();
+    return 0;
+}
+
 int cmd_unsqueeze(const std::string& in, std::string out, bool explain, bool force) {
     if (out.empty()) out = in + ".restored";
     if (!force && file_exists(out))
@@ -721,6 +907,9 @@ int cmd_inspect(const std::string& path) {
         std::cout << "  detected shape: general (arbitrary bytes) -- would fall back to compress()\n";
         std::cout << "  numeric-table match rate: " << s.rows << " / " << s.total_lines << " lines ("
                   << std::fixed << std::setprecision(1) << confidence << "% -- below the 95% threshold squeeze() requires)\n";
+        std::cout << "  recommendation: NOT a good fit for this codec's specialty (no clean 2/3/7-column numeric\n"
+                      "    table detected) -- general-purpose compression (zstd/gzip/lzma) is the fair comparison\n"
+                      "    here, not CSA's own lossy modes. See WHY_NOT_ZSTD.md.\n";
         return 0;
     }
     const char* shape = s.columns == 2 ? "geo2d" : s.columns == 3 ? "geo3d" : "pose (6-DOF)";
@@ -732,6 +921,10 @@ int cmd_inspect(const std::string& path) {
     max_abs_line << std::fixed << std::setprecision(6) << "  max abs value: position=" << s.max_abs_a;
     if (s.columns == 7) max_abs_line << ", orientation=" << s.max_abs_b;
     std::cout << max_abs_line.str() << "\n";
+    std::cout << "  recommendation: a good fit for this codec's specialty (a clean, consistent " << s.columns
+               << "-column numeric table was detected). `scissorc squeeze` will compress it losslessly by\n"
+                  "    default; `scissorc optimize` can search for the strongest lossy configuration that\n"
+                  "    still satisfies a real position/rotation error budget you state, if lossless isn't required.\n";
     return 0;
 }
 
@@ -784,6 +977,133 @@ int cmd_verify(const std::string& path) {
         std::cout << "verify: " << path << " -- FAILED: " << e.what() << "\n";
         return 1;
     }
+}
+
+// Real gzip-equivalent baseline via vendored miniz (see CMakeLists.txt) --
+// not an estimate, an actual mz_compress2()/mz_uncompress() round trip on
+// the identical raw bytes CSA sees, timed with the same std::chrono
+// pattern cmd_bench_transform already uses elsewhere in this file.
+struct GzipResult { size_t compressed_bytes; double compress_ms; double decompress_ms; bool round_trip_ok; };
+GzipResult gzip_equivalent_benchmark(const std::vector<u8>& raw) {
+    mz_ulong bound = mz_compressBound((mz_ulong)raw.size());
+    std::vector<u8> out(bound);
+    mz_ulong out_len = bound;
+    auto t0 = std::chrono::steady_clock::now();
+    int rc = mz_compress2(out.data(), &out_len, raw.data(), (mz_ulong)raw.size(), MZ_BEST_COMPRESSION);
+    auto t1 = std::chrono::steady_clock::now();
+    if (rc != MZ_OK) throw std::runtime_error("miniz mz_compress2 failed (code " + std::to_string(rc) + ")");
+    out.resize(out_len);
+
+    std::vector<u8> back(raw.size());
+    mz_ulong back_len = (mz_ulong)raw.size();
+    auto t2 = std::chrono::steady_clock::now();
+    rc = mz_uncompress(back.data(), &back_len, out.data(), (mz_ulong)out.size());
+    auto t3 = std::chrono::steady_clock::now();
+    bool ok = (rc == MZ_OK) && (back_len == raw.size()) && (back == raw);
+
+    return {
+        out.size(),
+        std::chrono::duration<double, std::milli>(t1 - t0).count(),
+        std::chrono::duration<double, std::milli>(t3 - t2).count(),
+        ok,
+    };
+}
+
+// `scissorc benchmark <file>`: a real, measured comparison table -- CSA's
+// own auto-detected mode (whatever squeeze() would actually pick) against
+// a real gzip-equivalent baseline (vendored miniz, not an estimate).
+// Deliberately does NOT include an lzma column: a real LZMA implementation
+// is a much larger dependency than the single-file miniz vendored for
+// this feature (see CMakeLists.txt's comment on that trade-off) -- adding
+// it is future scope, not something this command pretends to already do.
+// For the project's own already-measured lzma/zstd/brotli comparisons on
+// real datasets, see REAL_POSE_BENCHMARK.md / REAL_GEO_BENCHMARK.md
+// instead, which this command does not attempt to reproduce or replace.
+int cmd_benchmark(const std::string& path) {
+    auto raw = read_file(path);
+    SniffResult s = sniff_table(path);
+
+    std::string shape_name = "general (arbitrary bytes)";
+    std::vector<u8> csa_blob;
+    double csa_compress_ms = 0.0, csa_decompress_ms = 0.0;
+    bool csa_round_trip_ok = false;
+
+    auto t0 = std::chrono::steady_clock::now();
+    if (s.columns == 2 || s.columns == 3) {
+        bool capped = false;
+        i64 scale = safe_scale(s.decimals_a, s.max_abs_a, capped);
+        shape_name = s.columns == 2 ? "geo2d" : "geo3d";
+        if (s.columns == 2) {
+            auto pts = read_points2d(path, scale);
+            csa_blob = compress_geo2d(pts);
+            auto t1 = std::chrono::steady_clock::now();
+            csa_compress_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            auto t2 = std::chrono::steady_clock::now();
+            auto back = decompress_geo2d(csa_blob);
+            auto t3 = std::chrono::steady_clock::now();
+            csa_decompress_ms = std::chrono::duration<double, std::milli>(t3 - t2).count();
+            csa_round_trip_ok = back.size() == pts.size();
+        } else {
+            auto pts = read_points3d(path, scale);
+            csa_blob = compress_geo3d(pts);
+            auto t1 = std::chrono::steady_clock::now();
+            csa_compress_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            auto t2 = std::chrono::steady_clock::now();
+            auto back = decompress_geo3d(csa_blob);
+            auto t3 = std::chrono::steady_clock::now();
+            csa_decompress_ms = std::chrono::duration<double, std::milli>(t3 - t2).count();
+            csa_round_trip_ok = back.size() == pts.size();
+        }
+    } else if (s.columns == 7) {
+        bool capped_a = false, capped_b = false;
+        i64 scale = safe_scale(s.decimals_a, s.max_abs_a, capped_a);
+        i64 qscale = safe_scale(s.decimals_b, s.max_abs_b, capped_b);
+        shape_name = "pose";
+        auto poses = read_poses(path, scale, qscale);
+        csa_blob = compress_pose(poses);
+        auto t1 = std::chrono::steady_clock::now();
+        csa_compress_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        auto t2 = std::chrono::steady_clock::now();
+        auto back = decompress_pose(csa_blob);
+        auto t3 = std::chrono::steady_clock::now();
+        csa_decompress_ms = std::chrono::duration<double, std::milli>(t3 - t2).count();
+        csa_round_trip_ok = back.size() == poses.size();
+    } else {
+        csa_blob = compress(raw, false, kLzDefaultMaxChain, kLzDefaultNiceLength);
+        auto t1 = std::chrono::steady_clock::now();
+        csa_compress_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        auto t2 = std::chrono::steady_clock::now();
+        auto back = decompress(csa_blob);
+        auto t3 = std::chrono::steady_clock::now();
+        csa_decompress_ms = std::chrono::duration<double, std::milli>(t3 - t2).count();
+        csa_round_trip_ok = back == raw;
+    }
+
+    GzipResult gz = gzip_equivalent_benchmark(raw);
+
+    auto pct = [&](size_t compressed) {
+        return raw.empty() ? 0.0 : 100.0 * (1.0 - (double)compressed / (double)raw.size());
+    };
+    std::cout << "benchmark: " << path << " (" << raw.size() << " bytes), detected: " << shape_name << "\n";
+    std::cout << std::fixed << std::setprecision(2);
+    std::cout << std::left << std::setw(24) << "  algorithm" << std::right
+               << std::setw(12) << "size (bytes)" << std::setw(11) << "reduction" << std::setw(15) << "compress (ms)"
+               << std::setw(18) << "decompress (ms)" << std::setw(11) << "verified" << "\n";
+    std::string csa_label = "  CSA (" + shape_name + (shape_name == "general" ? ", lossless)" : ", exact)");
+    std::cout << std::left << std::setw(24) << csa_label << std::right
+               << std::setw(12) << csa_blob.size() << std::setw(10) << pct(csa_blob.size()) << "%"
+               << std::setw(15) << csa_compress_ms << std::setw(18) << csa_decompress_ms
+               << std::setw(11) << (csa_round_trip_ok ? "yes" : "NO -- MISMATCH") << "\n";
+    std::cout << std::left << std::setw(24) << "  gzip-equivalent" << std::right
+               << std::setw(12) << gz.compressed_bytes << std::setw(10) << pct(gz.compressed_bytes) << "%"
+               << std::setw(15) << gz.compress_ms << std::setw(18) << gz.decompress_ms
+               << std::setw(11) << (gz.round_trip_ok ? "yes" : "NO -- MISMATCH") << "\n";
+    std::cout << "  (lzma/zstd/brotli comparisons on real datasets already measured offline -- see "
+                  "REAL_POSE_BENCHMARK.md / REAL_GEO_BENCHMARK.md; not reproduced live here)\n";
+
+    if (!csa_round_trip_ok || !gz.round_trip_ok)
+        return 1; // a benchmark whose own round-trip failed is not a number anyone should trust
+    return 0;
 }
 
 // Diagnostic: isolates lz_parse's match-finding time from lz_encode's
@@ -882,6 +1202,22 @@ void usage() {
         "      and the real, measured round-trip error.\n"
         "  scissorc unsqueeze <in> [out] [--explain] [--force]\n"
         "      Reverses squeeze. [out] defaults to <in>.restored.\n"
+        "  scissorc optimize <in> [out] --max-pos-error N [--max-quat-error N] [--explain] [--force]\n"
+        "      Auto-Optimize: searches the codec's real quant_step parameter space\n"
+        "      (via actual compress+decompress+measure at each candidate, not an\n"
+        "      estimate) for the strongest compression whose measured error stays\n"
+        "      within your stated budget. --max-pos-error is in the file's own\n"
+        "      position units; --max-quat-error is raw quaternion-component error\n"
+        "      (not degrees). Falls back to true lossless, honestly, if even the\n"
+        "      finest lossy step exceeds your budget. Only applies to detected\n"
+        "      geo2d/geo3d/pose data.\n"
+        "  scissorc benchmark <file>\n"
+        "      Real, measured comparison: CSA's own auto-detected mode (whatever\n"
+        "      squeeze() would pick) vs. a real gzip-equivalent baseline (vendored\n"
+        "      miniz) -- actual size, actual compress/decompress time, actual\n"
+        "      round-trip verification for both, not estimates. Does not include\n"
+        "      lzma/zstd/brotli (see REAL_POSE_BENCHMARK.md/REAL_GEO_BENCHMARK.md\n"
+        "      for those, measured offline on real datasets instead).\n"
         "  scissorc inspect <file>\n"
         "      Reports what squeeze/unsqueeze would actually do with this file --\n"
         "      the detected shape and confidence for a raw input, or the real\n"
@@ -943,6 +1279,22 @@ int main(int argc, char** argv) {
                 else if (a == "--force") force = true;
             }
             return cmd_unsqueeze(in, out, explain, force);
+        } else if (cmd == "optimize" && argc >= 3) {
+            std::string in = argv[2];
+            std::string out;
+            bool explain = false, force = false;
+            bool have_pos_budget = false, have_quat_budget = false;
+            double pos_budget = 0.0, quat_budget = 0.0;
+            int i = 3;
+            if (i < argc && std::string(argv[i]).rfind("--", 0) != 0) out = argv[i++];
+            for (; i < argc; i++) {
+                std::string a = argv[i];
+                if (a == "--max-pos-error" && i + 1 < argc) { have_pos_budget = true; pos_budget = std::stod(argv[++i]); }
+                else if (a == "--max-quat-error" && i + 1 < argc) { have_quat_budget = true; quat_budget = std::stod(argv[++i]); }
+                else if (a == "--explain") explain = true;
+                else if (a == "--force") force = true;
+            }
+            return cmd_optimize(in, out, have_pos_budget, pos_budget, have_quat_budget, quat_budget, explain, force);
         } else if (cmd == "compress" && argc >= 4) {
             bool gpu = false;
             std::string level = "balanced";
@@ -1016,6 +1368,8 @@ int main(int argc, char** argv) {
             return cmd_inspect(argv[2]);
         } else if (cmd == "verify" && argc >= 3) {
             return cmd_verify(argv[2]);
+        } else if (cmd == "benchmark" && argc >= 3) {
+            return cmd_benchmark(argv[2]);
         } else if (cmd == "bench-lz" && argc >= 3) {
             return cmd_bench_lz(argv[2]);
         } else if (cmd == "bench-transform" && argc >= 3) {

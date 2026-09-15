@@ -77,7 +77,52 @@ else()
     target_compile_definitions(csa_core PUBLIC CSA_HAVE_CUDA=0)
 endif()
 
-add_executable(scissorc cli/main.cpp)
+# miniz: a single-file (miniz.c/miniz.h), public-domain, zlib-compatible
+# deflate/inflate implementation -- vendored (not a system dependency) so
+# `scissorc benchmark` can compare CSA against a real gzip-equivalent
+# baseline without relying on zlib being present on the build machine
+# (it isn't, by default, on plain Windows). Populated without running
+# miniz's own CMakeLists.txt (which calls project(miniz C) and would
+# otherwise fight this project's own C++-only language/flags setup) --
+# only its two source files are added directly to the scissorc target
+# below. This is the one real new external dependency added for the
+# "csa benchmark" feature; deliberately does not also vendor a real LZMA
+# implementation (a much larger, multi-file dependency), so `scissorc
+# benchmark`'s comparison is against gzip-equivalent only, not lzma --
+# see its --explain output and BENCHMARKS.md for that disclosed scope.
+include(FetchContent)
+enable_language(C)
+FetchContent_Declare(
+    miniz
+    GIT_REPOSITORY https://github.com/richgel999/miniz.git
+    GIT_TAG 3.1.2
+)
+FetchContent_GetProperties(miniz)
+if(NOT miniz_POPULATED)
+    FetchContent_Populate(miniz)
+endif()
+
+# miniz.h unconditionally #includes "miniz_export.h", normally produced by
+# its own CMakeLists.txt's generate_export_header() call (which we're
+# deliberately not running -- see the comment above). Since miniz.c is
+# compiled directly into scissorc as a static object, not a separate
+# shared library, the export macro just needs to be empty; write that by
+# hand rather than pull in miniz's own build system for one generated file.
+file(WRITE "${miniz_SOURCE_DIR}/miniz_export.h" "#ifndef MINIZ_EXPORT\n#define MINIZ_EXPORT\n#endif\n")
+
+# miniz.c alone (the zlib-compatible mz_compress2()/mz_uncompress()
+# wrapper layer) isn't actually self-contained in this repo's git tree --
+# it calls tdefl_*/tinfl_* functions whose real implementations live in
+# the separate miniz_tdef.c/miniz_tinfl.c files (a true single-file
+# amalgamation is only produced by amalgamate.sh for packaged releases,
+# not committed as-is); found this the direct way, via a real unresolved-
+# symbol link error, not by reading miniz's docs closely enough up front.
+add_executable(scissorc cli/main.cpp
+    "${miniz_SOURCE_DIR}/miniz.c"
+    "${miniz_SOURCE_DIR}/miniz_tdef.c"
+    "${miniz_SOURCE_DIR}/miniz_tinfl.c"
+)
+target_include_directories(scissorc PRIVATE "${miniz_SOURCE_DIR}")
 target_link_libraries(scissorc PRIVATE csa_core)
 
 # libcsa: stable C ABI shared library for language bindings (Python, Rust,

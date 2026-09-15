@@ -198,6 +198,68 @@ def test_inspect_and_verify():
         pass
 
 
+def test_optimize():
+    points3d = [(int(3000 * math.cos(i * 0.11) + (i * 37 % 23) - 11),
+                 int(3000 * math.sin(i * 0.11) + (i * 53 % 19) - 9),
+                 int(i * 4 + (i * 29 % 17))) for i in range(600)]
+    lossless_blob = csa.compress_geo3d(points3d)
+
+    r = csa.optimize_geo3d(points3d, max_pos_error=20)
+    check(not r["lossless"], "optimize_geo3d: budget of 20 units is loose enough to find a lossy config")
+    check(r["measured_error"] <= 20, f"optimize_geo3d: measured error respects budget ({r['measured_error']})")
+    check(len(r["blob"]) < len(lossless_blob), f"optimize_geo3d: found smaller-than-lossless ({len(r['blob'])} < {len(lossless_blob)})")
+    back = csa.decompress_geo3d(r["blob"])
+    max_err = max(max(abs(a - b) for a, b in zip(p, q)) for p, q in zip(points3d, back))
+    check(max_err == r["measured_error"], "optimize_geo3d: reported error matches independently re-measured error")
+
+    poses = []
+    qw, qz = 1000000, 0
+    for i in range(300):
+        poses.append(((1000 + i * 3, 2000 - i * 2, 3000 + i), (qw, 0, 0, qz)))
+        qz += 500  # drift the orientation component a little each step
+
+    rp = csa.optimize_pose(poses, max_pos_error=8, max_quat_error=2000)
+    check(rp["measured_pos_error"] <= 8, f"optimize_pose: position error respects budget ({rp['measured_pos_error']})")
+    check(rp["measured_quat_error"] <= 2000, f"optimize_pose: rotation error respects budget ({rp['measured_quat_error']})")
+    back_p = csa.decompress_pose(rp["blob"])
+    check(len(back_p) == len(poses), "optimize_pose: round trip preserves record count")
+
+    # Position-only budget: rotation should fall back to quant_step=1 (near-lossless), not be dropped.
+    rp2 = csa.optimize_pose(poses, max_pos_error=8)
+    check(rp2["quat_quant_step"] in (1, None), "optimize_pose: rotation held at finest step when no rotation budget given")
+
+    try:
+        csa.optimize_pose(poses)
+        check(False, "expected ValueError with no budget given")
+    except ValueError:
+        pass
+
+
+def test_profile():
+    import tempfile
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+        for i in range(200):
+            f.write(f"{1.0 + i * 0.1:.6f} {2.0 - i * 0.1:.6f} {3.0 + i * 0.2:.6f}\n")
+        path = f.name
+    try:
+        info = csa.profile(path)
+        check(info["shape"] == "geo3d", f"profile: detects geo3d for a clean 3-column table ({info})")
+        check(info["confidence_pct"] == 100.0, "profile: 100% confidence for a fully clean table")
+        check(info["recommended"] is True, "profile: recommends CSA for detected geo3d data")
+    finally:
+        os.unlink(path)
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+        f.write("this is not spatial data, just prose text with no numeric table structure at all\n")
+        path2 = f.name
+    try:
+        info2 = csa.profile(path2)
+        check(info2["shape"] == "general", "profile: detects general shape for non-numeric text")
+        check(info2["recommended"] is False, "profile: does not recommend CSA for general text")
+    finally:
+        os.unlink(path2)
+
+
 def main():
     test_general()
     test_geo2d()
@@ -206,6 +268,8 @@ def main():
     test_pose_lossy()
     test_error_handling()
     test_inspect_and_verify()
+    test_optimize()
+    test_profile()
     print(f"cuda_available() = {csa.cuda_available()}")
     print(f"{checks} checks, {failures} failures")
     sys.exit(1 if failures else 0)

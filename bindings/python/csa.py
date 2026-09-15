@@ -23,6 +23,7 @@ import ctypes
 import ctypes.util
 import os
 import platform
+import re
 import struct
 from typing import Iterable, List, Tuple
 
@@ -32,6 +33,7 @@ __all__ = [
     "compress_geo3d", "compress_geo3d_lossy", "decompress_geo3d",
     "compress_pose", "compress_pose_lossy", "decompress_pose",
     "cuda_available", "inspect", "verify",
+    "optimize_geo2d", "optimize_geo3d", "optimize_pose", "profile",
 ]
 
 # Kept in sync with pyproject.toml's [project].version by hand -- there is
@@ -391,3 +393,220 @@ def verify(data: bytes) -> dict:
     else:
         restored = decompress(data)
         return {"shape": "general", "count": len(restored)}
+
+
+def _search_max_quant_step(budget: float, hi: int, eval_fn) -> int:
+    """Largest quant_step in [1, hi] whose real measured error (from eval_fn,
+    which must actually compress+decompress+measure, not estimate) stays
+    <= budget. eval_fn is assumed monotonically non-decreasing in
+    quant_step -- true of this codec's quantization by construction.
+    Returns 0 if even quant_step=1 (the finest granularity the *lossy*
+    path offers) already exceeds the budget, in which case the caller
+    should recommend true lossless rather than a fabricated best effort.
+    Mirrors cli/main.cpp's search_max_quant_step exactly."""
+    if eval_fn(1) > budget:
+        return 0
+    lo, hi_, best = 1, hi, 1
+    while lo <= hi_:
+        mid = lo + (hi_ - lo) // 2
+        if eval_fn(mid) <= budget:
+            best = mid
+            if mid == hi_:
+                break
+            lo = mid + 1
+        else:
+            if mid == lo:
+                break
+            hi_ = mid - 1
+    return best
+
+
+_OPTIMIZE_SEARCH_HI = 1 << 20
+
+
+def optimize_geo2d(points: Iterable[Tuple[int, int]], max_pos_error: float) -> dict:
+    """Auto-Optimize for geo2d: searches the real quant_step space (via
+    actual compress+decompress+measure at each candidate -- see
+    _search_max_quant_step) for the strongest compression whose measured
+    max coordinate error stays within max_pos_error, in the same integer
+    units `points` is already expressed in. Returns {"blob": bytes,
+    "quant_step": int or None, "measured_error": float, "lossless": bool}
+    -- lossless=True means even the finest lossy step exceeded the
+    budget and true compress_geo2d() was used instead."""
+    points = list(points)
+
+    def eval_fn(step):
+        blob = compress_geo2d_lossy(points, step, 64)
+        back = decompress_geo2d(blob)
+        return max((max(abs(a - b) for a, b in zip(p, q)) for p, q in zip(points, back)), default=0.0)
+
+    step = _search_max_quant_step(max_pos_error, _OPTIMIZE_SEARCH_HI, eval_fn)
+    if step == 0:
+        return {"blob": compress_geo2d(points), "quant_step": None, "measured_error": 0.0, "lossless": True}
+    blob = compress_geo2d_lossy(points, step, 64)
+    return {"blob": blob, "quant_step": step, "measured_error": eval_fn(step), "lossless": False}
+
+
+def optimize_geo3d(points: Iterable[Tuple[int, int, int]], max_pos_error: float) -> dict:
+    """Auto-Optimize for geo3d. See optimize_geo2d -- identical contract."""
+    points = list(points)
+
+    def eval_fn(step):
+        blob = compress_geo3d_lossy(points, step, 64)
+        back = decompress_geo3d(blob)
+        return max((max(abs(a - b) for a, b in zip(p, q)) for p, q in zip(points, back)), default=0.0)
+
+    step = _search_max_quant_step(max_pos_error, _OPTIMIZE_SEARCH_HI, eval_fn)
+    if step == 0:
+        return {"blob": compress_geo3d(points), "quant_step": None, "measured_error": 0.0, "lossless": True}
+    blob = compress_geo3d_lossy(points, step, 64)
+    return {"blob": blob, "quant_step": step, "measured_error": eval_fn(step), "lossless": False}
+
+
+def optimize_pose(poses: Iterable[Pose], max_pos_error: float = None, max_quat_error: float = None) -> dict:
+    """Auto-Optimize for 6-DOF pose: position and rotation are searched
+    independently (holding the other at quant_step=1, since the format
+    encodes them as two genuinely separate sub-streams -- see FORMAT.md's
+    Pose mode description), then the combined configuration is
+    re-verified for real before being returned, rather than assumed
+    additive. Pass only one of max_pos_error/max_quat_error to optimize
+    just that half (the other is held at quant_step=1, the finest the
+    lossy path offers). Mirrors `scissorc optimize` exactly.
+
+    Returns {"blob": bytes, "pos_quant_step": int or None,
+    "quat_quant_step": int or None, "measured_pos_error": float,
+    "measured_quat_error": float, "pos_lossless": bool, "quat_lossless":
+    bool}."""
+    if max_pos_error is None and max_quat_error is None:
+        raise ValueError("optimize_pose needs at least one of max_pos_error / max_quat_error")
+    poses = list(poses)
+
+    def eval_pos(step):
+        blob = compress_pose_lossy(poses, step, 64, 1, 64)
+        back = decompress_pose(blob)
+        return max((max(abs(a - b) for a, b in zip(p[0], q[0])) for p, q in zip(poses, back)), default=0.0)
+
+    def eval_quat(step):
+        blob = compress_pose_lossy(poses, 1, 64, step, 64)
+        back = decompress_pose(blob)
+        return max((max(abs(a - b) for a, b in zip(p[1], q[1])) for p, q in zip(poses, back)), default=0.0)
+
+    pos_step = _search_max_quant_step(max_pos_error, _OPTIMIZE_SEARCH_HI, eval_pos) if max_pos_error is not None else 1
+    quat_step = _search_max_quant_step(max_quat_error, _OPTIMIZE_SEARCH_HI, eval_quat) if max_quat_error is not None else 1
+    pos_lossless = max_pos_error is not None and pos_step == 0
+    quat_lossless = max_quat_error is not None and quat_step == 0
+
+    if pos_lossless and quat_lossless:
+        return {
+            "blob": compress_pose(poses), "pos_quant_step": None, "quat_quant_step": None,
+            "measured_pos_error": 0.0, "measured_quat_error": 0.0, "pos_lossless": True, "quat_lossless": True,
+        }
+
+    final_pos_step = 1 if pos_step == 0 else pos_step
+    final_quat_step = 1 if quat_step == 0 else quat_step
+    blob = compress_pose_lossy(poses, final_pos_step, 64, final_quat_step, 64)
+    back = decompress_pose(blob)
+    combined_pos_err = max((max(abs(a - b) for a, b in zip(p[0], q[0])) for p, q in zip(poses, back)), default=0.0)
+    combined_quat_err = max((max(abs(a - b) for a, b in zip(p[1], q[1])) for p, q in zip(poses, back)), default=0.0)
+    if (max_pos_error is not None and combined_pos_err > max_pos_error) or \
+       (max_quat_error is not None and combined_quat_err > max_quat_error):
+        raise CsaError(
+            f"internal error: combined configuration violated a budget that passed in isolation "
+            f"(pos_err={combined_pos_err}, quat_err={combined_quat_err}) -- please report this"
+        )
+    return {
+        "blob": blob,
+        "pos_quant_step": None if pos_lossless else final_pos_step,
+        "quat_quant_step": None if quat_lossless else final_quat_step,
+        "measured_pos_error": combined_pos_err, "measured_quat_error": combined_quat_err,
+        "pos_lossless": pos_lossless, "quat_lossless": quat_lossless,
+    }
+
+
+def _find_cli() -> str:
+    here = os.path.dirname(os.path.abspath(__file__))
+    name = "scissorc.exe" if platform.system() == "Windows" else "scissorc"
+    for candidate in (
+        os.path.join(here, name),
+        os.path.abspath(os.path.join(here, "..", "..", "build", name)),
+    ):
+        if os.path.exists(candidate):
+            return candidate
+    raise OSError(
+        "Could not locate the scissorc CLI binary (checked next to this file and "
+        "../../build/ relative to it). profile() shells out to it rather than "
+        "reimplementing its text-table sniffing heuristic a second time in Python -- "
+        "build the project first (cmake --build build --target scissorc)."
+    )
+
+
+def profile(path: str) -> dict:
+    """Runs `scissorc inspect <path>` and parses its real output into a
+    structured dict. Deliberately implemented by shelling out to the
+    actual CLI rather than re-implementing its text-table detection
+    heuristic (sniff_table(), cli/main.cpp) a second time in pure Python
+    -- that heuristic lives in exactly one place, already covered by the
+    C++ test suite, so this can't drift out of sync with what
+    `scissorc squeeze` itself would actually detect. Requires the CLI
+    binary to be built and locatable (see _find_cli()) -- a real
+    limitation of this specific function, not the rest of the module: a
+    plain `pip install .` only packages libcsa itself (see
+    pyproject.toml's build.targets), not the scissorc executable, so
+    profile() raises OSError with an actionable message in that case
+    while every other function in this module keeps working normally.
+    This is a different code path than the rest of this module, which
+    talks to libcsa directly via ctypes and has no such dependency.
+
+    Returns a dict with at least "recognized_csa_file" (bool). For a raw
+    (non-.csa) input: "shape" ("general"/"geo2d"/"geo3d"/"pose"),
+    "confidence_pct" (float), "recommended" (bool), plus
+    "decimals_position"/"decimals_orientation"/"max_abs_position"/
+    "max_abs_orientation" when a shape was detected. For an actual .csa
+    file, returns the same fields inspect() already provides.
+    """
+    import subprocess
+
+    cli = _find_cli()
+    result = subprocess.run([cli, "inspect", path], capture_output=True, text=True)
+    output = result.stdout
+    if result.returncode != 0:
+        raise CsaError(f"scissorc inspect failed: {result.stderr.strip() or output.strip()}")
+
+    if "not a recognized .csa file" not in output:
+        # Real .csa file -- read it and reuse inspect() rather than re-parsing this text a second way.
+        with open(path, "rb") as f:
+            info = inspect(f.read())
+        info["recognized_csa_file"] = True
+        return info
+
+    info = {"recognized_csa_file": False}
+    m = re.search(r"detected shape: general", output)
+    if m:
+        info["shape"] = "general"
+        conf_m = re.search(r"match rate: (\d+) / (\d+) lines \(([\d.]+)%", output)
+        if conf_m:
+            info["confidence_pct"] = float(conf_m.group(3))
+        info["recommended"] = False
+        return info
+
+    shape_m = re.search(r"detected shape: (geo2d|geo3d|pose)", output)
+    if shape_m:
+        info["shape"] = shape_m.group(1)
+        conf_m = re.search(r"confidence: (\d+) / (\d+) lines matched \(([\d.]+)%\)", output)
+        if conf_m:
+            info["confidence_pct"] = float(conf_m.group(3))
+        dec_m = re.search(r"decimal precision: position=(\d+)(?:, orientation=(\d+))?", output)
+        if dec_m:
+            info["decimals_position"] = int(dec_m.group(1))
+            if dec_m.group(2):
+                info["decimals_orientation"] = int(dec_m.group(2))
+        abs_m = re.search(r"max abs value: position=([\d.]+)(?:, orientation=([\d.]+))?", output)
+        if abs_m:
+            info["max_abs_position"] = float(abs_m.group(1))
+            if abs_m.group(2):
+                info["max_abs_orientation"] = float(abs_m.group(2))
+        info["recommended"] = True
+        return info
+
+    info["raw_output"] = output
+    return info

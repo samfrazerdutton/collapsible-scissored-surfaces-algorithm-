@@ -1680,6 +1680,110 @@ for equivalent files -- including a screenshot of the rendered hex dump
 showing the format's own documented "CSAG ... CSA1" double-magic
 artifact in the actual byte content, not just asserted in text.
 
+### Auto-Optimize, Profile-before-compress, and a real gzip-equivalent benchmark
+
+The next ask was a 170-section brief for a full commercial spatial-data
+platform (multi-page app routing, a packet-level replay engine, ROI
+calculator, fleet simulator, ROS2-in-browser, streaming transport
+abstractions, fuzzing infrastructure, release engineering) -- the same
+category of request as the 114-section brief before it, just larger.
+Applied the same discipline again: audited what already exists (real
+bindings in five languages, a real ROS2 bridge, CI already running the
+correctness matrix), proposed three concretely buildable slices that fit
+this project's actual static-site-plus-native-core architecture, and the
+user picked all three: an error-budget auto-optimizer, a profile-before-
+compress step, and a real multi-codec benchmark comparison.
+
+**Auto-Optimize** (`scissorc optimize`, `csa.optimize_geo2d`/
+`optimize_geo3d`/`optimize_pose`, and a new `optimize` Worker command in
+`docs/index.html`, three independent implementations of the same real
+search): rather than picking a `quant_step` and checking whether the
+resulting error happens to be acceptable, states a real position and/or
+rotation error budget and binary-searches the codec's actual
+`quant_step` parameter space -- an actual compress+decompress+measure at
+each candidate step, not an estimate -- for the strongest compression
+that stays within it. For pose data, position and rotation are searched
+independently (holding the other at `quant_step=1`, since the format
+encodes them as genuinely separate sub-streams per FORMAT.md), then the
+combined configuration is re-verified for real before being reported,
+rather than assumed additive. Falls back to true lossless, honestly, if
+even the finest lossy step (`quant_step=1`) still exceeds the stated
+budget. A real, incidental finding surfaced by this feature: `quant_step
+=1` is a mathematical no-op in this codec's quantization (divide-and-
+round by 1 changes nothing), so it always measures exactly zero error --
+meaning the search's real floor is finer than the manual UI sliders
+ever reach (they bottom out at `quant_step=2`, quality=9), a genuine
+capability gap between the two interfaces worth knowing about. Verified
+across all three implementations with real datasets: tight/loose/
+impossible budgets, position-only vs. both-budgets cases, and the
+honest-lossless-fallback path, including one case where a naive test
+assumption ("a looser budget must find something smaller than lossless")
+turned out to be wrong for a particular dataset because this codec's
+real quantization error jumps discontinuously between adjacent
+`quant_step` values rather than varying smoothly -- caught by an actual
+failing assertion, not assumed away.
+
+**Profile-before-compress** (`scissorc inspect`'s existing raw-file
+output, now with an added one-line evidence-based recommendation; a new
+`profile` Worker command plus a "Profile (detect only, no compression)"
+button in the Compression Lab; `csa.profile()` in Python): surfaces the
+same real `sniff_table()`/`sniffTable()` detection already used
+internally by `squeeze()`, as its own visible step, before any
+compression happens -- with a recommendation grounded strictly in the
+real detected shape and confidence percentage, never a fabricated "fit
+score." Python's `profile()` is deliberately implemented by shelling out
+to the real `scissorc inspect` command rather than re-implementing the
+sniffing heuristic a third time in pure Python (it already exists in
+both C++ and, as of the redesign work, JavaScript) -- documented plainly
+as a real limitation specific to that one function: a plain `pip
+install .` doesn't package the CLI binary, so `profile()` raises an
+actionable `OSError` in that case while every other function in the
+module keeps working via ctypes with no such dependency. Verified this
+distinction directly: confirmed `profile()` fails with the documented
+message against a fresh pip-installed wheel, while `compress`/
+`decompress`/`inspect`/`verify`/`optimize_*` all keep working normally
+in that same environment.
+
+While wiring the browser's `profile`/`optimize` commands, extended the
+existing JS `sniffTable()` to also expose a `totalLines` field --
+mirroring a fix already made to the C++ `SniffResult` struct in the
+prior redesign pass, which the JS port had never received. A real
+end-to-end worker_threads test caught this immediately (confidence
+computed as `NaN`/`0` instead of the real percentage) before it reached
+the browser; fixed by applying the identical change to the JS version.
+
+**`scissorc benchmark <file>`** (real multi-codec comparison): compares
+CSA's own auto-detected mode against a real gzip-equivalent baseline --
+actual compressed size, actual compress/decompress wall-clock time,
+actual round-trip verification for both, not estimates. The gzip-
+equivalent baseline needed a real dependency this project didn't have
+before: Windows doesn't ship zlib, so vendored miniz (`richgel999/
+miniz`, tag `3.1.2`, public-domain/MIT) via CMake `FetchContent`,
+deliberately bypassing miniz's own `CMakeLists.txt` (it calls its own
+`project(miniz C)` and would fight this project's C++-only language/
+flags setup) -- only its source files are added directly to the
+`scissorc` target. Two real build problems surfaced and were fixed by
+actually hitting them, not by reading miniz's docs closely enough up
+front: `miniz.h` unconditionally includes a `miniz_export.h` normally
+generated by miniz's own build system (worked around by writing a
+one-line replacement, since `scissorc` links miniz statically and the
+export macro can just be empty); and the checked-in `miniz.c` is not
+actually a complete amalgamation -- it calls `tdefl_*`/`tinfl_*`
+functions whose real bodies live in the separate `miniz_tdef.c`/
+`miniz_tinfl.c` files, only combined into one file by a packaging script
+this repo doesn't run. Both fixed, then verified with a full clean
+configure+build+test pass in WSL Ubuntu (matching the real
+`ubuntu-latest` CI environment, not just the Windows/MSVC dev machine)
+in addition to the native Windows build, confirming the new dependency
+resolves and links correctly on both platforms scissorc actually ships
+on. Deliberately does not add a real LZMA comparison column in this
+pass -- a real LZMA implementation is a much larger, multi-file
+dependency than the single-file miniz vendored here, disclosed directly
+in the command's own `--help`/output text rather than silently
+implied; the project's already-measured lzma/zstd/brotli comparisons on
+real datasets remain in REAL_POSE_BENCHMARK.md/REAL_GEO_BENCHMARK.md,
+which this command points to rather than duplicates.
+
 ## Local web app (`webapp/`)
 
 The one thing `demo/csa_demo.html` (the WASM Artifact) structurally
