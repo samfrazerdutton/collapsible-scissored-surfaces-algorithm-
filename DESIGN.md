@@ -1256,16 +1256,33 @@ the original: max error 5e-6, exactly the rounding tolerance the
 auto-picked scale implies -- a real, checked fact, not an assumption
 carried over from the CLI's own tests.
 
-**Not hosted anywhere yet.** Tested by serving the plain file locally
-(`python -m http.server` from `docs/`, or just opening it
-directly) -- publishing it somewhere with a real URL is the same kind of
-deliberate, separate decision as `webapp/`'s hosting question, not
-something to do silently. The file lives at `docs/index.html`
-specifically so GitHub Pages can serve it directly, free, for a public
-repo: repo Settings -> Pages -> Source: "Deploy from a branch" -> Branch:
-`main`, folder: `/docs` -> Save. The page then appears at
-`https://<owner>.github.io/<repo>/` within a minute or two of the next
-push to `main`.
+**First real usability problem after deploying, fixed**: the page worked
+correctly but felt inert -- it asked a first-time visitor to read a
+paragraph, pick a sample, then click a button before showing anything,
+so the most compelling thing this project can show (a huge, honest ratio
+win on real structured data) was gated behind three actions nobody had a
+reason to take yet. Fixed by restructuring the page, not by adding
+features: the result panel moved to the very top and now auto-runs the
+drone-pose sample the instant the WASM engine finishes loading (labeled
+"Live, right now, in this tab" so it's clearly not a canned screenshot),
+with a large animated headline stat (e.g. "3.5x smaller than gzip",
+counting up with an eased transition rather than snapping into place), size bars that animate in with a staggered reveal (raw, then
+gzip, then CSA, ~180ms apart) instead of appearing instantly, and the
+trajectory preview now draws progressively over ~1.1s rather than all at
+once, so watching it trace out reads as "this is what got reconstructed"
+rather than a static illustration. All of it respects
+`prefers-reduced-motion` (skips straight to final state, no motion) --
+verified by running the *entire* page script (auto-run through the full
+render path, not a truncated excerpt) inside a stubbed DOM in Node twice,
+once with reduced-motion forced on and once with the real animation/rAF
+timing loops actually exercised; both completed cleanly with the correct
+final hero stat and result state.
+
+**Hosted, live, for free**: this repo's GitHub Pages, serving
+`docs/index.html` directly (repo Settings -> Pages -> Source: "Deploy
+from a branch" -> Branch: `main`, folder: `/docs`), at
+`https://<owner>.github.io/<repo>/` -- no server, no cost, updates
+automatically on every push to `main` that touches `docs/`.
 
 ## Local web app (`webapp/`)
 

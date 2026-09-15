@@ -63,20 +63,33 @@
   .status { font-family: var(--font-mono); font-size: 13px; color: var(--text-dim); margin: 10px 0; min-height: 18px; }
   .status.err { color: var(--bad); }
 
-  .result { display: none; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 18px; margin-top: 16px; }
-  .result.show { display: block; }
-  .result .summary { font-size: 15px; font-weight: 600; margin-bottom: 4px; }
+  .result {
+    display: none; background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+    padding: 22px; margin-top: 14px; margin-bottom: 24px;
+  }
+  .result.show { display: block; animation: result-in .5s ease-out; }
+  @keyframes result-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+  .result .hero-label { font-family: var(--font-mono); font-size: 12px; letter-spacing: .05em; text-transform: uppercase; color: var(--text-dim); margin-bottom: 6px; }
+  .result .hero-stat {
+    font-family: var(--font-mono); font-weight: 600; font-size: 42px; line-height: 1.1;
+    color: var(--accent); letter-spacing: -0.01em; margin-bottom: 4px; font-variant-numeric: tabular-nums;
+  }
+  .result .summary { font-size: 14px; color: var(--text-dim); margin-bottom: 4px; }
   .result .not-specialty { font-size: 12.5px; color: var(--accent-2); margin-bottom: 10px; }
-  .result .detail { font-family: var(--font-mono); font-size: 12.5px; color: var(--text-dim); white-space: pre-wrap; margin-bottom: 14px; }
+  .result .detail { font-family: var(--font-mono); font-size: 12.5px; color: var(--text-dim); white-space: pre-wrap; margin-bottom: 14px; margin-top: 12px; }
 
-  table.sizes { width: 100%; border-collapse: collapse; font-size: 13px; margin-bottom: 14px; }
+  table.sizes { width: 100%; border-collapse: collapse; font-size: 13px; margin-bottom: 14px; margin-top: 16px; }
   table.sizes td { padding: 6px 4px; border-bottom: 1px solid var(--border); vertical-align: middle; }
   table.sizes tr:last-child td { border-bottom: none; }
   .size-label { color: var(--text-dim); white-space: nowrap; padding-right: 10px; width: 1%; }
   .size-num { font-family: var(--font-mono); text-align: right; white-space: nowrap; width: 1%; padding-left: 10px; font-variant-numeric: tabular-nums; }
   .size-bar-track { background: var(--surface-2); border-radius: 4px; height: 10px; overflow: hidden; }
-  .size-bar-fill { height: 100%; border-radius: 4px; background: var(--text-dim); }
+  .size-bar-fill { height: 100%; border-radius: 4px; background: var(--text-dim); width: 0%; transition: width 0.7s cubic-bezier(.16,1,.3,1); }
   .size-bar-fill.csa { background: var(--accent); }
+  @media (prefers-reduced-motion: reduce) {
+    .result.show { animation: none; }
+    .size-bar-fill { transition: none; }
+  }
 
   .preview-scope { background: var(--scope); border-radius: 8px; margin-bottom: 14px; }
   .preview-scope canvas { display: block; width: 100%; height: 200px; }
@@ -97,17 +110,30 @@
 <div class="wrap">
   <span class="eyebrow">CSA &middot; runs entirely in this tab, no server</span>
   <h1>Squeeze</h1>
-  <p class="thesis">The real C++ codec, compiled to WebAssembly, running in your browser. Drop any file: it detects whether it's a 2D/3D point trajectory, a 6-DOF pose stream, or just bytes, compresses it accordingly, and verifies the round-trip before handing you a real, downloadable result &mdash; lossless by default. Nothing you drop here ever leaves this tab.</p>
+  <p class="thesis">The real C++ codec, compiled to WebAssembly, running in your browser. Watch it compress a real drone flight path below &mdash; automatically, right now &mdash; then drop in your own file: it detects whether it's a 2D/3D point trajectory, a 6-DOF pose stream, or just bytes, compresses it accordingly, and verifies the round-trip before handing you a real, downloadable result. Nothing you drop here ever leaves this tab.</p>
+
+  <div class="status" id="status">Booting the WebAssembly engine&hellip;</div>
+
+  <div class="result" id="result">
+    <div class="hero-label" id="hero-label">Live, right now, in this tab:</div>
+    <div class="hero-stat" id="hero-stat">&nbsp;</div>
+    <div class="summary" id="result-summary"></div>
+    <div class="not-specialty" id="result-not-specialty" style="display:none">This is a general byte stream, not this codec's specialty (structured point/pose data) &mdash; the gzip comparison below is the fair baseline here. Try a sample below to see the real edge.</div>
+    <div class="preview-scope" id="preview-scope" style="display:none"><canvas id="preview-canvas" width="700" height="200"></canvas></div>
+    <table class="sizes" id="sizes-table"></table>
+    <div class="detail" id="result-detail"></div>
+    <a class="download" id="download-link" href="#">Download</a>
+  </div>
 
   <div class="samples">
-    <span class="label">Try a sample:</span>
+    <span class="label">Try another sample:</span>
     <button data-sample="pose">Drone pose trajectory</button>
     <button data-sample="points">LiDAR-style point cloud</button>
     <button data-sample="gps">GPS walk</button>
   </div>
 
   <div class="dropzone" id="dropzone">
-    <div class="big">Drop a file here, or click to choose one</div>
+    <div class="big">Or drop a file here, or click to choose one</div>
     <div class="small">Any file. Numeric point/pose tables get a specialized transform automatically.</div>
     <input type="file" id="file-input">
   </div>
@@ -119,17 +145,6 @@
       <span id="quality-value">lossless</span>
     </div>
     <button class="run" id="run-btn" disabled>Squeeze</button>
-  </div>
-
-  <div class="status" id="status">Loading the WASM engine&hellip;</div>
-
-  <div class="result" id="result">
-    <div class="summary" id="result-summary"></div>
-    <div class="not-specialty" id="result-not-specialty" style="display:none">This is a general byte stream, not this codec's specialty (structured point/pose data) &mdash; the gzip comparison below is the fair baseline here. Try a sample above to see the real edge.</div>
-    <div class="preview-scope" id="preview-scope" style="display:none"><canvas id="preview-canvas" width="700" height="200"></canvas></div>
-    <table class="sizes" id="sizes-table"></table>
-    <div class="detail" id="result-detail"></div>
-    <a class="download" id="download-link" href="#">Download</a>
   </div>
 
   <div class="restore-row">
@@ -194,10 +209,20 @@ function readI32(p, n) { return (!p || n === 0) ? new Int32Array(0) : Module.HEA
 const csaReady = CsaModule().then(M => {
   Module = M;
   fns = bindFunctions(M);
-  document.getElementById('status').textContent = 'Ready.';
   document.getElementById('run-btn').disabled = !selectedFile;
+  // The whole point of putting the result panel first: prove it before
+  // anyone has to click anything. Auto-runs the pose sample the instant
+  // the engine is ready, clearly labeled as a live/automatic run.
+  runAutoDemo();
   return M;
 });
+
+async function runAutoDemo() {
+  setSelectedFile(SAMPLES.pose());
+  qualitySlider.value = 0;
+  qualityValue.textContent = 'lossless';
+  await runSqueeze();
+}
 
 /* ================= squeeze wire-format helpers (mirrors cli/main.cpp) ================= */
 // kGeoMagic = "CSAG", dims byte: 2=geo2d, 3=geo3d, 7=pose. General blobs
@@ -570,16 +595,55 @@ document.querySelectorAll('.samples button').forEach(btn => {
   });
 });
 
+const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+// Eases a number from `from` to `to` over `durationMs`, calling
+// `render(value)` every frame -- used for the headline stat, so the
+// result feels like something is actively happening rather than a
+// static fact appearing.
+function animateNumber(from, to, durationMs, render) {
+  if (reduceMotion) { render(to); return; }
+  const t0 = performance.now();
+  const easeOutCubic = t => 1 - Math.pow(1 - t, 3);
+  function tick(now) {
+    const t = Math.min(1, (now - t0) / durationMs);
+    render(from + (to - from) * easeOutCubic(t));
+    if (t < 1) requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
+}
+
+function renderHeroStat(rawSize, gzSize, csaSize) {
+  const heroStat = document.getElementById('hero-stat');
+  const useGzip = gzSize && csaSize > 0 && csaSize < gzSize;
+  const target = useGzip ? gzSize / csaSize : (rawSize > 0 ? 100 * (1 - csaSize / rawSize) : 0);
+  animateNumber(useGzip ? 1 : 0, target, 900, v => {
+    heroStat.textContent = useGzip ? `${v.toFixed(1)}× smaller than gzip` : `${v.toFixed(1)}% smaller`;
+  });
+}
+
 function renderSizes(rawSize, gzSize, csaSize) {
   const maxSize = Math.max(rawSize, gzSize || 0, csaSize, 1);
-  const row = (label, size, cls) => size == null ? '' : `
+  const row = (label, size, cls, id) => size == null ? '' : `
     <tr>
       <td class="size-label">${label}</td>
-      <td style="width:100%"><div class="size-bar-track"><div class="size-bar-fill ${cls || ''}" style="width:${(100 * size / maxSize).toFixed(1)}%"></div></div></td>
+      <td style="width:100%"><div class="size-bar-track"><div class="size-bar-fill ${cls || ''}" id="${id}"></div></div></td>
       <td class="size-num">${size.toLocaleString()} B</td>
       <td class="size-num" style="color:var(--text-dim)">${size === rawSize ? '' : (100 * (1 - size / rawSize)).toFixed(1) + '% smaller'}</td>
     </tr>`;
-  sizesTable.innerHTML = row('original', rawSize) + row('gzip -9', gzSize) + row('CSA squeeze', csaSize, 'csa');
+  sizesTable.innerHTML = row('original', rawSize, '', 'bar-raw') + row('gzip -9', gzSize, '', 'bar-gzip') + row('CSA squeeze', csaSize, 'csa', 'bar-csa');
+  // Bars start at width:0 (CSS default) so the transition to their real
+  // width actually plays -- staggered slightly so the reveal reads as a
+  // sequence (raw, then gzip, then CSA) rather than three things landing
+  // at once.
+  const targets = [['bar-raw', rawSize], ['bar-gzip', gzSize], ['bar-csa', csaSize]];
+  targets.forEach(([id, size], i) => {
+    const el = document.getElementById(id);
+    if (!el || size == null) return;
+    const pct = (100 * size / maxSize).toFixed(1) + '%';
+    if (reduceMotion) { el.style.width = pct; return; }
+    setTimeout(() => requestAnimationFrame(() => { el.style.width = pct; }), i * 180);
+  });
 }
 
 function drawPreview(points) {
@@ -588,17 +652,32 @@ function drawPreview(points) {
   const canvas = document.getElementById('preview-canvas');
   const ctx = canvas.getContext('2d');
   const w = canvas.width, h = canvas.height;
-  ctx.clearRect(0, 0, w, h);
   let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
   for (const [x, y] of points) { minX = Math.min(minX, x); maxX = Math.max(maxX, x); minY = Math.min(minY, y); maxY = Math.max(maxY, y); }
   const pad = 14;
   const s = Math.min((w - 2 * pad) / Math.max(1e-9, maxX - minX), (h - 2 * pad) / Math.max(1e-9, maxY - minY));
   const project = ([x, y]) => [pad + (x - minX) * s, h - pad - (y - minY) * s];
   const accent = getComputedStyle(document.documentElement).getPropertyValue('--accent').trim();
-  ctx.strokeStyle = accent; ctx.lineWidth = 1.6;
-  ctx.beginPath();
-  points.forEach((p, i) => { const [px, py] = project(p); i === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py); });
-  ctx.stroke();
+
+  // Draws the path progressively rather than all at once -- it's a
+  // reconstruction, so watching it trace out reads as "this is what got
+  // decoded," not just a static illustration.
+  const drawUpTo = n => {
+    ctx.clearRect(0, 0, w, h);
+    ctx.strokeStyle = accent; ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    for (let i = 0; i < n; i++) { const [px, py] = project(points[i]); i === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py); }
+    ctx.stroke();
+  };
+  if (reduceMotion) { drawUpTo(points.length); return; }
+  const durationMs = 1100;
+  const t0 = performance.now();
+  function tick(now) {
+    const t = Math.min(1, (now - t0) / durationMs);
+    drawUpTo(Math.max(2, Math.round(t * points.length)));
+    if (t < 1) requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
 }
 
 async function runSqueeze() {
@@ -616,6 +695,7 @@ async function runSqueeze() {
     resultSummary.textContent = r.summary;
     resultDetail.textContent = r.detail.join('\n');
     resultNotSpecialty.style.display = r.shape === 'general' ? 'block' : 'none';
+    renderHeroStat(r.rawSize, r.gzipSize, r.csaSize);
     renderSizes(r.rawSize, r.gzipSize, r.csaSize);
     drawPreview(r.preview);
     resultEl.classList.add('show');
