@@ -1,0 +1,30 @@
+[build-system]
+requires = ["scikit-build-core>=0.10"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "collapsible-scissored-surfaces"
+version = "0.1.0"
+description = "CSA: a domain-aware compression codec for 6-DOF pose streams and point clouds, compiled from the real C++ core"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.8"
+authors = [{ name = "CSA project" }]
+
+[project.urls]
+Homepage = "https://github.com/samfrazerdutton/collapsible-scissored-surfaces-algorithm-"
+Documentation = "https://github.com/samfrazerdutton/collapsible-scissored-surfaces-algorithm-/blob/main/DESIGN.md"
+
+[tool.scikit-build]
+cmake.define = { WITH_CUDA = "OFF" }
+cmake.build-type = "Release"
+build.targets = ["csa_capi"]
+
+# A plain list here maps to the *basename* of each path, which would
+# install this as a "python" package (import python.csa) rather than a
+# top-level "csa" module -- the mapping form is a
+# destination-in-the-wheel -> source-in-the-repo dict instead, and
+# scikit-build-core explicitly supports pointing a single module file
+# (not just a package directory) at its own destination.
+[tool.scikit-build.wheel.packages]
+"csa.py" = "bindings/python/csa.py"

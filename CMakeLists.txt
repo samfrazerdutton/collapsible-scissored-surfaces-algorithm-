@@ -80,6 +80,20 @@ set_target_properties(csa_capi PROPERTIES
     OUTPUT_NAME "csa"                # -> csa.dll / libcsa.so / libcsa.dylib
 )
 
+# `pip install .` (pyproject.toml, scikit-build-core) installs just this
+# one target, placing the compiled shared library directly alongside
+# bindings/python/csa.py -- see that file's _find_library() for the
+# matching runtime lookup. RUNTIME is where Windows puts a shared
+# library's actual .dll (its "library" file in CMake's model is the
+# small .lib import stub, not the .dll); LIBRARY/ARCHIVE cover
+# .so/.dylib and static-linkage cases respectively so this install rule
+# is correct across platforms without conditionals.
+install(TARGETS csa_capi
+    RUNTIME DESTINATION .
+    LIBRARY DESTINATION .
+    ARCHIVE DESTINATION .
+)
+
 enable_testing()
 add_executable(csa_tests tests/test_main.cpp)
 target_link_libraries(csa_tests PRIVATE csa_core)

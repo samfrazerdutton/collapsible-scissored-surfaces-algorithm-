@@ -193,6 +193,24 @@ dedicated CPU-vs-GPU crossover measurement from 100K to 256M elements
 
 ## Quick start
 
+**Python, one command, no manual C++ build**: `pip install .` from a
+clone of this repo compiles the C++ core automatically (via
+`scikit-build-core`/CMake, CPU-only for portability) and installs a real,
+working `csa` module -- verified in a completely isolated fresh venv with
+no access to a pre-built `build/` directory:
+
+```
+pip install .
+python -c "import csa; print(csa.compress(b'hello world'))"
+```
+
+(Not yet published to PyPI -- that's a separate, deliberate publish step;
+today this means `pip install .` from a local clone, not `pip install
+collapsible-scissored-surfaces` from the index.)
+
+For the CLI, the CUDA-accelerated path, or to hack on the core itself,
+build directly with CMake:
+
 ```powershell
 # Build (Windows, MSVC + CUDA 13.x; CPU-only build works without CUDA too)
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release

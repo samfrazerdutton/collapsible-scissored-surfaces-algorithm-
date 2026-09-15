@@ -55,6 +55,16 @@ def _find_library() -> str:
         names = ["libcsa.so"]
 
     for name in names:
+        # A real `pip install .` (scikit-build-core, see pyproject.toml)
+        # places the compiled shared library right next to this module in
+        # site-packages -- checked first since that's the common case for
+        # anyone who didn't clone the repo and build it by hand.
+        candidate = os.path.join(here, name)
+        if os.path.exists(candidate):
+            return candidate
+        # Dev-repo fallback: running straight out of a git checkout with
+        # cmake --build build done separately (the pattern every bench/
+        # script and this project's own tests already use).
         candidate = os.path.abspath(os.path.join(here, "..", "..", "build", name))
         if os.path.exists(candidate):
             return candidate
