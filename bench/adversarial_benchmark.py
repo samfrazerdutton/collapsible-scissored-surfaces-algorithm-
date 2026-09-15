@@ -210,9 +210,28 @@ def bench_lidar_draco():
     import laspy
 
     las = laspy.read(LIDAR_LAZ)
-    pts = np.column_stack([las.x, las.y, las.z]).astype(np.float32)
-    n = len(pts)
+    pts64 = np.column_stack([las.x, las.y, las.z]).astype(np.float64)
+    n = len(pts64)
     print(f"\n=== Autzen Stadium LiDAR scan ({n:,} real points) ===")
+
+    # Center before casting to float32 -- DracoPy's point cloud encoder
+    # takes float32/float64 input, and this scan's real coordinates are
+    # large absolute UTM values (~5x10^5 m). float32 has ~7 significant
+    # decimal digits, so at that magnitude its own representable
+    # precision is ~6-7cm -- coarser than the source data's real 1cm
+    # precision, and lost BEFORE quantization_bits even applies. This
+    # was checked, not assumed: feeding Draco the raw uncentered
+    # coordinates dropped 2,264 of 693,895 points at every qbits setting
+    # tested (11 through 20); centering first (subtracting the mean, so
+    # coordinates are O(100m) instead of O(5x10^5m)) drops that to
+    # exactly 20 -- which matches the real exact-duplicate points already
+    # present in the source data. Reporting the corrected, properly-
+    # integrated number below; see ADVERSARIAL_BENCHMARK.md for why this
+    # is structurally the same problem LAS/LAZ's own per-file
+    # scale+offset+int32 design exists to avoid, and why CSA (also
+    # integer/fixed-point internally) never has this failure mode.
+    offset = pts64.mean(axis=0)
+    pts = (pts64 - offset).astype(np.float32)
 
     # Guaranteed quantization step (not a measured error): decoded points
     # get reordered/deduplicated relative to the input, so an index-wise

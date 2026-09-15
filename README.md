@@ -56,8 +56,12 @@ Foxglove default for pose/telemetry logging: real `PoseStamped` messages
 lose to CSA by 78-88% on all three real datasets, and lose to *doing
 nothing* on two of three, real message-framing overhead included, not
 stripped out) and Draco (Google's point-cloud codec: beats CSA on ratio
-only at its roughest setting, and drops real points at every setting
-tested here, including its finest) -- and `GPU_BENCHMARKS.md` for a
+only at its roughest setting; also the source of a real bug this session
+caught in its own first benchmark attempt -- feeding Draco raw absolute
+UTM coordinates silently lost precision in the float32 cast before
+quantization even applied, dropping 2,264 points, fixed by centering the
+coordinates first, the same reason LAS/LAZ's own format stores a
+per-file offset) -- and `GPU_BENCHMARKS.md` for a
 dedicated CPU-vs-GPU crossover measurement from 100K to 256M elements
 (nothing in any of those files is hand-typed).
 

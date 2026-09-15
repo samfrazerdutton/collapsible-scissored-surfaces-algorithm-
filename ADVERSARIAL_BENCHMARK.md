@@ -63,46 +63,76 @@ guaranteed precision derived from the real bounding box and `quantization_bits`
 (not a measured error: Draco's decoder reorders/deduplicates points relative
 to the input, so an index-wise error comparison isn't valid; the analytic
 step size is the rigorous, decoder-order-independent way to state it).
+Coordinates were centered (mean subtracted) before encoding -- see below
+for why that step turned out to matter far more than expected.
 
 | method | size (bytes) | vs. raw packed | precision | points preserved | round-trip |
 |---|---:|---:|---:|---:|:---:|
 | raw packed (4-byte int × 3 axes) | 8,326,740 | -- | exact | 693,895 / 693,895 | (reference) |
-| Draco (qbits=11) | 558,352 | 93.3% smaller | step ≈170.2mm | **691,631 / 693,895** | lossy, points dropped |
-| Draco (qbits=16) | 1,821,870 | 78.1% smaller | step ≈5.3mm | **691,631 / 693,895** | lossy, points dropped |
-| Draco (qbits=20) | 2,836,658 | 65.9% smaller | step ≈0.33mm | **691,631 / 693,895** | lossy, points dropped |
+| Draco (qbits=11) | 562,968 | 93.2% smaller | step ≈170.0mm | 693,875 / 693,895 | lossy, 20 points dropped |
+| Draco (qbits=16) | 1,833,481 | 78.0% smaller | step ≈5.3mm | 693,875 / 693,895 | lossy, 20 points dropped |
+| Draco (qbits=20) | 2,853,172 | 65.7% smaller | step ≈0.33mm | 693,875 / 693,895 | lossy, 20 points dropped |
 | **CSA `compress-geo3d`** | **1,336,093** | **84.0% smaller** | **exact** | **693,895 / 693,895** | **PASS, exact** |
 | **LASzip (geometry-only)** | **1,012,384** | **87.8% smaller** | **exact** | **693,895 / 693,895** | **PASS, exact** |
 
-### A real, unexplained finding worth being upfront about
+### A real bug in this benchmark, found and fixed -- and the actual finding underneath it
 
-Draco decoded **2,264 fewer points than were encoded, at every quantization
-level tested (11, 16, and even 20 bits)** -- including the finest setting,
-where the guaranteed quantization step (~0.33mm) is far smaller than the
-scan's real point spacing, so coordinate-collision quantization isn't an
-obvious explanation. The raw source data has only 20 exact-duplicate XYZ
-triples, which doesn't account for the other ~2,244 points. This was
-checked, not assumed -- and it's reported honestly rather than diagnosed
-away, because the root cause inside Draco's point-cloud encoder wasn't
-tracked down here. What's certain: **CSA's `compress-geo3d` and LASzip both
-round-trip all 693,895 points exactly; Draco, at every setting tested here,
-does not.** For a use case where every point matters (safety-critical
-perception, downstream registration/SLAM), that is a real, measured
-difference in guarantees, not just ratio.
+The first version of this table fed Draco the scan's raw absolute UTM
+coordinates directly (as most naive point-cloud pipelines would) and
+found something alarming: **2,264 of 693,895 points dropped on decode, at
+every quantization level tested, including the finest (qbits=20, a
+guaranteed ~0.33mm step)**. That number was wrong, and here's the real
+mechanism, tracked down rather than left as "huh, weird":
+
+DracoPy's point-cloud encoder takes float32/float64 NumPy input. This
+scan's real coordinates are large absolute UTM values (~4.9x10^5 m on the
+X axis). **float32 has ~7 significant decimal digits of precision** -- at
+a magnitude of 500,000, its own representable precision is only about
+**500,000 x 2^-23 ~ 6cm**, which is *coarser than the source data's real
+1cm stored precision*, and that precision is lost the moment the
+coordinates are cast to float32 -- **before `quantization_bits` ever gets
+a chance to matter**. No amount of raising `quantization_bits` can recover
+precision the input array had already lost. Centering the coordinates
+first (subtracting the mean, so values are O(100m) instead of O(5x10^5m))
+gives float32 enough headroom to represent 1cm precision cleanly, and the
+dropped-point count falls to exactly 20 -- which matches, precisely, the
+20 real exact-duplicate XYZ triples already present in the raw source
+data (checked directly against the LAS file's own integer coordinates).
+Confirmed by varying only that one thing (centered vs. not) with
+`quantization_bits` and `compression_level` both held fixed: the drop
+count tracks the centering, not the quantization setting.
+
+**This is not really a Draco-specific bug -- it's a real, common, easy-to-
+miss integration pitfall for *any* float32-based geometry pipeline fed
+absolute UTM/ECEF-style coordinates**, and it is structurally exactly the
+problem LAS/LAZ's own file format design (a per-file float64
+scale+offset pair plus int32 stored coordinates) exists to sidestep: never
+hand a lossy, magnitude-dependent-precision float32 value a huge absolute
+offset it doesn't need to carry per-point. CSA never hits this failure
+mode for the same structural reason -- its `--scale`-quantized
+representation is exact fixed-point integers throughout, and squeeze's
+auto-detected scale (`cli/main.cpp`'s `safe_scale`) is chosen from the
+data's own precision, not from an arbitrary float32 cast. The corrected,
+properly-centered comparison above is the fair one; the caught version of
+this bug is itself the more interesting engineering lesson.
 
 ### Combined honest picture
 
+- With Draco integrated correctly (centered coordinates), its remaining
+  "loss" (20 points) is arguably not a loss at all -- those are the
+  dataset's own genuine exact duplicates, which CSA and LASzip also collapse
+  to identical output values (just without ever dropping the row).
 - CSA beats Draco on ratio at Draco's higher-precision settings (16/20-bit:
-  CSA's 1,336,093 bytes beats both, while also being the only *exact*
-  result of the three). At Draco's roughest setting (11-bit, ~170mm
-  precision -- coarser than useful for most real LiDAR applications), Draco
-  is smaller than CSA, but drops points and quantizes hard.
+  CSA's 1,336,093 bytes beats both, while also being the only result of
+  the three with zero rows dropped). At Draco's roughest setting (11-bit,
+  ~170mm precision -- coarser than useful for most real LiDAR applications),
+  Draco is smaller than CSA.
 - LASzip still wins outright on this dataset, exactly as `REAL_GEO_BENCHMARK.md`
   already found -- smaller than CSA *and* exact *and* ~75x faster to
   compress. That finding is unchanged by adding Draco to the table; Draco is
   a mesh/point-cloud geometry codec, not built for airborne-scan-order
   structure the way LASzip is, and lands between CSA and general-purpose
-  compressors on ratio while being the only one of the three that isn't
-  exact.
+  compressors on ratio.
 
 ## Regenerating these numbers
 
