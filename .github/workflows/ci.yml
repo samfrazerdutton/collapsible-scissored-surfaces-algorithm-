@@ -1,0 +1,57 @@
+# Build + full correctness test suite on every push and PR. Fast and
+# always-on, unlike benchmarks.yml (real-dataset ratio/speed
+# comparisons) which runs less often -- see that file's own header for
+# why "every commit" isn't the right cadence for timing-sensitive
+# benchmarks specifically, even though it is for correctness tests.
+#
+# NOT execution-verified against a real GitHub Actions runner as of this
+# commit -- this repo's own development and testing happened on Windows/
+# MSVC throughout; ubuntu-latest/GCC was chosen because a grep across
+# src/ and include/csa/ found no Windows-specific code outside
+# csa_capi.h's already-portable _WIN32/__declspec guard, and the same
+# core already compiles cleanly under Emscripten's clang (a real
+# portability signal), but that's inference, not a verified Linux build.
+# Watch the first real run of this workflow and expect to fix something
+# small (a missing apt package, a flag GCC is stricter about than MSVC).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+
+      - name: Configure (CPU-only -- no GPU on standard GitHub runners)
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DWITH_CUDA=OFF
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Run core C++ test suite
+        run: ./build/csa_tests
+
+      - name: Run C ABI test suite (links the real shared library)
+        run: ./build/csa_capi_test
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run Python bindings test
+        run: python bindings/python/test_bindings.py
+
+      - name: pip install . (packaging smoke test)
+        run: |
+          python -m venv /tmp/pip_ci_venv
+          /tmp/pip_ci_venv/bin/pip install .
+          /tmp/pip_ci_venv/bin/python -c "import csa; assert csa.decompress(csa.compress(b'ci smoke test')) == b'ci smoke test'; print('pip package OK')"

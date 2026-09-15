@@ -1,0 +1,96 @@
+# Runs the real, adversarial benchmarks (bench/real_pose_benchmark.py,
+# bench/adversarial_benchmark.py) against real downloaded datasets and
+# publishes the actual output as this run's Job Summary -- turning the
+# "honest, reproducible benchmark" claim into something checked on a
+# schedule and on demand, not just a one-time blog post.
+#
+# Deliberately NOT on every push/PR, unlike ci.yml: these are real-dataset
+# ratio *and speed* comparisons, and compress/decompress timing numbers
+# from a shared, variable-load CI runner are noisy enough to produce
+# false "regressions" if run on every commit. Correctness (ci.yml) should
+# gate every commit; these should stay fresh without being trusted for
+# minor timing deltas run-to-run. Runs on push to main, on a weekly
+# schedule (so results don't go stale even with no commits), and on
+# manual dispatch (so a result can be regenerated on demand -- e.g.
+# before citing a number in a blog post).
+#
+# NOT execution-verified against a real GitHub Actions runner as of this
+# commit -- see ci.yml's header for the same caveat. The dataset URLs
+# below are the exact ones this session verified work with a plain
+# unauthenticated curl (evo's GitHub raw mirror for EuRoC/TUM/KITTI;
+# media.githubusercontent.com's LFS media endpoint for the real LiDAR
+# scan) -- that part has real, verified precedent in this repo's own
+# bench/ scripts and this session's own history, even though the
+# workflow orchestration around it doesn't yet.
+name: Adversarial benchmarks
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 6 * * 1" # weekly, Monday 06:00 UTC
+  workflow_dispatch: {}
+
+jobs:
+  benchmarks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+
+      - name: Configure and build scissorc (CPU-only)
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DWITH_CUDA=OFF
+          cmake --build build --target scissorc
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install benchmark dependencies
+        run: pip install zstandard brotli mcap mcap-ros2-support DracoPy laspy numpy
+
+      - name: Fetch real pose datasets (EuRoC/TUM/KITTI ground truth)
+        run: |
+          mkdir -p bench/_thirdparty/pose_data
+          curl -sL -o bench/_thirdparty/pose_data/V102_groundtruth.csv \
+            https://raw.githubusercontent.com/MichaelGrupp/evo/master/test/data/V102_groundtruth.csv
+          curl -sL -o bench/_thirdparty/pose_data/fr2_desk_groundtruth.txt \
+            https://raw.githubusercontent.com/MichaelGrupp/evo/master/test/data/fr2_desk_groundtruth.txt
+          curl -sL -o bench/_thirdparty/pose_data/KITTI_00_gt.txt \
+            https://raw.githubusercontent.com/MichaelGrupp/evo/master/test/data/KITTI_00_gt.txt
+
+      - name: Fetch the real LiDAR scan (Autzen Stadium, PDAL/data)
+        run: |
+          mkdir -p bench/_thirdparty/lidar_data
+          curl -sL -o bench/_thirdparty/lidar_data/stadium-utm.laz \
+            https://media.githubusercontent.com/media/PDAL/data/main/autzen/stadium-utm.laz
+
+      - name: Run real pose benchmark (gzip/bz2/lzma/zstd/brotli)
+        run: python bench/real_pose_benchmark.py | tee /tmp/pose_bench.txt
+
+      - name: Run adversarial benchmark (MCAP+zstd, Draco)
+        run: python bench/adversarial_benchmark.py | tee /tmp/adversarial_bench.txt
+
+      - name: Publish results to the Job Summary
+        run: |
+          {
+            echo "# CSA benchmark results -- $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo
+            echo "Real datasets, fetched fresh this run (not cached/hand-typed)."
+            echo "See \`REAL_POSE_BENCHMARK.md\`/\`ADVERSARIAL_BENCHMARK.md\` for the"
+            echo "narrative writeup these numbers back."
+            echo
+            echo "## bench/real_pose_benchmark.py"
+            echo '```'
+            cat /tmp/pose_bench.txt
+            echo '```'
+            echo
+            echo "## bench/adversarial_benchmark.py"
+            echo '```'
+            cat /tmp/adversarial_bench.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,5 +1,8 @@
 # Collapsible Scissored Surfaces Algorithm (CSA)
 
+[![CI](https://github.com/samfrazerdutton/collapsible-scissored-surfaces-algorithm-/actions/workflows/ci.yml/badge.svg)](https://github.com/samfrazerdutton/collapsible-scissored-surfaces-algorithm-/actions/workflows/ci.yml)
+[![Adversarial benchmarks](https://github.com/samfrazerdutton/collapsible-scissored-surfaces-algorithm-/actions/workflows/benchmarks.yml/badge.svg)](https://github.com/samfrazerdutton/collapsible-scissored-surfaces-algorithm-/actions/workflows/benchmarks.yml)
+
 Licensed under Apache-2.0 (see `LICENSE`) -- see `CONTRIBUTING.md` before
 opening a PR, `FORMAT.md` for the `.csa` wire format (pre-1.0, may change),
 and **[why not just zstd?](WHY_NOT_ZSTD.md)** if that's your first question
