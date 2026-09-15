@@ -1,5 +1,11 @@
 # Collapsible Scissored Surfaces Algorithm (CSA)
 
+Licensed under Apache-2.0 (see `LICENSE`) -- see `CONTRIBUTING.md` before
+opening a PR, `FORMAT.md` for the `.csa` wire format (pre-1.0, may change),
+and **[why not just zstd?](WHY_NOT_ZSTD.md)** if that's your first question
+(it's a reasonable one, and the honest answer is "for most files, use
+zstd" -- read on for where CSA actually wins and why).
+
 **[Live in-browser demo](https://claude.ai/artifact/GpJeaG3pwRzfVGW65bKxWq)** --
 the actual C++ core compiled to WebAssembly, compressing a real KITTI
 vehicle trajectory, a real 693,895-point airborne LiDAR scan (Autzen
