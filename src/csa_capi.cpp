@@ -5,6 +5,7 @@
 #include "csa/csa_capi.h"
 #include "csa/codec.hpp"
 #include "csa/pantograph_lift_cuda.hpp"
+#include "csa/rans_coder.hpp"
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -223,6 +224,28 @@ csa_buffer csa_decompress_pose(const unsigned char* input, size_t input_size, si
     } catch (...) {
         if (out_count) *out_count = 0;
         return fail("csa_decompress_pose: unknown error");
+    }
+}
+
+csa_buffer csa_rans_encode(const unsigned char* input, size_t input_size, int num_lanes, int scale_bits) {
+    try {
+        std::vector<csa::u8> in(input, input + input_size);
+        return make_buffer(csa::encode_interleaved_rans(in, num_lanes, scale_bits));
+    } catch (const std::exception& e) {
+        return fail(e.what());
+    } catch (...) {
+        return fail("csa_rans_encode: unknown error");
+    }
+}
+
+csa_buffer csa_rans_decode(const unsigned char* input, size_t input_size) {
+    try {
+        std::vector<csa::u8> in(input, input + input_size);
+        return make_buffer(csa::decode_interleaved_rans(in));
+    } catch (const std::exception& e) {
+        return fail(e.what());
+    } catch (...) {
+        return fail("csa_rans_decode: unknown error");
     }
 }
 

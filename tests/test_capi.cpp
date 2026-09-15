@@ -222,6 +222,31 @@ static void test_pose_lossy() {
     csa_free_buffer(lossy_decoded);
 }
 
+static void test_rans() {
+    std::vector<unsigned char> input;
+    for (int i = 0; i < 20000; i++) input.push_back((unsigned char)((i * 37) % 7)); // skewed, low-entropy
+
+    csa_buffer coded = csa_rans_encode(input.data(), input.size(), /*num_lanes=*/4, /*scale_bits=*/14);
+    CHECK(coded.data != nullptr && coded.size > 0 && coded.size < input.size() / 2);
+
+    csa_buffer decoded = csa_rans_decode(coded.data, coded.size);
+    CHECK(decoded.size == input.size());
+    CHECK(decoded.data != nullptr && std::memcmp(decoded.data, input.data(), input.size()) == 0);
+
+    csa_free_buffer(coded);
+    csa_free_buffer(decoded);
+
+    // Empty input round-trips too: encode still emits its small fixed
+    // header (so `coded` is non-empty), but decoding it back yields an
+    // empty result.
+    csa_buffer empty_coded = csa_rans_encode(nullptr, 0, 4, 14);
+    CHECK(empty_coded.data != nullptr && empty_coded.size > 0);
+    csa_buffer empty_decoded = csa_rans_decode(empty_coded.data, empty_coded.size);
+    CHECK(empty_decoded.data == nullptr && empty_decoded.size == 0);
+    csa_free_buffer(empty_coded);
+    csa_free_buffer(empty_decoded);
+}
+
 static void test_error_reporting() {
     unsigned char garbage[] = {1, 2, 3, 4, 5};
     csa_buffer result = csa_decompress(garbage, sizeof(garbage));
@@ -238,6 +263,7 @@ int main() {
     test_geo2d_lossy();
     test_geo3d_lossy();
     test_pose_lossy();
+    test_rans();
     test_error_reporting();
     std::printf("cuda available (via C ABI): %s\n", csa_cuda_available() ? "yes" : "no");
     std::printf("%d checks, %d failures\n", g_checks, g_failures);

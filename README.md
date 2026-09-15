@@ -122,7 +122,20 @@ dedicated CPU-vs-GPU crossover measurement from 100K to 256M elements
   growing win from ~100K elements onward (up to ~4x faster at 10M) --
   not wired into `compress_pose` since no dataset measured here actually
   benefits yet. See `DESIGN.md`.
-- **1613 round-trip correctness checks** (`tests/test_main.cpp` +
+- **Interleaved rANS** (`rans_coder.hpp`), a parallel order-0 entropy
+  coder offered as a standalone alternative to the adaptive order-1
+  range coder used elsewhere: a single static frequency table shared
+  across `num_lanes` independent lanes, each lane a self-contained
+  byte-oriented rANS stream, encoded/decoded concurrently via
+  `std::thread` (measured ~2.3x/~3.6x encode/decode speedup at 4/8
+  lanes) -- exactly the lane-per-thread structure real GPU entropy
+  coders use. Measured, not assumed, to be competitive with (sometimes
+  smaller than) the adaptive coder on data without real order-1
+  structure, and not silently substituted into `compress()` since that
+  isn't true in general. Exposed through the C ABI
+  (`csa_rans_encode`/`csa_rans_decode`) for any binding to use directly.
+  See `DESIGN.md`.
+- **1649 round-trip correctness checks** (`tests/test_main.cpp` +
   `tests/test_capi.cpp`, the latter linking the real shared library to
   catch actual symbol-export problems), including a dedicated check that
   the GPU path actually succeeds (not just that the overall call

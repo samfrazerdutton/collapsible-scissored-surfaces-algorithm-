@@ -83,6 +83,19 @@ CSA_API csa_buffer csa_compress_pose_lossy(const int32_t* pose7, size_t count,
  * the number of poses. Works for both lossless and lossy blobs. */
 CSA_API csa_buffer csa_decompress_pose(const unsigned char* input, size_t input_size, size_t* out_count);
 
+/* Interleaved rANS: a parallel, order-0 static-table entropy coder (see
+ * csa/rans_coder.hpp) offered here as a standalone alternative to the
+ * general-purpose csa_compress -- it is NOT used internally by
+ * csa_compress, since it does not consistently beat the adaptive order-1
+ * range coder csa_compress already uses (see DESIGN.md for the measured
+ * comparison). Reach for this directly when you specifically want
+ * multi-threaded CPU encode/decode across independent lanes, e.g. for
+ * very large buffers on a multi-core machine.
+ * num_lanes <= 0 is treated as 1; scale_bits <= 0 or > 16 defaults to 14. */
+CSA_API csa_buffer csa_rans_encode(const unsigned char* input, size_t input_size,
+                                    int num_lanes, int scale_bits);
+CSA_API csa_buffer csa_rans_decode(const unsigned char* input, size_t input_size);
+
 /* Frees a buffer returned by any csa_compress_... or csa_decompress_... function. */
 CSA_API void csa_free_buffer(csa_buffer buf);
 
