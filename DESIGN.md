@@ -1218,10 +1218,10 @@ Every explicit command from before this addition is unchanged and still
 exists for pipelines/scripts that already know their data's shape and
 want to name the scale themselves rather than have it detected.
 
-## Zero-backend browser app (`browser-app/`)
+## Zero-backend browser app (`docs/`)
 
 `webapp/` (below) is real, but needs Python/Flask running locally --
-not something a stranger with a link can use. `browser-app/index.html`
+not something a stranger with a link can use. `docs/index.html`
 is the version built for that: a single self-contained static HTML file
 (the compiled WASM core inlined, same as `demo/csa_demo.html`) with no
 server at all, so it can be hosted anywhere plain files are served
@@ -1231,7 +1231,7 @@ Artifact demo, isn't sandboxed -- real drag-and-drop, real
 
 The one piece of logic that had to move: `squeeze`/`unsqueeze`'s
 sniffing/auto-scale/round-trip-verify algorithm lives only in
-`cli/main.cpp`, which doesn't run in a browser. `browser-app/index.html`
+`cli/main.cpp`, which doesn't run in a browser. `docs/index.html`
 re-implements it in JS (`sniffTable`/`safeScale`/`qualityToQuantStep`),
 deliberately mirroring `cli/main.cpp`'s algorithm line-for-line rather
 than approximating it, plus the tiny `CSAG`-header framing
@@ -1257,10 +1257,15 @@ auto-picked scale implies -- a real, checked fact, not an assumption
 carried over from the CLI's own tests.
 
 **Not hosted anywhere yet.** Tested by serving the plain file locally
-(`python -m http.server` from `browser-app/`, or just opening it
+(`python -m http.server` from `docs/`, or just opening it
 directly) -- publishing it somewhere with a real URL is the same kind of
 deliberate, separate decision as `webapp/`'s hosting question, not
-something to do silently.
+something to do silently. The file lives at `docs/index.html`
+specifically so GitHub Pages can serve it directly, free, for a public
+repo: repo Settings -> Pages -> Source: "Deploy from a branch" -> Branch:
+`main`, folder: `/docs` -> Save. The page then appears at
+`https://<owner>.github.io/<repo>/` within a minute or two of the next
+push to `main`.
 
 ## Local web app (`webapp/`)
 

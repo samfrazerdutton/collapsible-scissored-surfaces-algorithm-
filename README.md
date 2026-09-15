@@ -11,8 +11,8 @@ correctness-verified against the CPU output live in your browser). See
 it's built and what it does and doesn't prove. The Artifact demo can't
 hand a file back to you, though (browser sandbox restriction) -- two
 real ways around that:
-- **`browser-app/index.html`** -- no backend at all, just a static HTML
-  file (open it directly, or `python -m http.server` from `browser-app/`
+- **`docs/index.html`** -- no backend at all, just a static HTML
+  file (open it directly, or `python -m http.server` from `docs/`
   and visit `http://127.0.0.1:8000/`): drop in your own file, get a real
   compressed file back via a normal download. Same WASM core, but with
   the CLI's `squeeze` auto-detection ported to JS and no sandbox, so
