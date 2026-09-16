@@ -9,8 +9,19 @@
 // pointer, which is what a JS caller can actually consume directly
 // (Module.HEAPU8.subarray(ptr, ptr + size)).
 #include "csa/csa_capi.h"
+#include "csa/spatial_index.hpp"
+#include <algorithm>
 #include <cstdlib>
 #include <emscripten/emscripten.h>
+
+// A single, page-global KdTree3i rather than an opaque per-tree handle:
+// the browser demo this shim serves decodes and queries one point cloud
+// at a time (see docs/index.html), so there is nothing for a caller to
+// gain from managing multiple trees, and a lot of JS-side handle-
+// lifetime bookkeeping to avoid by not offering that. build() replaces
+// whatever tree existed before, exactly like reloading a new file
+// replaces whatever was previously decoded.
+static csa::KdTree3i g_kdtree;
 
 extern "C" {
 
@@ -108,6 +119,41 @@ unsigned char* csa_wasm_rans_decode(const unsigned char* input, size_t input_siz
     csa_buffer b = csa_rans_decode(input, input_size);
     *out_size = b.size;
     return b.data;
+}
+
+EMSCRIPTEN_KEEPALIVE
+void csa_wasm_kdtree_build(const int32_t* xyz, size_t count) {
+    std::vector<csa::Point3i> pts(count);
+    for (size_t i = 0; i < count; i++)
+        pts[i] = {xyz[i * 3 + 0], xyz[i * 3 + 1], xyz[i * 3 + 2]};
+    g_kdtree.build(pts);
+}
+
+// Both query functions return a malloc'd uint32_t array of original
+// point indices (free with csa_wasm_free, the same generic free()
+// wrapper every other allocating export here already uses) and write
+// the result count through out_count. An empty/never-built tree simply
+// returns zero results, not an error -- there's nothing unsafe about
+// querying before build() is called, it just finds nothing.
+EMSCRIPTEN_KEEPALIVE
+uint32_t* csa_wasm_kdtree_range_query(const int32_t* lo3, const int32_t* hi3, size_t* out_count) {
+    csa::Point3i lo{lo3[0], lo3[1], lo3[2]};
+    csa::Point3i hi{hi3[0], hi3[1], hi3[2]};
+    std::vector<uint32_t> result = g_kdtree.range_query(lo, hi);
+    *out_count = result.size();
+    uint32_t* out = (uint32_t*)std::malloc(result.size() * sizeof(uint32_t));
+    if (out) std::copy(result.begin(), result.end(), out);
+    return out;
+}
+
+EMSCRIPTEN_KEEPALIVE
+uint32_t* csa_wasm_kdtree_knn(const int32_t* query3, size_t k, size_t* out_count) {
+    csa::Point3i q{query3[0], query3[1], query3[2]};
+    std::vector<uint32_t> result = g_kdtree.k_nearest(q, k);
+    *out_count = result.size();
+    uint32_t* out = (uint32_t*)std::malloc(result.size() * sizeof(uint32_t));
+    if (out) std::copy(result.begin(), result.end(), out);
+    return out;
 }
 
 EMSCRIPTEN_KEEPALIVE

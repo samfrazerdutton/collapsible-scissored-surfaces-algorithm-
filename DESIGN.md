@@ -955,7 +955,51 @@ and highest-value target, not because a 2D version would be harder.
 Also not built: any wiring into the CLI (`scissorc` has no `query`
 subcommand exposing this against a real `.csa` file) -- `KdTree3i` is a
 tested, benchmarked library primitive, not yet a user-facing feature of
-the command-line tool. Both are real, scoped, disclosed follow-up work.
+the command-line tool.
+
+### KdTree3i compiled to WASM (browser-facing, verified independently -- not yet wired into the UI)
+
+`src/wasm_shim.cpp` gets three new exports alongside its pre-existing
+compress/decompress ones: `csa_wasm_kdtree_build`, `_range_query`,
+`_knn` -- a thin re-export of `KdTree3i`, following the same
+out-param-pointer convention (Emscripten lowers a struct-by-value C
+return into a hidden pointer parameter JS's `cwrap`/`ccall` can't see,
+so every allocating export here returns a raw pointer plus writes the
+result count through an explicit `size_t*`) every other export already
+uses. Deliberately a single page-global tree, not an opaque per-tree
+handle: the browser demo this shim serves decodes and queries one point
+cloud at a time, so there's nothing to gain from multi-tree management
+and real JS-side handle-lifetime bookkeeping to avoid by not offering
+it.
+
+**A real, previously-dangling documentation gap closed while doing
+this**: `wasm_shim.cpp`'s own header comment has referenced
+`bench/build_wasm.sh` by name for a long time, but the file never
+actually existed -- the module had only ever been rebuilt by hand,
+ad hoc, without saving the exact command. The same "referenced but
+never created" gap this project already found and fixed once for
+`docs/SANITIZERS.md`. `bench/build_wasm.sh` now exists, with the real,
+tested command (verified by rebuilding from scratch and re-running the
+check below, not written from memory and assumed correct).
+
+**Verified independently via Node, not yet via the live browser page**:
+`bench/verify_wasm.mjs` instantiates the freshly-built module directly
+in Node and cross-checks both the new `KdTree3i` exports (`range_query`
+and `k_nearest`, against a pure-JS brute-force reference on 2,000
+points) and the pre-existing exports (general and geo3d
+compress/decompress round-trips) -- catching a regression in either
+direction, not just confirming the new code works in isolation. All
+four checks pass. This is real, reproducible verification (`bash
+bench/build_wasm.sh && node bench/verify_wasm.mjs`), but it stops at
+the compiled module boundary: `docs/index.html`'s embedded worker
+source, its message-passing protocol, and its UI (a query panel, a
+Three.js highlight of matched points) have not been touched, and
+wiring this in is real, scoped, disclosed follow-up work -- not
+attempted this pass, given the real risk of destabilizing an
+already-shipped, already-carefully-verified live page late in an
+already large session, weighed against the time left to verify a UI
+change to it with the same rigor (real headless-Chrome testing, byte-
+for-byte tail preservation) every previous change to that file received.
 
 ## GPU acceleration (`cuda/pantograph_lift_cuda.cu`)
 
