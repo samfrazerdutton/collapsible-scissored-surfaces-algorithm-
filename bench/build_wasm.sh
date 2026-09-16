@@ -39,7 +39,7 @@ mkdir -p build_wasm
 em++ $SOURCES -std=c++17 -Iinclude -O2 \
     -s MODULARIZE=1 -s EXPORT_NAME=CsaModule -s SINGLE_FILE=1 \
     -s ALLOW_MEMORY_GROWTH=1 \
-    -s EXPORTED_RUNTIME_METHODS='["cwrap","ccall","HEAP32","HEAPU32","HEAPU8"]' \
+    -s EXPORTED_RUNTIME_METHODS='["cwrap","ccall","getValue","HEAP32","HEAPU32","HEAPU8"]' \
     -s EXPORTED_FUNCTIONS='["_malloc","_free"]' \
     -o build_wasm/csa.js
 

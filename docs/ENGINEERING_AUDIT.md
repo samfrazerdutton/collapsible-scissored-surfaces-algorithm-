@@ -406,10 +406,16 @@ highest-value missing functionality" instruction:
    honest clean result on a previously untested parser, consistent with
    its bounds-checking design, not proof of exhaustive coverage. See
    `docs/SANITIZERS.md`'s new section and `fuzz/README.md`.
-4. **Wire the already-built `KdTree3i` WASM export into `docs/index.html`'s
-   UI** -- the nearest-to-done item on the whole list (library done,
-   WASM export done and independently verified; only the UI/message-
-   protocol layer remains).
+4. ~~**Wire the already-built `KdTree3i` WASM export into `docs/index.html`'s
+   UI**~~ **done, same session**: a new "Spatial Query (KD-Tree)" panel,
+   verified end-to-end in a real headless Chrome loading the actual
+   file (real squeeze -> real query -> correct nearest-neighbor results,
+   zero console errors). This rebuild also silently carried forward
+   every core-library fix made earlier this session into the browser
+   build for the first time -- the previously-shipped page predated all
+   of it. See `DESIGN.md`'s updated "KdTree3i compiled to WASM" section,
+   including a real bug this pass's own verification step caught
+   (a missing `getValue` runtime export) before it reached the live page.
 5. **`.csa` format CRC** -- real, well-scoped, but a genuine format-
    version bump (a bigger compatibility decision than the others on
    this list, so ranked lower despite being conceptually simple).

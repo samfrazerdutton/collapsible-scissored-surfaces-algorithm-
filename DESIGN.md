@@ -957,7 +957,7 @@ subcommand exposing this against a real `.csa` file) -- `KdTree3i` is a
 tested, benchmarked library primitive, not yet a user-facing feature of
 the command-line tool.
 
-### KdTree3i compiled to WASM (browser-facing, verified independently -- not yet wired into the UI)
+### KdTree3i compiled to WASM, and wired into the live page
 
 `src/wasm_shim.cpp` gets three new exports alongside its pre-existing
 compress/decompress ones: `csa_wasm_kdtree_build`, `_range_query`,
@@ -982,24 +982,70 @@ never created" gap this project already found and fixed once for
 tested command (verified by rebuilding from scratch and re-running the
 check below, not written from memory and assumed correct).
 
-**Verified independently via Node, not yet via the live browser page**:
-`bench/verify_wasm.mjs` instantiates the freshly-built module directly
-in Node and cross-checks both the new `KdTree3i` exports (`range_query`
-and `k_nearest`, against a pure-JS brute-force reference on 2,000
-points) and the pre-existing exports (general and geo3d
-compress/decompress round-trips) -- catching a regression in either
-direction, not just confirming the new code works in isolation. All
-four checks pass. This is real, reproducible verification (`bash
-bench/build_wasm.sh && node bench/verify_wasm.mjs`), but it stops at
-the compiled module boundary: `docs/index.html`'s embedded worker
-source, its message-passing protocol, and its UI (a query panel, a
-Three.js highlight of matched points) have not been touched, and
-wiring this in is real, scoped, disclosed follow-up work -- not
-attempted this pass, given the real risk of destabilizing an
-already-shipped, already-carefully-verified live page late in an
-already large session, weighed against the time left to verify a UI
-change to it with the same rigor (real headless-Chrome testing, byte-
-for-byte tail preservation) every previous change to that file received.
+**Verified independently via Node first**: `bench/verify_wasm.mjs`
+instantiates the freshly-built module directly in Node and cross-checks
+both the new `KdTree3i` exports (`range_query` and `k_nearest`, against
+a pure-JS brute-force reference on 2,000 points) and the pre-existing
+exports (general and geo3d compress/decompress round-trips) -- catching
+a regression in either direction, not just confirming the new code
+works in isolation, before ever touching the live page.
+
+**A real bug this verification step caught before it could reach
+production**: the very first WASM rebuild this session omitted
+`getValue` from `EXPORTED_RUNTIME_METHODS` -- a runtime method the
+*pre-existing* worker code (`readU32`, used by every existing
+squeeze/unsqueeze/profile/optimize call, not just the new KD-tree
+paths) already depended on. A build that compiled cleanly and passed
+`bench/verify_wasm.mjs`'s own checks still broke real, already-shipped
+functionality the moment it was exercised through a
+`worker_threads`-based harness running a real squeeze/unsqueeze round
+trip -- caught there, not after embedding into the live page. Fixed by
+adding `getValue` to `bench/build_wasm.sh`'s flags; re-verified clean
+afterward.
+
+**Then wired into `docs/index.html`, with the same rigor every previous
+change to that file received**: the currently-embedded worker source
+was extracted, and the *entire* Emscripten-generated glue portion (2
+lines, ~155KB) was replaced with the freshly-built one -- meaning this
+also silently carried forward every core-library fix made earlier this
+session (the 8 fuzzer-found decode-path bugs, the SIMD/work-stealing/
+packet-transport/spatial-index/numerical additions) into the browser
+build for the first time; the previously-shipped page had been running
+a WASM build that predated all of it. Three real insertions were made
+into the existing custom protocol code (verified via Python string
+markers each matched exactly once, not a manual line-number edit): new
+`bindFunctions` entries for the three KD-tree exports, a new
+`kdtreeQuery()` function operating on whatever point array the caller
+already has decoded (no file re-parsing), and one new `else if` branch
+in `self.onmessage`'s dispatcher. Every byte of the file outside the
+`WORKER_SRC_B64` assignment was verified programmatically
+byte-identical before and after (Python string-slice comparison, not
+eyeballed).
+
+**A new "Spatial Query (KD-Tree)" panel** in the page itself: a query
+point (prefilled from the decoded cloud's own first point, not an
+arbitrary placeholder that could land outside the data's extent) and a
+k input, enabled only for a real geo3d result (disabled with an
+explicit reason otherwise -- `KdTree3i` has no Point2i/pose variant, so
+the panel says so rather than silently doing nothing). Matches are
+rendered as a distinct highlighted overlay in the existing Three.js
+viewport, using the same coordinate transform `setPreview3D` already
+computes (now retained in a `lastTransform` variable instead of staying
+function-local) so the highlight lands in the exact same normalized
+space as the base point cloud.
+
+**Verified end-to-end in a real headless Chrome, loading the actual
+file** (not a copy, not a simulation): the page's own "LiDAR-style point
+cloud" sample button drives a real squeeze, the Spatial Query panel
+becomes enabled and pre-filled, running a query against the cloud's own
+first point correctly finds that exact point first (distance `0.0000`)
+followed by its real nearest neighbors on the synthetic ring dataset's
+geometry (points at increasing angular offset, exactly as the ring's
+own structure predicts) -- zero console errors. A second, separate
+browser run confirmed the pre-existing Profile and Auto-Optimize panels
+(neither touched by this change) still produce real output, and the
+Format Inspector panel (whose DOM position shifted, since the new panel
+was inserted immediately before it) still renders correctly.
 
 ## Numerical computing lab (`numerical.hpp`/`.cpp`)
 
