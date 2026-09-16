@@ -1968,8 +1968,7 @@ campaign and the fixes that followed it, so this last-look discipline
 was not a formality.
 
 **Explicitly not attempted this pass, named rather than left implicit**:
-GPU expansion (a new CUDA kernel beyond the existing Pantograph Lift/
-quaternion-calibration ones); streaming/packetization; spatial indexing
+streaming/packetization; spatial indexing
 (octree/BVH/KD-tree); the CLI's own CSAG-header parser, the Python
 bindings' header parser, and the browser worker's JS port of the same
 header logic are none of them fuzzed, despite each being a real,
@@ -1982,6 +1981,44 @@ thread/scheduler visualization, Pareto-frontier UI, replay studio) was
 deliberately deprioritized behind all of the above -- a systems-focused
 audience reads the C++ decode path and its verification discipline, not
 the web frontend, and time was spent accordingly.
+
+### A third backend for max_abs_diff_i32 -- and an honest GPU loss
+
+The next item in priority order after fuzzing/sanitizers was GPU
+expansion. `cuda/simd_cuda.cu`/`include/csa/simd_cuda.hpp` add a CUDA
+implementation of the exact same `max_abs_diff_i32` reduction the SIMD
+work above vectorizes with AVX2 -- a real third backend for one
+operation (scalar, AVX2, CUDA), following the existing
+`pantograph_lift_forward_cuda`/`src/pantograph_lift_cuda_stub.cpp`
+one-shot pattern (own device buffers, freed before returning; a CPU
+stub built instead when `WITH_CUDA=OFF`, so linking never breaks on a
+CUDA-less machine).
+
+Measured honestly rather than assumed to be a win because it's a GPU:
+correctness holds (cross-checked against the scalar reference across
+several sizes), but the actual timing comparison on 20,000,000 elements
+-- CPU (AVX2) 5.63ms vs. GPU (including real H2D/D2H transfer, not just
+kernel time) 35.39ms -- is a clear GPU **loss**, about 6x slower, not
+faster. Diagnosed, not just reported: this kernel's arithmetic intensity
+(one comparison per 8 bytes of input) is far too low to amortize a
+~5ms two-way PCIe transfer of 160MB, and because both transfer and
+compute cost scale linearly with element count, no larger input would
+fix this -- unlike the real, existing Pantograph Lift/quaternion-
+calibration CUDA kernels (`GPU_BENCHMARKS.md`), which do enough real
+per-element floating-point work to be compute-bound rather than
+transfer-bound. Kept in the codebase and documented as a deliberate
+negative result (`docs/PARALLELISM.md`'s "A third backend for
+max_abs_diff_i32" section) rather than discarded once it came back
+unfavorable, and specifically *not* wired into `cli/main.cpp`'s actual
+error-measurement call sites -- doing so would make real code slower to
+gain nothing. Verified on both platforms: the CPU-stub build (WSL,
+`WITH_CUDA` effectively off) compiles and links cleanly and the new test
+(`test_simd_max_abs_diff_cuda`) correctly no-ops there; the CUDA build
+(Windows) runs both the correctness and timing comparisons for real.
+Full suite: 1670 checks on Windows (CUDA available, up from 1654), 1619
+on WSL (CUDA unavailable there, matching the earlier count exactly,
+since the new test's CPU-stub path contributes no additional
+assertions) -- both 0 failures.
 
 ## Local web app (`webapp/`)
 

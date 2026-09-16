@@ -15,6 +15,7 @@
 #include "csa/rans_coder.hpp"
 #include "csa/rod_joint_transform.hpp"
 #include "csa/simd.hpp"
+#include "csa/simd_cuda.hpp"
 #include "csa/thread_pool.hpp"
 #include "csa/work_stealing_pool.hpp"
 #include <algorithm>
@@ -1877,6 +1878,50 @@ static void test_simd_max_abs_diff() {
 #endif
 }
 
+// The third backend for the same reduction test_simd_max_abs_diff()
+// above already checks two of (scalar CPU, AVX2, GPU): correctness
+// against the scalar reference across several sizes, then a real,
+// honestly-reported timing comparison against the best available CPU
+// path at a large size -- including the H2D/D2H transfer cost in the
+// GPU number, since that's what a real caller actually pays, not just
+// the kernel's own execution time.
+static void test_simd_max_abs_diff_cuda() {
+    if (!cuda_is_available()) {
+        std::printf("  (CUDA not available at test time; GPU SIMD path skipped, CPU-only verified above)\n");
+        return;
+    }
+
+    std::mt19937 rng(20240616);
+    std::uniform_int_distribution<i32> dist(-1000000000, 1000000000);
+    for (size_t n : {size_t(0), size_t(1), size_t(7), size_t(8), size_t(9), size_t(1000), size_t(100003)}) {
+        std::vector<i32> a(n), b(n);
+        for (size_t i = 0; i < n; i++) { a[i] = dist(rng); b[i] = dist(rng); }
+        u32 cpu_result = max_abs_diff_i32_scalar(a.data(), b.data(), n);
+        u32 gpu_result = 0;
+        bool ok = max_abs_diff_i32_cuda(a.data(), b.data(), n, gpu_result);
+        CHECK(ok);
+        CHECK(gpu_result == cpu_result);
+    }
+
+    size_t n = 20000000;
+    std::vector<i32> a(n), b(n);
+    for (size_t i = 0; i < n; i++) { a[i] = (i32)(i % 1000000); b[i] = (i32)((i * 7) % 1000000); }
+
+    auto t0 = std::chrono::steady_clock::now();
+    volatile u32 r1 = max_abs_diff_i32(a.data(), b.data(), n); // best available CPU backend
+    auto t1 = std::chrono::steady_clock::now();
+    u32 r2 = 0;
+    bool ok = max_abs_diff_i32_cuda(a.data(), b.data(), n, r2);
+    auto t2 = std::chrono::steady_clock::now();
+    CHECK(ok);
+    CHECK(r1 == r2);
+
+    double cpu_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    double gpu_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
+    std::printf("  (max_abs_diff_i32 CUDA: CPU(best)=%.2fms GPU(incl. transfer)=%.2fms on %zu elements, %.2fx)\n",
+                 cpu_ms, gpu_ms, n, cpu_ms / gpu_ms);
+}
+
 // Deliberately spends real wall-clock time (not just increments a
 // counter) so a timing comparison against it is measuring real work,
 // not the cost of scheduling an empty no-op.
@@ -1993,6 +2038,7 @@ int main() {
     test_thread_pool();
     test_work_stealing_pool();
     test_simd_max_abs_diff();
+    test_simd_max_abs_diff_cuda();
     test_quat_calibration_cuda_matches_cpu();
     test_pose_codec();
     test_pose_stream();

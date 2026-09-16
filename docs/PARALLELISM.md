@@ -1,14 +1,16 @@
 # Parallelism in CSA
 
-**Status: covers every real parallelism/vectorization primitive in this
-codebase today -- the interleaved rANS entropy backend (OS threads via a
-reusable pool), a separate work-stealing pool (built, tested, measured,
-not yet wired into any production call site), and AVX2 SIMD behind
-runtime dispatch -- plus an explicit account of why the entropy coder
-actually used by `compress()`/`compress_pose()`/`squeeze()` is not
-parallelized the same way. This is not a roadmap document dressed up as
-a status report -- everything below either has code and a measurement
-behind it, or is explicitly labeled as not yet built.**
+**Status: covers every real parallelism/vectorization/GPU primitive in
+this codebase today -- the interleaved rANS entropy backend (OS threads
+via a reusable pool), a separate work-stealing pool (built, tested,
+measured, not yet wired into any production call site), AVX2 SIMD behind
+runtime dispatch, and a CUDA kernel for the same operation (a real,
+honestly-reported *loss* against the CPU, not a win) -- plus an explicit
+account of why the entropy coder actually used by
+`compress()`/`compress_pose()`/`squeeze()` is not parallelized the same
+way. This is not a roadmap document dressed up as a status report --
+everything below either has code and a measurement behind it, or is
+explicitly labeled as not yet built.**
 
 ## What's actually parallel, and why it's safe
 
@@ -203,6 +205,48 @@ CI's `ubuntu-latest`, and on any machine without an NVIDIA GPU). See
 steady-state per-call cost, one-shot vs. persistent-session comparison)
 -- not reproduced here.
 
+## A third backend for max_abs_diff_i32 -- and a real negative result
+
+`cuda/simd_cuda.cu`/`include/csa/simd_cuda.hpp` add a GPU implementation
+of the exact same reduction the SIMD section above vectorizes with
+AVX2: a block-level shared-memory tree reduction per CUDA block,
+collapsed into a single global result with one `atomicMax` per block
+(so contention on the output is O(num_blocks), not O(n)). Same
+zero-precondition contract as the scalar CPU reference (widens to
+`long long` per element on-device) rather than AVX2's narrower one --
+a GPU thread pays for the same global memory transaction regardless of
+whether the arithmetic after it is 32 or 64 bits wide, so there's no
+throughput reason to take on AVX2's tighter contract here. One-shot,
+like `pantograph_lift_forward_cuda`: allocates and frees its own device
+buffers per call, since this kernel has no multi-level state worth a
+`CudaLiftSession`-style persistent buffer to amortize.
+
+**Measured, and the honest result is a loss for the GPU path**:
+`tests/test_main.cpp`'s `test_simd_max_abs_diff_cuda` cross-checks
+correctness against the scalar reference across several sizes (all
+pass), then times the best available CPU backend (AVX2, dispatched)
+against the CUDA kernel on 20,000,000 elements -- *including* the
+H2D/D2H transfer cost in the GPU number, since that's what a real
+caller actually pays, not just the kernel's own execution time. Real
+result on this machine: CPU (AVX2) = 5.63ms, GPU (incl. transfer) =
+35.39ms -- **0.16x**, i.e. the GPU path is about 6x *slower*. This is
+not a bug to fix; it's the expected outcome for this specific kernel,
+and worth stating plainly rather than only reporting wins: `atomicMax`
+over 20M int32 pairs does one comparison per 8 bytes read -- an
+arithmetic intensity far too low to amortize a ~5ms two-way PCIe
+transfer of 160MB, regardless of how much faster the GPU's raw compute
+is than a CPU core's. Because both the transfer cost and the compute
+cost scale linearly with element count, this isn't a "wrong input size"
+result either -- there is no larger N at which this specific kernel
+would cross over, unlike the real crossover `GPU_BENCHMARKS.md` measures
+for the Pantograph Lift's calibration kernel (which does real per-element
+floating-point work, not a single comparison). The Pantograph Lift and
+quaternion-calibration kernels already in this codebase are legitimate
+GPU wins because they do enough per-element arithmetic to be compute-
+bound rather than transfer-bound; this one is a clean, deliberately
+included counter-example, not cherry-picked out of the writeup once it
+came back unfavorable.
+
 ## What this pass does not add (disclosed, not silently skipped)
 
 - **SIMD/vectorization beyond `max_abs_diff_i32`**: a later pass added
@@ -224,8 +268,14 @@ steady-state per-call cost, one-shot vs. persistent-session comparison)
 - **Wiring interleaved rANS into the main compress paths as a
   throughput-optimized alternative to the adaptive range coder**: a real,
   concrete, unimplemented next step (see above), not attempted here.
-- **Distributed/multi-process execution, GPU-accelerated quantization/
-  error-measurement kernels beyond the existing Pantograph Lift/
-  quaternion-calibration CUDA kernels, out-of-core/streaming processing**:
+- **A GPU error-measurement kernel now exists** (`max_abs_diff_i32_cuda`,
+  see above) but is not wired into `cli/main.cpp`'s actual error-checking
+  call sites, on purpose -- the honest measurement above shows it would
+  make those call sites slower, not faster, so wiring it in would be
+  building a feature specifically to regress performance. It remains a
+  real, tested, correctly-implemented kernel and a real, documented
+  negative result, not a production code path.
+- **Distributed/multi-process execution, GPU-accelerated quantization
+  kernels beyond error measurement, out-of-core/streaming processing**:
   none of this exists yet. Treat any claim otherwise, anywhere in this
   repository, as a documentation bug -- please file it.

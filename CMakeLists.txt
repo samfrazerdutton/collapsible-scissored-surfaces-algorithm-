@@ -96,6 +96,7 @@ if(CSA_HAVE_CUDA)
     add_library(csa_cuda STATIC
         cuda/pantograph_lift_cuda.cu
         cuda/quaternion_calibration_cuda.cu
+        cuda/simd_cuda.cu
     )
     target_include_directories(csa_cuda PUBLIC include cuda)
     set_target_properties(csa_cuda PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
@@ -108,7 +109,7 @@ if(CSA_HAVE_CUDA)
     add_executable(quat_calibration_gpu_crossover bench/quat_calibration_gpu_crossover.cpp)
     target_link_libraries(quat_calibration_gpu_crossover PRIVATE csa_core)
 else()
-    target_sources(csa_core PRIVATE src/pantograph_lift_cuda_stub.cpp)
+    target_sources(csa_core PRIVATE src/pantograph_lift_cuda_stub.cpp src/simd_cuda_stub.cpp)
     target_compile_definitions(csa_core PUBLIC CSA_HAVE_CUDA=0)
 endif()
 
