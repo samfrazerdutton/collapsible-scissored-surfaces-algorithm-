@@ -12,6 +12,7 @@
 #include "csa/crc32.hpp"
 #include "csa/packet_transport.hpp"
 #include "csa/spatial_index.hpp"
+#include "csa/numerical.hpp"
 #include "csa/quaternion_calibration_cuda.hpp"
 #include "csa/quaternion_joint.hpp"
 #include "csa/range_coder.hpp"
@@ -2027,6 +2028,110 @@ static void test_spatial_index_benchmark() {
                  n, build_ms, num_queries, tree_ms, brute_ms, brute_ms / tree_ms);
 }
 
+static bool grids_bit_identical(const Grid2D& a, const Grid2D& b) {
+    if (a.width != b.width || a.height != b.height) return false;
+    for (size_t i = 0; i < a.data.size(); i++) if (a.data[i] != b.data[i]) return false;
+    return true;
+}
+
+// Every kernel in numerical.hpp computes each output cell purely from
+// the read-only input grid, so the row-parallel version is required to
+// produce bit-identical output to the scalar reference -- not just
+// "close." Checked directly here, not assumed from the embarrassingly-
+// parallel design.
+static void test_numerical_correctness() {
+    // 1D stencil: a simple known case (a discrete delta function) where
+    // the periodic second-derivative result can be checked by hand.
+    {
+        std::vector<double> f(8, 0.0);
+        f[3] = 1.0;
+        std::vector<double> lap = laplacian_1d_scalar(f, 1.0);
+        // At the spike: neighbors are 0, center is 1 -> (0+0-2*1)/1 = -2.
+        // At each neighbor: one side sees the spike -> (1+0-2*0)/1 = 1.
+        CHECK(lap[3] == -2.0);
+        CHECK(lap[2] == 1.0);
+        CHECK(lap[4] == 1.0);
+        for (size_t i = 0; i < f.size(); i++) if (i != 2 && i != 3 && i != 4) CHECK(lap[i] == 0.0);
+    }
+
+    std::mt19937 rng(20260916);
+    std::uniform_real_distribution<double> dist(-10.0, 10.0);
+    for (size_t size : {size_t(1), size_t(2), size_t(5), size_t(37)}) {
+        Grid2D f(size, size);
+        for (double& v : f.data) v = dist(rng);
+
+        Grid2D lap_s = laplacian_scalar(f, 0.5);
+        Grid2D lap_p = laplacian_parallel(f, 0.5);
+        CHECK(grids_bit_identical(lap_s, lap_p));
+
+        Grid2D gx_s, gy_s, gx_p, gy_p;
+        gradient_scalar(f, 0.5, gx_s, gy_s);
+        gradient_parallel(f, 0.5, gx_p, gy_p);
+        CHECK(grids_bit_identical(gx_s, gx_p));
+        CHECK(grids_bit_identical(gy_s, gy_p));
+
+        Grid2D fy(size, size);
+        for (double& v : fy.data) v = dist(rng);
+        Grid2D div_s = divergence_scalar(f, fy, 0.5);
+        Grid2D div_p = divergence_parallel(f, fy, 0.5);
+        CHECK(grids_bit_identical(div_s, div_p));
+
+        Grid2D diff_s = diffuse_scalar(f, 0.1, 0.1, 1.0, 5);
+        Grid2D diff_p = diffuse_parallel(f, 0.1, 0.1, 1.0, 5);
+        CHECK(grids_bit_identical(diff_s, diff_p));
+    }
+
+    // A genuine physical invariant, not just self-consistency: periodic-
+    // boundary diffusion conserves total mass (the 5-point stencil's
+    // weights sum to zero, so no step creates or destroys material) --
+    // checked to a tight floating-point tolerance, not asserted true by
+    // construction.
+    {
+        Grid2D f(20, 20);
+        for (double& v : f.data) v = dist(rng);
+        double mass_before = f.sum();
+        Grid2D after = diffuse_scalar(f, 0.2, 0.1, 1.0, 200);
+        double mass_after = after.sum();
+        double rel_diff = std::fabs(mass_after - mass_before) / std::fabs(mass_before);
+        CHECK(rel_diff < 1e-9);
+        std::printf("  (Diffusion mass conservation: before=%.6f after=%.6f, relative drift=%.2e over 200 steps)\n",
+                     mass_before, mass_after, rel_diff);
+    }
+
+    // The stability bound must actually be enforced, not just documented.
+    {
+        Grid2D f(10, 10);
+        bool threw = false;
+        try { diffuse_scalar(f, 100.0, 1.0, 1.0, 1); } // alpha*dt/dx^2 = 100, way past 0.25
+        catch (const std::exception&) { threw = true; }
+        CHECK(threw);
+    }
+}
+
+// Real, measured timing: scalar vs. row-parallel Laplacian on a grid
+// large enough for per-row work to plausibly amortize thread-dispatch
+// overhead. Reported honestly either way, not assumed to be a win --
+// see the printed result for whether it actually was on this run.
+static void test_numerical_benchmark() {
+    size_t n = 2000;
+    Grid2D f(n, n);
+    std::mt19937 rng(777);
+    std::uniform_real_distribution<double> dist(-1.0, 1.0);
+    for (double& v : f.data) v = dist(rng);
+
+    auto t0 = std::chrono::steady_clock::now();
+    Grid2D lap_s = laplacian_scalar(f, 1.0);
+    auto t1 = std::chrono::steady_clock::now();
+    Grid2D lap_p = laplacian_parallel(f, 1.0);
+    auto t2 = std::chrono::steady_clock::now();
+
+    CHECK(grids_bit_identical(lap_s, lap_p));
+    double scalar_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    double parallel_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
+    std::printf("  (Laplacian %zux%zu grid: scalar=%.2fms parallel=%.2fms, %.2fx)\n",
+                 n, n, scalar_ms, parallel_ms, scalar_ms / parallel_ms);
+}
+
 // Validates encode_interleaved_rans/decode_interleaved_rans round-trip
 // across the same kind of edge cases test_range_coder already exercises
 // (empty, single byte, constant, periodic, high-entropy, every-symbol-
@@ -2427,6 +2532,8 @@ int main() {
     test_packetized_pose_stream_with_loss();
     test_spatial_index_correctness();
     test_spatial_index_benchmark();
+    test_numerical_correctness();
+    test_numerical_benchmark();
     test_rans_coder();
     test_codec();
     test_codec_adaptive_skip();

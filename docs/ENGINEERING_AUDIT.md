@@ -384,11 +384,14 @@ Ranked by (brief-stated value) x (how unbuilt it currently is), not
 strictly by brief section order, per section 295's "implement the
 highest-value missing functionality" instruction:
 
-1. **Numerical Computing Lab** (brief sections 19-24, Phase 6) -- a
-   complete, real gap. Nothing in this codebase currently maps
-   "mathematics -> algorithm -> parallel kernel" for a non-codec
-   workload, which is the brief's own stated central thesis (section
-   294). Highest narrative and technical value of anything on this list.
+1. ~~**Numerical Computing Lab**~~ **done, same session**: see
+   `docs/NUMERICAL_METHODS.md` and `DESIGN.md`'s "Numerical computing
+   lab" section -- `Grid2D`, 1D/2D Laplacian, gradient, divergence, and
+   an explicit-Euler diffusion simulation, each with a bit-identical-
+   verified scalar/parallel pair, a real enforced stability bound, and
+   a genuine physical invariant (mass conservation to 4.43e-16 relative
+   drift) checked, not assumed. GPU/SIMD backends for these kernels
+   remain real, disclosed follow-up work, not done yet.
 2. **Hardware fingerprint / `scissorc system`** (brief sections 29, 200) --
    small, concrete, and a real prerequisite for making every existing
    benchmark doc's numbers properly comparable/reproducible (brief
