@@ -29,6 +29,8 @@ struct SystemInfo {
     bool cuda_available = false;
     std::string cuda_device_name;    // empty if cuda_available is false
     u64 cuda_device_memory_bytes = 0; // 0 if cuda_available is false
+    std::string git_commit;      // short commit hash at configure time, or "unknown"
+    bool git_dirty = false;      // true if the working tree had uncommitted changes at configure time
 };
 
 SystemInfo query_system_info();

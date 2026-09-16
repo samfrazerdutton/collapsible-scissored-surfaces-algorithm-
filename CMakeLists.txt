@@ -21,6 +21,34 @@ endif()
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Real build provenance for csa::query_system_info()/`scissorc system` --
+# every benchmark doc in this repo used to record its hardware/commit by
+# hand, in prose, with no way to check it against the tree that actually
+# produced the numbers (see docs/ENGINEERING_AUDIT.md). Regenerated on
+# every configure, so it can never go stale the way a hand-typed commit
+# hash in a doc can.
+find_package(Git QUIET)
+set(CSA_GIT_COMMIT "unknown")
+set(CSA_GIT_DIRTY "false")
+if(GIT_FOUND)
+    execute_process(COMMAND ${GIT_EXECUTABLE} rev-parse --short HEAD
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        OUTPUT_VARIABLE CSA_GIT_COMMIT_RAW OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET RESULT_VARIABLE CSA_GIT_RC)
+    if(CSA_GIT_RC EQUAL 0 AND CSA_GIT_COMMIT_RAW)
+        set(CSA_GIT_COMMIT ${CSA_GIT_COMMIT_RAW})
+    endif()
+    execute_process(COMMAND ${GIT_EXECUTABLE} status --porcelain
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        OUTPUT_VARIABLE CSA_GIT_STATUS_RAW OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET)
+    if(CSA_GIT_STATUS_RAW)
+        set(CSA_GIT_DIRTY "true")
+    endif()
+endif()
+configure_file(${CMAKE_SOURCE_DIR}/include/csa/build_info.hpp.in
+    ${CMAKE_BINARY_DIR}/generated/csa/build_info.hpp @ONLY)
+
 # Real sanitizer support, not just claimed in a document -- see
 # docs/SANITIZERS.md for what's actually been run under each of these
 # and what hasn't. GCC/Clang only (MSVC's /fsanitize=address exists but
@@ -78,7 +106,7 @@ add_library(csa_core STATIC
     src/simd.cpp
     src/simd_avx2.cpp
 )
-target_include_directories(csa_core PUBLIC include)
+target_include_directories(csa_core PUBLIC include ${CMAKE_BINARY_DIR}/generated)
 
 # src/simd_avx2.cpp is the one translation unit in this codebase allowed
 # to use AVX2 intrinsics -- compiled with a wider instruction-set target

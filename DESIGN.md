@@ -1142,12 +1142,26 @@ CUDA as unavailable (this WSL build has `WITH_CUDA` effectively off).
 Verified on both: 1861 checks (Windows/MSVC+CUDA, up from 1855), 1810
 (WSL/GCC, up from 1804), both 0 failures.
 
-**Not yet done**: this information is not yet automatically attached to
-any benchmark's output (the `REAL_*.md`/`GPU_BENCHMARKS.md`/etc. docs
-still record hardware in hand-written prose) -- wiring `scissorc
-scale-test --json`/`benchmark`/a future experiment-manifest format to
-include this fingerprint automatically is the natural next step, not
-attempted in this pass.
+**Now wired into a real benchmark's own output, same session**:
+`scissorc scale-test --json` embeds the full fingerprint directly (a
+`"system"` object, via a new shared `write_system_info_json()` helper
+both commands call -- so a benchmark's JSON can never drift from what
+`scissorc system` reports on its own) plus a real git commit hash and
+dirty-tree flag, gathered by CMake at configure time
+(`include/csa/build_info.hpp.in` -> `configure_file` ->
+`build/generated/csa/build_info.hpp`, regenerated on every configure so
+it can never go stale the way a hand-typed commit hash in a doc can).
+Verified: both platforms report the identical real commit hash for the
+same checkout, and both correctly detect the tree was dirty (this
+feature was itself built and tested before being committed). Full
+suite: 1862 checks (Windows, up from 1861), 1811 (WSL, up from 1810),
+both 0 failures.
+
+**Still not done**: the `REAL_*.md`/`GPU_BENCHMARKS.md`/etc. docs still
+record hardware in hand-written prose rather than embedding a generated
+fingerprint block, and no other command (`benchmark`, a future
+experiment-manifest format) embeds this yet beyond `scale-test` --
+real, scoped, disclosed follow-up work.
 
 ## GPU acceleration (`cuda/pantograph_lift_cuda.cu`)
 

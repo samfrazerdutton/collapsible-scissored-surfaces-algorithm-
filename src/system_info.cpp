@@ -1,6 +1,7 @@
 #include "csa/system_info.hpp"
 #include "csa/simd.hpp"
 #include "csa/pantograph_lift_cuda.hpp"
+#include "csa/build_info.hpp"
 #include <cstdio>
 #include <thread>
 
@@ -114,6 +115,8 @@ SystemInfo query_system_info() {
     info.simd_backend = (detect_simd_backend() == SimdBackend::AVX2) ? "AVX2" : "Scalar";
     info.ram_total_bytes = detect_ram_total_bytes();
     info.cuda_available = cuda_device_info(info.cuda_device_name, info.cuda_device_memory_bytes);
+    info.git_commit = kGitCommit;
+    info.git_dirty = kGitDirty;
     return info;
 }
 

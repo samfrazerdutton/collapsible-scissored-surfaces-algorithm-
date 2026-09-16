@@ -1141,23 +1141,37 @@ int cmd_benchmark(const std::string& path) {
 // information is gathered by code, so a future benchmark run can attach
 // it automatically instead of risking it drifting from the machine that
 // actually produced the numbers.
+// Shared by `scissorc system --json` and `scissorc scale-test --json`
+// (and any future JSON-emitting benchmark command): the same real
+// hardware/software/commit fingerprint, embedded as one JSON object
+// rather than reimplemented per command -- so a benchmark's own JSON
+// output carries exactly the same fields `scissorc system` reports on
+// its own, not a hand-picked subset that could drift from it.
+void write_system_info_json(std::ostream& os, const SystemInfo& info, int indent) {
+    std::string pad(indent, ' ');
+    os << pad << "{\n"
+       << pad << "  \"os\": \"" << info.os << "\",\n"
+       << pad << "  \"compiler\": \"" << info.compiler << "\",\n"
+       << pad << "  \"build_type\": \"" << info.build_type << "\",\n"
+       << pad << "  \"logical_cores\": " << info.logical_cores << ",\n"
+       << pad << "  \"cpu_brand\": \"" << info.cpu_brand << "\",\n"
+       << pad << "  \"simd_backend\": \"" << info.simd_backend << "\",\n"
+       << pad << "  \"ram_total_bytes\": " << info.ram_total_bytes << ",\n"
+       << pad << "  \"cuda_available\": " << (info.cuda_available ? "true" : "false") << ",\n"
+       << pad << "  \"cuda_device_name\": \"" << info.cuda_device_name << "\",\n"
+       << pad << "  \"cuda_device_memory_bytes\": " << info.cuda_device_memory_bytes << ",\n"
+       << pad << "  \"git_commit\": \"" << info.git_commit << "\",\n"
+       << pad << "  \"git_dirty\": " << (info.git_dirty ? "true" : "false") << "\n"
+       << pad << "}";
+}
+
 int cmd_system(bool json) {
     SystemInfo info = query_system_info();
     auto bytes_to_gib = [](u64 b) { return (double)b / (1024.0 * 1024.0 * 1024.0); };
 
     if (json) {
-        std::cout << "{\n"
-                   << "  \"os\": \"" << info.os << "\",\n"
-                   << "  \"compiler\": \"" << info.compiler << "\",\n"
-                   << "  \"build_type\": \"" << info.build_type << "\",\n"
-                   << "  \"logical_cores\": " << info.logical_cores << ",\n"
-                   << "  \"cpu_brand\": \"" << info.cpu_brand << "\",\n"
-                   << "  \"simd_backend\": \"" << info.simd_backend << "\",\n"
-                   << "  \"ram_total_bytes\": " << info.ram_total_bytes << ",\n"
-                   << "  \"cuda_available\": " << (info.cuda_available ? "true" : "false") << ",\n"
-                   << "  \"cuda_device_name\": \"" << info.cuda_device_name << "\",\n"
-                   << "  \"cuda_device_memory_bytes\": " << info.cuda_device_memory_bytes << "\n"
-                   << "}\n";
+        write_system_info_json(std::cout, info, 0);
+        std::cout << "\n";
         return 0;
     }
 
@@ -1166,7 +1180,8 @@ int cmd_system(bool json) {
               << "CPU              " << (info.cpu_brand.empty() ? "NOT AVAILABLE" : info.cpu_brand) << "\n"
               << "Logical cores    " << (info.logical_cores ? std::to_string(info.logical_cores) : "NOT AVAILABLE") << "\n"
               << "SIMD backend     " << info.simd_backend << "\n"
-              << "RAM              " << (info.ram_total_bytes ? std::to_string(bytes_to_gib(info.ram_total_bytes)).substr(0, 5) + " GiB" : "NOT AVAILABLE") << "\n";
+              << "RAM              " << (info.ram_total_bytes ? std::to_string(bytes_to_gib(info.ram_total_bytes)).substr(0, 5) + " GiB" : "NOT AVAILABLE") << "\n"
+              << "Commit           " << info.git_commit << (info.git_dirty ? " (dirty working tree)" : "") << "\n";
     if (info.cuda_available) {
         std::cout << "CUDA             AVAILABLE (" << info.cuda_device_name << ", "
                    << std::to_string(bytes_to_gib(info.cuda_device_memory_bytes)).substr(0, 5) << " GiB)\n";
@@ -1214,7 +1229,15 @@ int cmd_scale_test(size_t buffer_bytes, int repeats, bool json) {
 
     double baseline_enc = rows[0].encode_ms, baseline_dec = rows[0].decode_ms;
     if (json) {
-        std::cout << "{\n  \"buffer_bytes\": " << buffer_bytes << ",\n  \"repeats\": " << repeats
+        // A real "experiment record," not just a results table: the same
+        // hardware/software/commit fingerprint `scissorc system` reports
+        // is embedded directly here, so this JSON is self-describing --
+        // reproducing or comparing a result later doesn't depend on
+        // separately remembering (or hand-typing into a doc) what
+        // machine and commit produced it.
+        std::cout << "{\n  \"system\": ";
+        write_system_info_json(std::cout, query_system_info(), 2);
+        std::cout << ",\n  \"buffer_bytes\": " << buffer_bytes << ",\n  \"repeats\": " << repeats
                    << ",\n  \"hardware_concurrency\": " << hw << ",\n  \"rows\": [\n";
         for (size_t i = 0; i < rows.size(); i++) {
             const auto& r = rows[i];
