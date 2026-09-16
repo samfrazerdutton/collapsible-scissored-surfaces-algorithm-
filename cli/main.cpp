@@ -814,6 +814,8 @@ std::vector<u32> pareto_quant_steps() {
     return steps;
 }
 
+void write_system_info_json(std::ostream& os, const SystemInfo& info, int indent); // defined below, alongside cmd_system
+
 int cmd_pareto(const std::string& in, bool json) {
     auto raw = read_file(in);
     SniffResult s = sniff_table(in);
@@ -885,7 +887,9 @@ int cmd_pareto(const std::string& in, bool json) {
     };
 
     if (json) {
-        std::cout << "{\n  \"raw_bytes\": " << raw.size() << ",\n  \"position\": ";
+        std::cout << "{\n  \"system\": ";
+        write_system_info_json(std::cout, query_system_info(), 2);
+        std::cout << ",\n  \"raw_bytes\": " << raw.size() << ",\n  \"position\": ";
         print_json_array(pos_points);
         if (!quat_points.empty()) { std::cout << ",\n  \"rotation\": "; print_json_array(quat_points); }
         std::cout << "\n}\n";

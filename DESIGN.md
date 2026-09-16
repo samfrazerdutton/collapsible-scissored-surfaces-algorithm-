@@ -1253,11 +1253,19 @@ feature was itself built and tested before being committed). Full
 suite: 1862 checks (Windows, up from 1861), 1811 (WSL, up from 1810),
 both 0 failures.
 
+**Also wired into `scissorc pareto --json`** (added after `pareto`
+itself, via a forward declaration of `write_system_info_json` since
+`cmd_pareto` is defined earlier in the file than `cmd_system`) -- so
+both JSON-emitting experiment-shaped commands now embed the identical
+fingerprint, not just one of them. Verified both platforms still
+report their own correct, real values (Windows: RTX 2060 6GB, CUDA
+available; WSL: CUDA unavailable, lower RAM -- the same real difference
+noted above) after this addition.
+
 **Still not done**: the `REAL_*.md`/`GPU_BENCHMARKS.md`/etc. docs still
 record hardware in hand-written prose rather than embedding a generated
-fingerprint block, and no other command (`benchmark`, a future
-experiment-manifest format) embeds this yet beyond `scale-test` --
-real, scoped, disclosed follow-up work.
+fingerprint block, and `benchmark` (the gzip-comparison command) still
+doesn't embed it -- real, scoped, disclosed follow-up work.
 
 ## GPU acceleration (`cuda/pantograph_lift_cuda.cu`)
 
