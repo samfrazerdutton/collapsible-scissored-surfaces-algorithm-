@@ -11,6 +11,7 @@
 #include "csa/pose_stream.hpp"
 #include "csa/crc32.hpp"
 #include "csa/packet_transport.hpp"
+#include "csa/spatial_index.hpp"
 #include "csa/quaternion_calibration_cuda.hpp"
 #include "csa/quaternion_joint.hpp"
 #include "csa/range_coder.hpp"
@@ -1902,6 +1903,130 @@ static void test_packetized_pose_stream_with_loss() {
                  poses.size(), chunks.size(), decoded.size(), poses.size() - decoded.size());
 }
 
+static std::vector<u32> brute_force_range(const std::vector<Point3i>& pts, const Point3i& lo, const Point3i& hi) {
+    std::vector<u32> out;
+    for (u32 i = 0; i < pts.size(); i++) {
+        const Point3i& p = pts[i];
+        if (p.x >= lo.x && p.x <= hi.x && p.y >= lo.y && p.y <= hi.y && p.z >= lo.z && p.z <= hi.z)
+            out.push_back(i);
+    }
+    return out;
+}
+
+static double point_dist_sq(const Point3i& a, const Point3i& b) {
+    double dx = (double)a.x - b.x, dy = (double)a.y - b.y, dz = (double)a.z - b.z;
+    return dx * dx + dy * dy + dz * dz;
+}
+
+static std::vector<double> brute_force_knn_dists(const std::vector<Point3i>& pts, const Point3i& q, size_t k) {
+    std::vector<double> dists;
+    for (const Point3i& p : pts) dists.push_back(point_dist_sq(p, q));
+    std::sort(dists.begin(), dists.end());
+    if (dists.size() > k) dists.resize(k);
+    return dists;
+}
+
+// Correctness only (no timing) -- cross-checks KdTree3i::range_query and
+// ::k_nearest against a brute-force linear-scan reference across several
+// sizes, including the edge cases a recursive, index-permuting
+// implementation is most likely to get wrong (empty, one point, a tree
+// small enough that some recursive calls hit empty ranges).
+static void test_spatial_index_correctness() {
+    std::mt19937 rng(90210);
+    std::uniform_int_distribution<i32> coord_dist(-1000000, 1000000);
+
+    for (size_t n : {size_t(0), size_t(1), size_t(2), size_t(5), size_t(37), size_t(2000)}) {
+        std::vector<Point3i> pts(n);
+        for (size_t i = 0; i < n; i++)
+            pts[i] = {coord_dist(rng), coord_dist(rng), coord_dist(rng)};
+
+        KdTree3i tree;
+        tree.build(pts);
+        CHECK(tree.size() == n);
+
+        // A handful of random query boxes per size, including one that
+        // covers the entire coordinate range (should return everything).
+        for (int q = 0; q < 5; q++) {
+            i32 ax = coord_dist(rng), bx = coord_dist(rng);
+            i32 ay = coord_dist(rng), by = coord_dist(rng);
+            i32 az = coord_dist(rng), bz = coord_dist(rng);
+            Point3i lo{std::min(ax, bx), std::min(ay, by), std::min(az, bz)};
+            Point3i hi{std::max(ax, bx), std::max(ay, by), std::max(az, bz)};
+
+            std::vector<u32> tree_result = tree.range_query(lo, hi);
+            std::vector<u32> brute_result = brute_force_range(pts, lo, hi);
+            std::sort(tree_result.begin(), tree_result.end());
+            std::sort(brute_result.begin(), brute_result.end());
+            CHECK(tree_result == brute_result);
+        }
+        {
+            Point3i lo{-1000000, -1000000, -1000000}, hi{1000000, 1000000, 1000000};
+            std::vector<u32> all = tree.range_query(lo, hi);
+            CHECK(all.size() == n);
+        }
+
+        // k-nearest for several k values, including k > n (must clamp,
+        // not crash or return garbage) and k == 0 (must return nothing).
+        for (size_t k : {size_t(0), size_t(1), size_t(3), n + 5}) {
+            Point3i q{coord_dist(rng), coord_dist(rng), coord_dist(rng)};
+            std::vector<u32> tree_result = tree.k_nearest(q, k);
+            size_t expected_count = std::min(k, n);
+            CHECK(tree_result.size() == expected_count);
+
+            std::vector<double> tree_dists;
+            for (u32 idx : tree_result) tree_dists.push_back(point_dist_sq(pts[idx], q));
+            std::vector<double> brute_dists = brute_force_knn_dists(pts, q, k);
+            CHECK(tree_dists.size() == brute_dists.size());
+            // tree_result is already returned nearest-first by k_nearest();
+            // brute_dists is sorted ascending -- both must match exactly
+            // (random real-valued coordinates make exact-distance ties
+            // between distinct points vanishingly unlikely).
+            bool dists_match = true;
+            for (size_t i = 0; i < tree_dists.size(); i++)
+                if (tree_dists[i] != brute_dists[i]) dists_match = false;
+            CHECK(dists_match);
+        }
+    }
+}
+
+// Real, measured query-time comparison: KdTree3i vs. a brute-force linear
+// scan, on a point count in the same order of magnitude as this
+// codebase's own largest real benchmark dataset (the 693,895-point
+// Autzen LiDAR scan) -- not a toy size picked to flatter the speedup.
+static void test_spatial_index_benchmark() {
+    std::mt19937 rng(31337);
+    std::uniform_int_distribution<i32> coord_dist(-5000000, 5000000);
+    size_t n = 500000;
+    std::vector<Point3i> pts(n);
+    for (size_t i = 0; i < n; i++) pts[i] = {coord_dist(rng), coord_dist(rng), coord_dist(rng)};
+
+    auto t_build0 = std::chrono::steady_clock::now();
+    KdTree3i tree;
+    tree.build(pts);
+    auto t_build1 = std::chrono::steady_clock::now();
+    double build_ms = std::chrono::duration<double, std::milli>(t_build1 - t_build0).count();
+
+    const int num_queries = 200;
+    std::vector<Point3i> queries(num_queries);
+    for (int i = 0; i < num_queries; i++) queries[i] = {coord_dist(rng), coord_dist(rng), coord_dist(rng)};
+
+    auto t0 = std::chrono::steady_clock::now();
+    size_t tree_total_found = 0;
+    for (const Point3i& q : queries) tree_total_found += tree.k_nearest(q, 10).size();
+    auto t1 = std::chrono::steady_clock::now();
+    double tree_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+    auto t2 = std::chrono::steady_clock::now();
+    size_t brute_total_found = 0;
+    for (const Point3i& q : queries) brute_total_found += brute_force_knn_dists(pts, q, 10).size();
+    auto t3 = std::chrono::steady_clock::now();
+    double brute_ms = std::chrono::duration<double, std::milli>(t3 - t2).count();
+
+    CHECK(tree_total_found == brute_total_found);
+    std::printf("  (KdTree3i: %zu points, build=%.1fms; %d x k-nearest(10): tree=%.2fms brute-force=%.2fms, %.1fx)\n",
+                 n, build_ms, num_queries, tree_ms, brute_ms, brute_ms / tree_ms);
+}
+
 // Validates encode_interleaved_rans/decode_interleaved_rans round-trip
 // across the same kind of edge cases test_range_coder already exercises
 // (empty, single byte, constant, periodic, high-entropy, every-symbol-
@@ -2300,6 +2425,8 @@ int main() {
     test_crc32();
     test_packet_reassembler();
     test_packetized_pose_stream_with_loss();
+    test_spatial_index_correctness();
+    test_spatial_index_benchmark();
     test_rans_coder();
     test_codec();
     test_codec_adaptive_skip();

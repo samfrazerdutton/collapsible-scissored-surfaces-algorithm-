@@ -66,6 +66,7 @@ add_library(csa_core STATIC
     src/pose_stream.cpp
     src/crc32.cpp
     src/packet_transport.cpp
+    src/spatial_index.cpp
     src/rans_coder.cpp
     src/lz_matcher.cpp
     src/lz_codec.cpp
