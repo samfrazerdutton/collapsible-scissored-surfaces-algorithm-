@@ -9,6 +9,8 @@
 #include "csa/pantograph_lift.hpp"
 #include "csa/pantograph_lift_cuda.hpp"
 #include "csa/pose_stream.hpp"
+#include "csa/crc32.hpp"
+#include "csa/packet_transport.hpp"
 #include "csa/quaternion_calibration_cuda.hpp"
 #include "csa/quaternion_joint.hpp"
 #include "csa/range_coder.hpp"
@@ -1647,6 +1649,259 @@ static void test_pose_stream() {
                  match ? "PASS" : "FAIL");
 }
 
+static void test_crc32() {
+    // The universal CRC-32/ISO-HDLC check value: every real
+    // implementation is verified against this exact input/output pair.
+    const char* check = "123456789";
+    CHECK(crc32((const u8*)check, 9) == 0xCBF43926u);
+    CHECK(crc32(nullptr, 0) == 0u);
+
+    std::vector<u8> a = {1, 2, 3, 4, 5};
+    std::vector<u8> b = {1, 2, 3, 4, 6};
+    CHECK(crc32(a) == crc32(a)); // deterministic
+    CHECK(crc32(a) != crc32(b)); // sensitive to a single trailing byte
+}
+
+// Exercises PacketReassembler directly (no pose data involved) against
+// reordering, loss, corruption, and the specific adversarial case its own
+// design has to defend against: a single packet claiming a wildly out-of-
+// range seq must resolve in bounded time, not hang.
+static void test_packet_reassembler() {
+    // Reordering only, nothing lost or corrupted: every payload must
+    // still arrive exactly once, in seq order, regardless of the order
+    // packets were fed in.
+    {
+        std::vector<u32> delivered_seqs;
+        std::vector<std::pair<u32, u32>> lost_ranges;
+        int corrupt_count = 0;
+        PacketReassembler r(
+            [&](u32 seq, const std::vector<u8>&) { delivered_seqs.push_back(seq); },
+            [&](u32 first, u32 count) { lost_ranges.push_back({first, count}); },
+            [&]() { corrupt_count++; },
+            /*max_reorder_window=*/8);
+
+        std::vector<std::vector<u8>> packets;
+        for (u32 seq = 0; seq < 10; seq++) packets.push_back(serialize_packet(seq, {(u8)seq}));
+        // A fixed, deliberately-scrambled delivery order (not sorted, not
+        // identity) -- shuffled by hand rather than via a shared RNG
+        // stream, so this specific test's coverage doesn't shift if some
+        // other test's random draws change.
+        std::vector<int> order = {3, 1, 0, 2, 6, 4, 5, 9, 7, 8};
+        for (int idx : order) r.feed(packets[idx]);
+        r.flush();
+
+        CHECK(delivered_seqs.size() == 10);
+        for (u32 i = 0; i < 10; i++) CHECK(delivered_seqs[i] == i);
+        CHECK(lost_ranges.empty());
+        CHECK(corrupt_count == 0);
+    }
+
+    // Genuine loss: seq 3 is never fed at all. With a small window, once
+    // enough later packets arrive to exceed it, the gap must be reported
+    // -- exactly once, as the single missing seq -- and everything else
+    // still delivered correctly and in order.
+    {
+        std::vector<u32> delivered_seqs;
+        std::vector<std::pair<u32, u32>> lost_ranges;
+        PacketReassembler r(
+            [&](u32 seq, const std::vector<u8>&) { delivered_seqs.push_back(seq); },
+            [&](u32 first, u32 count) { lost_ranges.push_back({first, count}); },
+            [&]() {},
+            /*max_reorder_window=*/3);
+
+        for (u32 seq = 0; seq < 10; seq++) {
+            if (seq == 3) continue; // simulated loss
+            r.feed(serialize_packet(seq, {(u8)seq}));
+        }
+        r.flush();
+
+        CHECK(lost_ranges.size() == 1);
+        CHECK(lost_ranges[0].first == 3);
+        CHECK(lost_ranges[0].second == 1);
+        // Every seq except 3 must still show up, in order.
+        std::vector<u32> expected;
+        for (u32 seq = 0; seq < 10; seq++) if (seq != 3) expected.push_back(seq);
+        CHECK(delivered_seqs == expected);
+    }
+
+    // Corruption: flip a byte in one already-serialized packet (simulating
+    // a bit-flip in transit, not a bug at the sender) -- must be caught by
+    // CRC, routed to on_corrupt, and never delivered as if it were seq 3's
+    // real payload; the surrounding packets must still all arrive
+    // correctly once the gap it leaves behind is given up on.
+    {
+        std::vector<u32> delivered_seqs;
+        std::vector<std::pair<u32, u32>> lost_ranges;
+        int corrupt_count = 0;
+        PacketReassembler r(
+            [&](u32 seq, const std::vector<u8>&) { delivered_seqs.push_back(seq); },
+            [&](u32 first, u32 count) { lost_ranges.push_back({first, count}); },
+            [&]() { corrupt_count++; },
+            /*max_reorder_window=*/3);
+
+        for (u32 seq = 0; seq < 10; seq++) {
+            std::vector<u8> pkt = serialize_packet(seq, {(u8)seq, (u8)(seq * 2)});
+            if (seq == 3) pkt[12] ^= 0xFF; // flip a payload byte post-serialization
+            r.feed(pkt);
+        }
+        r.flush();
+
+        CHECK(corrupt_count == 1);
+        CHECK(lost_ranges.size() == 1);
+        CHECK(lost_ranges[0].first == 3);
+        CHECK(lost_ranges[0].second == 1);
+        std::vector<u32> expected;
+        for (u32 seq = 0; seq < 10; seq++) if (seq != 3) expected.push_back(seq);
+        CHECK(delivered_seqs == expected);
+    }
+
+    // The adversarial case this design exists to defend against: a single
+    // packet claiming a seq near UINT32_MAX must resolve immediately (one
+    // on_lost call covering the whole gap), not hang trying to walk the
+    // gap one integer at a time.
+    {
+        std::vector<std::pair<u32, u32>> lost_ranges;
+        u32 delivered_seq = 0;
+        bool delivered = false;
+        PacketReassembler r(
+            [&](u32 seq, const std::vector<u8>&) { delivered_seq = seq; delivered = true; },
+            [&](u32 first, u32 count) { lost_ranges.push_back({first, count}); },
+            [&]() {},
+            /*max_reorder_window=*/64);
+
+        auto t0 = std::chrono::steady_clock::now();
+        r.feed(serialize_packet(0xFFFFFFF0u, {1, 2, 3}));
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+        CHECK(delivered);
+        CHECK(delivered_seq == 0xFFFFFFF0u);
+        CHECK(lost_ranges.size() == 1);
+        CHECK(lost_ranges[0].first == 0);
+        CHECK(lost_ranges[0].second == 0xFFFFFFF0u);
+        CHECK(ms < 100.0); // must resolve immediately, not walk ~4 billion seqs
+    }
+}
+
+// End-to-end: PoseStreamEncoder's per-chunk output, packetized (one
+// packet per chunk, sequential seq), pushed through a real simulated-
+// unreliable transport (some chunks dropped, one corrupted, delivery
+// order shuffled), reassembled, and fed to PoseStreamDecoder. Verifies
+// the whole stack degrades safely under real loss: no crash, no wrong
+// pose ever produced for a lost/corrupted chunk, and every pose from a
+// chunk that *did* survive intact still decodes correctly.
+static void test_packetized_pose_stream_with_loss() {
+    const double qscale = 1 << 20;
+    std::vector<Pose> poses;
+    double qw = 1, qx = 0, qy = 0, qz = 0;
+    for (int i = 0; i < 2000; i++) { // 2000 / 50 = 40 exact data chunks, no partial tail
+        double t = i * 0.05;
+        i32 px = (i32)std::lround(2000 * std::cos(t));
+        i32 py = (i32)std::lround(2000 * std::sin(t));
+        poses.push_back({{px, py, 0}, quat_to_i32(qw, qx, qy, qz, qscale)});
+        double half = (1.0 * kTestPi / 180.0) / 2.0;
+        double dqw = std::cos(half), dqz = std::sin(half);
+        double nw, nx, ny, nz;
+        quat_mul_d(qw, qx, qy, qz, dqw, 0, 0, dqz, nw, nx, ny, nz);
+        qw = nw; qx = nx; qy = ny; qz = nz;
+    }
+
+    const size_t chunk_size = 50;
+    std::vector<std::vector<u8>> chunks; // one entry per on_chunk() call: 40 data + 1 sentinel
+    {
+        PoseStreamEncoder enc([&](const std::vector<u8>& c) { chunks.push_back(c); }, chunk_size);
+        for (const Pose& p : poses) enc.push(p);
+        enc.finish();
+    }
+    CHECK(chunks.size() == 41);
+
+    // Simulate a lossy, reordering, corrupting transport: drop data chunks
+    // 5 and 20 outright (100 poses lost), corrupt data chunk 10 in transit
+    // (another 50 poses lost, via the CRC catching it rather than it being
+    // silently accepted), and deliver everything else in a shuffled order.
+    const u32 dropped_a = 5, dropped_b = 20, corrupted = 10;
+    std::vector<std::vector<u8>> packets;
+    std::vector<u32> surviving_seqs;
+    for (u32 seq = 0; seq < chunks.size(); seq++) {
+        if (seq == dropped_a || seq == dropped_b) continue;
+        std::vector<u8> pkt = serialize_packet(seq, chunks[seq]);
+        if (seq == corrupted) pkt[12] ^= 0xFF;
+        packets.push_back(std::move(pkt));
+        surviving_seqs.push_back(seq);
+    }
+    std::mt19937 shuffle_rng(777);
+    std::shuffle(packets.begin(), packets.end(), shuffle_rng);
+
+    std::vector<Pose> decoded;
+    PoseStreamDecoder dec([&](const Pose& p) { decoded.push_back(p); });
+    std::vector<std::pair<u32, u32>> lost_ranges;
+    int corrupt_count = 0;
+    // A window comfortably larger than the total packet count (41): with
+    // full random shuffling of delivery order, reordering distance alone
+    // can approach the packet count, and a smaller window would trigger
+    // premature "give up" closures on packets that were only delayed, not
+    // actually lost -- see this test's own history (an earlier window=4
+    // attempt spuriously discarded most of the stream this way, a real
+    // bug caught by this test, not a hypothetical). The three genuine
+    // gaps below are resolved by flush() once feeding ends, exactly the
+    // real-world pattern for a bounded, finite stream.
+    PacketReassembler reasm(
+        [&](u32 /*seq*/, const std::vector<u8>& payload) { dec.feed(payload); },
+        [&](u32 first, u32 count) { lost_ranges.push_back({first, count}); },
+        [&]() { corrupt_count++; },
+        /*max_reorder_window=*/100);
+
+    for (const auto& pkt : packets) reasm.feed(pkt);
+    reasm.flush();
+
+    CHECK(corrupt_count == 1);
+    // Two distinct gaps are expected: the dropped seq 5 (reported once
+    // the corrupted-then-dropped seq 10 forces the window closed) and
+    // dropped seq 20 -- reported separately since they aren't contiguous.
+    // (chunk 10's own loss is reported as part of whichever gap it falls
+    // into, since a corrupt packet is indistinguishable from a dropped
+    // one once CRC rejects it.)
+    u32 total_lost = 0;
+    for (auto& lr : lost_ranges) total_lost += lr.second;
+    CHECK(total_lost == 3); // seqs 5, 10, 20
+
+    // Expected surviving poses: every chunk except 5, 10, 20 (the
+    // sentinel, seq 40, carries zero poses and doesn't affect this count).
+    size_t expected_pose_count = poses.size() - 3 * chunk_size;
+    CHECK(decoded.size() == expected_pose_count);
+
+    // Every surviving pose must match the corresponding original pose --
+    // i.e. decoded[] is exactly poses[] with the three dropped chunks'
+    // 150 poses removed, in the same relative order.
+    std::vector<Pose> expected_poses;
+    for (u32 seq = 0; seq < 40; seq++) { // data chunks only, not the sentinel
+        if (seq == dropped_a || seq == dropped_b || seq == corrupted) continue;
+        for (size_t i = 0; i < chunk_size; i++) expected_poses.push_back(poses[seq * chunk_size + i]);
+    }
+    CHECK(expected_poses.size() == decoded.size());
+    bool match = true;
+    for (size_t i = 0; i < decoded.size() && i < expected_poses.size(); i++) {
+        const Pose& a = expected_poses[i]; const Pose& b = decoded[i];
+        if (a.position.x != b.position.x || a.position.y != b.position.y || a.position.z != b.position.z ||
+            a.orientation.w != b.orientation.w || a.orientation.x != b.orientation.x ||
+            a.orientation.y != b.orientation.y || a.orientation.z != b.orientation.z) match = false;
+    }
+    CHECK(match);
+
+    // The sentinel (seq 40) survived in this simulation, so the decoder
+    // does correctly see end-of-stream here -- but this is not guaranteed
+    // in general: if the sentinel itself were dropped, dec.finished()
+    // would honestly stay false, since the receiver has no way to know
+    // the stream ended. Not exercised separately here; stated so a future
+    // reader doesn't mistake dec.finished()'s dependency on packet
+    // delivery for a bug.
+    CHECK(dec.finished());
+
+    std::printf("  (Packetized pose stream: %zu poses, 3/%zu chunks lost (2 dropped + 1 corrupted) -> "
+                 "%zu poses recovered exactly, %zu poses correctly absent, no crash)\n",
+                 poses.size(), chunks.size(), decoded.size(), poses.size() - decoded.size());
+}
+
 // Validates encode_interleaved_rans/decode_interleaved_rans round-trip
 // across the same kind of edge cases test_range_coder already exercises
 // (empty, single byte, constant, periodic, high-entropy, every-symbol-
@@ -2042,6 +2297,9 @@ int main() {
     test_quat_calibration_cuda_matches_cpu();
     test_pose_codec();
     test_pose_stream();
+    test_crc32();
+    test_packet_reassembler();
+    test_packetized_pose_stream_with_loss();
     test_rans_coder();
     test_codec();
     test_codec_adaptive_skip();

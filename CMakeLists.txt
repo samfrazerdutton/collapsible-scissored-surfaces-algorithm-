@@ -64,6 +64,8 @@ add_library(csa_core STATIC
     src/rod_joint_transform.cpp
     src/quaternion_joint.cpp
     src/pose_stream.cpp
+    src/crc32.cpp
+    src/packet_transport.cpp
     src/rans_coder.cpp
     src/lz_matcher.cpp
     src/lz_codec.cpp

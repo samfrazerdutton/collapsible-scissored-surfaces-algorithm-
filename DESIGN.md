@@ -810,6 +810,84 @@ whole sequence (or committing to one choice for the whole file) before
 they can be applied. Each chunk always uses the fixed-block, per-block-
 auto-lag-search encoding, applied independently.
 
+### A packet transport layer for unreliable delivery (`packet_transport.hpp`/`.cpp`)
+
+`PoseStreamDecoder::feed()` (above) assumes a reliable, ordered byte
+stream -- exactly right for TCP, a local pipe, or a file, but wrong for
+a genuinely packet-oriented, lossy transport (UDP, a lossy radio link,
+an unordered message queue), where individual chunks can arrive out of
+order, arrive corrupted, or simply never arrive at all.
+`include/csa/packet_transport.hpp` adds a real, generic layer underneath
+pose_stream.hpp for exactly that case -- not a replacement for the
+reliable-transport path, a separate one for when the real transport
+doesn't provide those guarantees itself.
+
+Each `PoseStreamEncoder` chunk becomes one packet: `serialize_packet(seq,
+payload)` wraps it as `[u32 seq][u32 crc32][u32 payload_len][payload]`,
+with the CRC-32 (`include/csa/crc32.hpp`, a small self-contained
+table-based implementation -- deliberately not a dependency on the
+miniz vendored for `scissorc benchmark`'s gzip comparison, since that's
+scoped to an optional CLI feature and this needs to work in every
+build, WASM included) covering the seq and length fields as well as the
+payload, so a corrupted header is caught exactly like a corrupted
+payload byte, not silently trusted just because it happens to parse.
+`PacketReassembler` accepts packets in any arrival order, buffers
+out-of-order ones up to a configurable window, and delivers payloads to
+a callback strictly in seq order -- skipping over (and reporting, via a
+separate callback) any seq range it gives up waiting for.
+
+**Bounded by design, not by luck**: a receiver that just buffers
+out-of-order packets "until they arrive" has no defense against a
+single packet claiming a wildly out-of-range seq, and closing that gap
+one integer at a time would be exactly the CPU-time-amplification bug
+class this project's fuzzing pass already found and fixed once this
+session (`docs/SANITIZERS.md` bug #7) -- a small input forcing a large
+amount of real work. `PacketReassembler` never iterates over the gap
+itself: when the reorder window is exceeded, it jumps directly to the
+smallest sequence number it actually holds (from a `std::map`, so this
+is bounded by the number of buffered packets, never by the numeric size
+of the gap) and reports only the genuinely-missing range in one call.
+Verified directly: `tests/test_main.cpp`'s `test_packet_reassembler`
+feeds a single packet claiming seq `0xFFFFFFF0` and asserts it resolves
+in well under 100ms, not by attempting (and eventually giving up on) four
+billion missing sequence numbers.
+
+**A real bug this session's own tests caught, not just designed
+around**: an early version of the end-to-end test
+(`test_packetized_pose_stream_with_loss`) used a reorder window (4) far
+smaller than the packet count (41) together with fully randomized
+delivery order -- and failed, recovering only 100 of the expected 1,850
+poses. Root-caused, not patched around: with that few packets held
+before a "give up" closure fires, ordinary *reordering* (packets that
+were only delayed, never actually lost) was indistinguishable from real
+loss, so the reassembler correctly-per-its-contract, but wrongly for
+the test's intent, kept giving up on packets that would have arrived
+eventually. Fixed by widening the test's window past the total packet
+count (so only genuine gaps -- resolved by `flush()`, the explicit
+"no more packets are coming" signal, mirroring `PoseStreamEncoder::
+finish()` -- ever trigger a loss report), not by changing the
+reassembler's logic, which was correct throughout. Left in this writeup
+because it's a real example of a test catching a real design tradeoff
+(window size trades early-loss-detection latency against tolerance for
+heavy reordering) rather than a bug in the code being tested.
+
+**Verified end-to-end**: the same test drops two chunks outright,
+corrupts a third in transit (a real bit-flip in the already-serialized
+packet bytes, caught by CRC, routed to a distinct `on_corrupt` callback
+rather than silently misread as valid data), and shuffles delivery order
+for everything else, then confirms: exactly the 150 poses belonging to
+the three affected chunks are absent, every one of the other 1,850
+poses decodes bit-for-bit identical to the original, and nothing
+crashes. Verified on both platforms (1,709 checks on Windows/MSVC with
+CUDA, 1,658 on WSL/GCC without, both 0 failures).
+
+**Honestly not attempted**: `deserialize_packet` -- the one function in
+this layer that parses untrusted bytes -- is not yet part of the
+libFuzzer harness (`fuzz/fuzz_decompress.cpp`) alongside the four
+`decompress_*` codec entry points; its CRC-then-length-then-payload
+validation is exercised by hand-constructed adversarial tests above, not
+by a fuzzing campaign. A real, scoped next step, not a checked box.
+
 ## GPU acceleration (`cuda/pantograph_lift_cuda.cu`)
 
 The Pantograph Lift's per-level transform is embarrassingly parallel: given
@@ -1968,7 +2046,7 @@ campaign and the fixes that followed it, so this last-look discipline
 was not a formality.
 
 **Explicitly not attempted this pass, named rather than left implicit**:
-streaming/packetization; spatial indexing
+spatial indexing
 (octree/BVH/KD-tree); the CLI's own CSAG-header parser, the Python
 bindings' header parser, and the browser worker's JS port of the same
 header logic are none of them fuzzed, despite each being a real,
