@@ -399,10 +399,13 @@ highest-value missing functionality" instruction:
    and exposed at the CLI (plain text or `--json`). Not yet wired into
    any benchmark's own output automatically -- the `REAL_*.md` docs
    still record hardware by hand; that wiring remains real follow-up work.
-3. **Fuzz `packet_transport.cpp`'s `deserialize_packet`** -- closes the
-   clearest concrete security gap this audit found (section 24), and is
-   a small, bounded extension of infrastructure that already exists
-   (`fuzz/fuzz_decompress.cpp`'s pattern).
+3. ~~**Fuzz `packet_transport.cpp`'s `deserialize_packet`**~~ **done,
+   same session**: added as a 5th selector case to the existing harness,
+   seeded with a real, CRC-cross-checked-against-Python valid packet. A
+   5-minute campaign (95,257 executions) found nothing -- a genuine,
+   honest clean result on a previously untested parser, consistent with
+   its bounds-checking design, not proof of exhaustive coverage. See
+   `docs/SANITIZERS.md`'s new section and `fuzz/README.md`.
 4. **Wire the already-built `KdTree3i` WASM export into `docs/index.html`'s
    UI** -- the nearest-to-done item on the whole list (library done,
    WASM export done and independently verified; only the UI/message-

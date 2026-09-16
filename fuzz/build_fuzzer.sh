@@ -15,7 +15,8 @@ CXX_PLAIN="clang++ -std=c++17 -O1 -g -fsanitize=address,undefined -fno-omit-fram
 $CXX_FUZZ -c fuzz/fuzz_decompress.cpp -o /tmp/fuzzobj/fuzz_decompress.o
 
 for f in range_coder pantograph_lift rod_joint_transform quaternion_joint pose_stream \
-         rans_coder lz_matcher lz_codec bwt_transform bwt_codec codec simd pantograph_lift_cuda_stub; do
+         rans_coder lz_matcher lz_codec bwt_transform bwt_codec codec simd pantograph_lift_cuda_stub \
+         crc32 packet_transport; do
     $CXX_PLAIN -c "src/$f.cpp" -o "/tmp/fuzzobj/$f.o"
 done
 

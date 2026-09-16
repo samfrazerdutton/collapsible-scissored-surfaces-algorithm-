@@ -1,21 +1,28 @@
 // A real libFuzzer harness (built with clang's -fsanitize=fuzzer,undefined,address
 // -- see fuzz/README.md for the exact commands this was actually run
-// with) against this codec's real untrusted-input boundary: the four
+// with) against this codec's real untrusted-input boundaries: the four
 // decompress functions a caller (CLI, Python, WASM/browser) hands
-// arbitrary bytes to. The contract under fuzzing is exactly what
+// arbitrary bytes to, plus (added in the session that also built
+// packet_transport.hpp) deserialize_packet -- a second, real untrusted-
+// input parser this codebase gained, named in docs/ENGINEERING_AUDIT.md
+// as the clearest concrete not-yet-fuzzed attack surface this session's
+// own audit found. The contract under fuzzing is exactly what
 // FORMAT.md and this project's own test suite already state: malformed
 // input must throw a clean std::runtime_error (or std::exception more
-// generally), never crash, never hang, never read out of bounds, never
+// generally, or for deserialize_packet specifically -- which reports
+// failure via a `valid` flag, not an exception -- simply return that
+// flag false), never crash, never hang, never read out of bounds, never
 // attempt an unbounded allocation from an attacker-controlled length
 // field. This harness does not assert decompression *succeeds* on
 // anything -- only that it fails safely when it fails.
 //
 // The first byte of each fuzzer-provided input selects which of the
-// four real decompress functions gets the rest of the bytes -- one
-// corpus covers all four related parsers instead of needing four
+// five real untrusted-input parsers gets the rest of the bytes -- one
+// corpus covers all five related parsers instead of needing five
 // separate fuzz binaries and corpora for what is fundamentally the same
-// "handle adversarial bytes safely" property repeated four times.
+// "handle adversarial bytes safely" property repeated five times.
 #include "csa/codec.hpp"
+#include "csa/packet_transport.hpp"
 #include <cstdint>
 #include <exception>
 #include <vector>
@@ -26,11 +33,12 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     std::vector<csa::u8> bytes(data + 1, data + size);
 
     try {
-        switch (selector % 4) {
+        switch (selector % 5) {
             case 0: { auto r = csa::decompress(bytes); (void)r; break; }
             case 1: { auto r = csa::decompress_geo2d(bytes); (void)r; break; }
             case 2: { auto r = csa::decompress_geo3d(bytes); (void)r; break; }
             case 3: { auto r = csa::decompress_pose(bytes); (void)r; break; }
+            case 4: { auto p = csa::deserialize_packet(bytes.data(), bytes.size()); (void)p; break; }
         }
     } catch (const std::exception&) {
         // Expected, frequent, and correct: malformed input is supposed to

@@ -12,7 +12,7 @@ such), not a hypothetical.**
 |---|---|---|---|
 | ThreadSanitizer (TSan) | WSL2 Ubuntu, GCC 13.3.0 | `csa_tests` (full suite, incl. `csa::ThreadPool`/`csa::WorkStealingPool`) | 0 races detected |
 | AddressSanitizer + UndefinedBehaviorSanitizer | WSL2 Ubuntu, GCC 13.3.0 | `csa_tests`, `csa_capi_test` (full suite) | 2 real bugs found and fixed (below); clean after |
-| libFuzzer + ASan + UBSan | WSL2 Ubuntu, clang 18.1.3 | `fuzz/fuzz_decompress.cpp` against `decompress()`/`decompress_geo2d()`/`decompress_geo3d()`/`decompress_pose()` | 6 real bugs found and fixed (below); a 5-minute follow-up campaign after the last fix found nothing further -- see fuzz/README.md for exact durations |
+| libFuzzer + ASan + UBSan | WSL2 Ubuntu, clang 18.1.3 | `fuzz/fuzz_decompress.cpp` against `decompress()`/`decompress_geo2d()`/`decompress_geo3d()`/`decompress_pose()`, plus (later pass) `deserialize_packet` | 8 real bugs found and fixed in the codec paths (below); `deserialize_packet` fuzzed separately and found clean (95,257 executions, 5 minutes) -- see fuzz/README.md for exact durations |
 
 Not run: MSVC's `/fsanitize=address` (CMake wires it up for MSVC too --
 see `CSA_SANITIZE` in `CMakeLists.txt` -- but this project's actual
@@ -190,15 +190,37 @@ codebase -- `decompress_pose` in `src/codec.cpp` already checks
 this fix brings `rod_joint_3d_inverse` in line with an existing project
 convention rather than introducing a new one.
 
+## `deserialize_packet` (packet_transport.hpp) -- fuzzed, clean
+
+A forensic audit of this repository (`docs/ENGINEERING_AUDIT.md`)
+named `packet_transport.cpp`'s `deserialize_packet` -- a second real
+untrusted-input parser this codebase gained, for the loss/corruption/
+reorder-tolerant transport layer underneath pose streaming -- as the
+clearest concrete, not-yet-fuzzed attack surface it found. Added as a
+fifth case to the existing harness (`fuzz/fuzz_decompress.cpp`,
+selector `% 5` now instead of `% 4`), seeded with one real, correctly-
+constructed packet (`serialize_packet`'s exact wire format, hand-built
+and cross-checked against Python's `zlib.crc32` to confirm the CRC
+matches this project's own implementation before ever fuzzing it). A
+5-minute campaign (95,257 executions) found nothing -- a real, honest
+"clean" result, not evidence of exhaustive coverage, but a genuine
+answer to a previously entirely untested question. Consistent with this
+function's design (see its own header comment): every length read from
+the wire is cross-checked against the actual received byte count before
+any slice/copy touches it, so there was no obvious bug shape for the
+fuzzer to have been expected to find here the way there was in
+`codec.cpp`'s deserializers before this session's earlier fixes.
+
 ## What fuzzing explicitly does not cover yet
 
-- Only the four `decompress_*` entry points (the real untrusted-input
-  boundary for a `.csa` file's *library-level* payload). Not fuzzed: the
-  CLI's own CSAG-header parsing (`cmd_unsqueeze`/`cmd_inspect` in
-  `cli/main.cpp`), the Python bindings' `inspect()`/`verify()` header
-  parsing, or the browser worker's JS port of the same header logic --
-  each is a real, separate parser with its own untrusted-input surface,
-  not yet given the same treatment.
+- Only the four `decompress_*` entry points and (as of this pass)
+  `deserialize_packet` -- the real untrusted-input boundaries for a
+  `.csa` file's *library-level* payload and the packet-transport layer.
+  Not fuzzed: the CLI's own CSAG-header parsing (`cmd_unsqueeze`/
+  `cmd_inspect` in `cli/main.cpp`), the Python bindings' `inspect()`/
+  `verify()` header parsing, or the browser worker's JS port of the
+  same header logic -- each is a real, separate parser with its own
+  untrusted-input surface, not yet given the same treatment.
 - The interleaved rANS format (`encode_interleaved_rans`/
   `decode_interleaved_rans`, `src/rans_coder.cpp`) is not in the fuzz
   harness at all yet, despite also parsing untrusted length-prefixed

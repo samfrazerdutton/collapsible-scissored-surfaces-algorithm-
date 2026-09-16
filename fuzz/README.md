@@ -70,6 +70,7 @@ unit) instead of fuzzing:
 | 15-minute campaign, full corpus incl. all then-known crash reproducers | 900s | 1 out-of-memory abort (bug #6: `num_levels` sanity cap too loose) plus 3 "slow unit" inputs (17s, 38s, 51s each -- not crashes, but became bug #7 once investigated: the same absolute output-length cap that prevents memory bombs still let those ~60-byte inputs burn double-digit seconds of real CPU time) |
 | 2-minute campaign, after bugs #6/#7 fixes | 120s | 1 new SEGV (bug #8: `rod_joint_3d_inverse` composing two independently-decoded sub-streams with no length check) |
 | 5-minute campaign, after bug #8 fix | 300s | nothing further; corpus plateaued at 26/27 coverage/feature counts, `DONE` |
+| 5-minute campaign, `deserialize_packet` added as a 5th selector case (harness now `% 5`, seeded with one real, hand-built, CRC-cross-checked-against-Python's-`zlib.crc32` valid packet) | 300s | nothing found (95,257 executions); a real, honest clean result on a previously entirely-untested parser, not evidence of exhaustive coverage |
 
 Every crash/OOM/slow-unit file the fuzzer wrote out during these runs
 was: (1) hex-dumped and reasoned about to find the real root cause --
