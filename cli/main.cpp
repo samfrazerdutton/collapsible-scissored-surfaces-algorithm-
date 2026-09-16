@@ -90,6 +90,19 @@ std::vector<Point2i> read_points2d(const std::string& path, i64 scale) {
         std::istringstream ss(line);
         double x, y;
         if (!(ss >> x >> y)) continue;
+        // Defensive, not a reproduced bug: the C++ standard's floating-
+        // point grammar for operator>> technically permits "nan"/"inf"/
+        // "infinity" tokens to parse successfully, which would make
+        // llround() below undefined behavior for that row. Tested this
+        // directly on both toolchains this project verifies against
+        // (MSVC and libstdc++/GCC) and neither actually accepts those
+        // tokens -- both set failbit instead, so this path is already
+        // unreachable via plain text on the platforms this codebase
+        // actually ships on today. Kept anyway as a correct, free guard
+        // against relying on that specific (and historically variable
+        // across standard library versions) parsing behavior, not
+        // removed just because it didn't reproduce here.
+        if (!std::isfinite(x) || !std::isfinite(y)) continue;
         pts.push_back({(i32)llround(x * (double)scale), (i32)llround(y * (double)scale)});
     }
     return pts;
@@ -105,6 +118,7 @@ std::vector<Point3i> read_points3d(const std::string& path, i64 scale) {
         std::istringstream ss(line);
         double x, y, z;
         if (!(ss >> x >> y >> z)) continue;
+        if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) continue; // see read_points2d's comment
         pts.push_back({(i32)llround(x * (double)scale), (i32)llround(y * (double)scale), (i32)llround(z * (double)scale)});
     }
     return pts;
@@ -274,6 +288,9 @@ std::vector<Pose> read_poses(const std::string& path, i64 scale, i64 qscale) {
         std::istringstream ss(line);
         double x, y, z, qw, qx, qy, qz;
         if (!(ss >> x >> y >> z >> qw >> qx >> qy >> qz)) continue;
+        if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z) ||
+            !std::isfinite(qw) || !std::isfinite(qx) || !std::isfinite(qy) || !std::isfinite(qz))
+            continue; // see read_points2d's comment: llround(NaN/Inf) is undefined behavior
         Pose p;
         p.position = {(i32)llround(x * (double)scale), (i32)llround(y * (double)scale), (i32)llround(z * (double)scale)};
         p.orientation = {(i32)llround(qw * (double)qscale), (i32)llround(qx * (double)qscale),
@@ -1094,6 +1111,72 @@ int cmd_verify(const std::string& path) {
     }
 }
 
+// A real data-quality gate over the *raw* input, before compression --
+// distinct from `verify` above (which checks an already-compressed
+// .csa file decodes). Reports PASS/WARN/FAIL per check rather than
+// silently altering or dropping bad data: this command only reports,
+// it never modifies the file or changes what squeeze()/optimize()/
+// pareto() do with it.
+//
+// Two things motivated adding this: (1) `read_points2d`/
+// `read_points3d`/`read_poses` were hardened at the same time (see
+// their own comments) against a theoretical non-finite-value path into
+// `llround()` -- tested directly and not actually reproducible on
+// either toolchain this project verifies against (both reject "nan"/
+// "inf" tokens as a parse failure already), but `validate` reports
+// exactly which rows that defensive skip would affect if it ever did
+// trigger, rather than the skip happening silently with no visibility;
+// (2) nothing anywhere in this codebase ever checked whether a pose
+// file's quaternions were actually unit-length, despite the codec
+// quantizing and compressing them as if they were -- that part is a
+// real, previously-nonexistent check, not a defensive no-op.
+int cmd_validate(const std::string& in) {
+    auto raw = read_file(in);
+    SniffResult s = sniff_table(in);
+    std::ifstream f(in);
+    if (!f) throw std::runtime_error("cannot open input file: " + in);
+
+    std::string line;
+    size_t non_blank_lines = 0, malformed_rows = 0, non_finite_rows = 0;
+    size_t quat_checked = 0, quat_out_of_tolerance = 0;
+    double max_quat_deviation = 0.0;
+    const double kQuatNormTolerance = 0.01; // 1% relative deviation from |q|=1
+
+    while (std::getline(f, line)) {
+        if (line.empty()) continue;
+        non_blank_lines++;
+        std::istringstream ss(line);
+        std::vector<double> vals;
+        double v;
+        while (ss >> v) vals.push_back(v);
+        if ((int)vals.size() != s.columns) { malformed_rows++; continue; }
+        bool any_non_finite = false;
+        for (double d : vals) if (!std::isfinite(d)) any_non_finite = true;
+        if (any_non_finite) { non_finite_rows++; continue; }
+        if (s.columns == 7) {
+            double qw = vals[3], qx = vals[4], qy = vals[5], qz = vals[6];
+            double norm = std::sqrt(qw * qw + qx * qx + qy * qy + qz * qz);
+            quat_checked++;
+            double dev = std::abs(norm - 1.0);
+            max_quat_deviation = std::max(max_quat_deviation, dev);
+            if (dev > kQuatNormTolerance) quat_out_of_tolerance++;
+        }
+    }
+
+    const char* shape = s.columns == 2 ? "geo2d" : s.columns == 3 ? "geo3d" : s.columns == 7 ? "pose" : "general (no spatial structure detected)";
+    std::cout << "validate: " << in << " (" << raw.size() << " bytes, " << non_blank_lines << " non-blank lines, detected: " << shape << ")\n";
+    std::cout << "  " << (malformed_rows ? "WARN" : "PASS") << "  malformed rows (wrong column count or unparseable): " << malformed_rows << "\n";
+    std::cout << "  " << (non_finite_rows ? "FAIL" : "PASS") << "  rows with NaN/Inf values: " << non_finite_rows;
+    if (non_finite_rows) std::cout << " (squeeze/optimize/pareto silently skip these rows rather than risk undefined behavior -- they will not appear in the compressed output)";
+    std::cout << "\n";
+    if (s.columns == 7) {
+        std::cout << "  " << (quat_out_of_tolerance ? "WARN" : "PASS") << "  quaternion norm (tolerance " << kQuatNormTolerance << "): "
+                   << quat_out_of_tolerance << "/" << quat_checked << " rows deviate from a unit quaternion beyond tolerance"
+                   << " (max deviation observed: " << max_quat_deviation << ")\n";
+    }
+    return non_finite_rows > 0 ? 1 : 0;
+}
+
 // Real gzip-equivalent baseline via vendored miniz (see CMakeLists.txt) --
 // not an estimate, an actual mz_compress2()/mz_uncompress() round trip on
 // the identical raw bytes CSA sees, timed with the same std::chrono
@@ -1522,6 +1605,15 @@ void usage() {
         "      Attempts to decode a .csa file on its own (no original to diff\n"
         "      against) and reports success with the decoded record count, or\n"
         "      the exact decode error. Exit code 1 on failure.\n"
+        "  scissorc validate <in>\n"
+        "      A real data-quality gate over the *raw* (pre-compression) input:\n"
+        "      malformed rows, NaN/Inf values (defended against in the readers\n"
+        "      themselves -- such rows are skipped rather than fed into llround(),\n"
+        "      whose behavior for non-finite input is undefined), and for pose\n"
+        "      data, whether each quaternion is actually unit-length. Reports\n"
+        "      PASS/WARN/FAIL per check; never modifies the file. Exit code 1 only\n"
+        "      if non-finite values were found (a real correctness risk); a\n"
+        "      quaternion-norm deviation is reported as WARN, not a failure.\n"
         "\n"
         "  scissorc compress <in> <out> [--gpu] [--level fast|balanced|high]\n"
         "  scissorc decompress <in> <out>\n"
@@ -1667,6 +1759,8 @@ int main(int argc, char** argv) {
             return cmd_inspect(argv[2]);
         } else if (cmd == "verify" && argc >= 3) {
             return cmd_verify(argv[2]);
+        } else if (cmd == "validate" && argc >= 3) {
+            return cmd_validate(argv[2]);
         } else if (cmd == "benchmark" && argc >= 3) {
             return cmd_benchmark(argv[2]);
         } else if (cmd == "system") {

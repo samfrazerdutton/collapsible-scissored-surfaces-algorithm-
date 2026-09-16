@@ -1104,6 +1104,66 @@ particle transforms or density estimation over `KdTree3i`'s points
 would fit this same pattern) -- see `docs/NUMERICAL_METHODS.md`'s own
 closing section for the full, disclosed list.
 
+## A real data-quality gate (`scissorc validate`) -- and an honest correction to my own first pass at it
+
+While auditing `read_points2d`/`read_points3d`/`read_poses`
+(`cli/main.cpp`), a real question surfaced: `operator>>` for `double`
+reads a token into `x`/`y`/`z` (and, for pose, the quaternion
+components) before the values are multiplied by `scale`/`qscale` and
+passed to `llround()` -- and the C++ standard's floating-point grammar
+technically permits `operator>>` to parse the literal tokens "nan"/
+"inf"/"infinity" successfully, which would make that `llround()` call
+undefined behavior for non-finite input.
+
+**First pass overclaimed this; corrected after actually testing it.**
+The initial fix (skip a row if any parsed value fails `std::isfinite`)
+was written and described as fixing "a real, previously-undiscovered
+UB path" -- before actually trying to reproduce it. Constructing real
+adversarial inputs (`nan 5.0 6.0`, `7.0 inf 9.0`, and an out-of-range
+`1e400` that should overflow to infinity during parsing) and running
+them through `scissorc validate` on **both** toolchains this project
+verifies against showed that neither MSVC's nor libstdc++/GCC's actual
+`operator>>` implementation accepts those tokens -- both set `failbit`
+instead, meaning the row is already caught by the pre-existing
+"unparseable line" skip, before the `isfinite` check this pass added
+ever runs. A third test (a large but genuinely finite value, `1e300`,
+which *does* parse successfully) confirmed `safe_scale`'s existing
+"capped to avoid overflow" logic already prevents the scale
+multiplication itself from overflowing for real data.
+
+**The honest conclusion, and what was kept**: on the two real
+toolchains this codebase actually ships on today, this specific
+non-finite-value path is not reachable through the input surface
+tested. The `isfinite` check was kept anyway -- it is free, correct,
+and guards against a parsing leniency the standard permits and that
+different standard library versions have historically disagreed on --
+but the commit and this entry describe it as defensive hardening for a
+theoretical gap, not as a reproduced bug, which is the distinction this
+project's whole credibility (`CONTRIBUTING.md`'s "honesty over a
+good-looking number" rule) depends on getting right. Contrast this
+with the *real*, reproduced bugs earlier this session
+(`docs/SANITIZERS.md`'s 8 fuzzer-found decode-path bugs) -- those had
+an actual crashing input replayed against the fix; this one doesn't,
+and says so.
+
+**What `validate` actually is**: a real, additive data-quality report
+over the *raw* (pre-compression) input -- distinct from `verify`
+(which checks an already-compressed `.csa` file decodes). Reports
+malformed-row count, non-finite-value count (PASS/FAIL), and for pose
+data, whether each quaternion is actually unit-length (PASS/WARN,
+tolerance 1%) -- a real, previously-nonexistent check; nothing in this
+codebase had ever verified quaternion normalization before, despite the
+codec quantizing and compressing orientation components as if they
+were always unit-length. Never modifies the file -- report only,
+matching the brief's "never silently alter scientific data" principle.
+Verified against real KITTI pose data (0 issues found, max quaternion
+deviation `5.5e-8` -- genuinely well-formed data) and real synthetic
+adversarial cases (a deliberately denormalized quaternion, norm=2,
+correctly flagged as WARN with `max deviation observed: 1`). Full
+suite unaffected and reconfirmed clean on both platforms (1862/1811
+checks, 0 failures) since this only touches CLI-layer code plus the
+narrow, defensive reader changes described above.
+
 ## A real Pareto frontier (`scissorc pareto`)
 
 Auto-Optimize (`scissorc optimize`) answers "what's the best
