@@ -1104,6 +1104,42 @@ particle transforms or density estimation over `KdTree3i`'s points
 would fit this same pattern) -- see `docs/NUMERICAL_METHODS.md`'s own
 closing section for the full, disclosed list.
 
+## A real Pareto frontier (`scissorc pareto`)
+
+Auto-Optimize (`scissorc optimize`) answers "what's the best
+configuration for *one* stated error budget" via binary search. It
+never shows the caller the shape of the tradeoff curve around that
+point -- whether they're right at a knee of diminishing returns or well
+short of one. `scissorc pareto` answers that directly: the same real
+`compress+decompress+measure` evaluation `optimize()`'s binary search
+already trusts (not an estimate), run across a fixed sweep of 21
+quant_step values (powers of 2, 1 to 2^20) instead of bisecting toward
+one target, reporting every `(quant_step, bytes, max_error)` point
+either as a table or `--json`.
+
+Pose data gets two independent 1D sweeps (position with rotation held
+lossless, then rotation with position held lossless) rather than a
+joint 2D grid -- the two are genuinely independent sub-streams by
+format design (see `FORMAT.md`), so a joint grid would spend 21x more
+compress/decompress calls (441 vs. 42) to report information a single
+axis at a time already fully captures.
+
+**Real output, including where the curve isn't perfectly smooth**: on
+the 693,895-point-scale `bench/datasets/lidar_ring.xyz` sample, error
+climbs from `0` at `quant_step=1` to `59.89` at `quant_step=1048576`
+while size drops from 19,304 to 1,530 bytes -- a genuine, monotonic
+tradeoff on this dataset, reported as measured rather than assumed
+monotonic in general (a real, adversarial or unusual dataset could show
+a local bump, and this command would report it honestly rather than
+smoothing the curve). Verified identical across platforms (Windows/MSVC
+and WSL/GCC produce byte-identical `(quant_step, bytes, error)` tables
+for the same input, as expected for a deterministic algorithm).
+
+**Not yet done**: no browser-side visualization of this curve (the
+brief's own "flagship Pareto frontier" ask envisions an interactive
+plot, not a CLI table) -- this is the real, measured data a future chart
+would consume, not the chart itself.
+
 ## Hardware/software fingerprint (`system_info.hpp`/`.cpp`, `scissorc system`)
 
 The audit's second-highest-priority gap: every existing benchmark doc

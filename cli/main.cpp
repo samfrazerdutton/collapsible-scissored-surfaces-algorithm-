@@ -775,6 +775,111 @@ int cmd_optimize(const std::string& in, std::string out, bool have_pos_budget, d
     return 0;
 }
 
+// A real, measured Pareto frontier along the quant_step axis -- Auto-
+// Optimize (above) answers "what's the best configuration for *one*
+// stated error budget"; this answers "show me the whole tradeoff curve"
+// so a caller can see where diminishing returns set in, rather than
+// guessing a single budget blind. Each point is a real
+// compress+decompress+measure at that quant_step (the same eval()
+// pattern cmd_optimize's binary search already uses), not an estimate --
+// so, unlike a modeled curve, this can (and sometimes does) show a
+// non-monotonic size at adjacent steps, which is reported honestly
+// rather than smoothed away.
+//
+// Pose data gets two independent 1D sweeps (position with rotation held
+// lossless, then rotation with position held lossless), not a joint 2D
+// grid -- the format's two sub-streams are independent by design (see
+// FORMAT.md), so this is the same information a joint sweep would give
+// per axis, at 1/21st the compress+decompress calls a full grid would need.
+std::vector<u32> pareto_quant_steps() {
+    std::vector<u32> steps;
+    for (u32 s = 1; s <= (1u << 20); s <<= 1) steps.push_back(s);
+    return steps;
+}
+
+int cmd_pareto(const std::string& in, bool json) {
+    auto raw = read_file(in);
+    SniffResult s = sniff_table(in);
+    const u32 kResync = 64;
+    if (s.columns != 2 && s.columns != 3 && s.columns != 7)
+        throw std::runtime_error("pareto only applies to detected geo2d/geo3d/pose data -- this file has no lossy mode to sweep");
+
+    struct Point { u32 quant_step; size_t bytes; double error; };
+    std::vector<Point> pos_points, quat_points; // quat_points stays empty for geo2d/geo3d
+
+    if (s.columns == 2 || s.columns == 3) {
+        bool capped = false;
+        i64 scale = safe_scale(s.decimals_a, s.max_abs_a, capped);
+        auto pts2 = s.columns == 2 ? read_points2d(in, scale) : std::vector<Point2i>{};
+        auto pts3 = s.columns == 3 ? read_points3d(in, scale) : std::vector<Point3i>{};
+        for (u32 step : pareto_quant_steps()) {
+            std::vector<u8> blob = s.columns == 2 ? compress_geo2d_lossy(pts2, step, kResync) : compress_geo3d_lossy(pts3, step, kResync);
+            double max_err = 0.0;
+            if (s.columns == 2) {
+                auto back = decompress_geo2d(blob);
+                size_t n = std::min(pts2.size(), back.size());
+                if (n) max_err = (double)max_abs_diff_i32(reinterpret_cast<const i32*>(pts2.data()), reinterpret_cast<const i32*>(back.data()), n * 2) / (double)scale;
+            } else {
+                auto back = decompress_geo3d(blob);
+                size_t n = std::min(pts3.size(), back.size());
+                if (n) max_err = (double)max_abs_diff_i32(reinterpret_cast<const i32*>(pts3.data()), reinterpret_cast<const i32*>(back.data()), n * 3) / (double)scale;
+            }
+            pos_points.push_back({step, blob.size(), max_err});
+        }
+    } else {
+        bool capped_a = false, capped_b = false;
+        i64 scale = safe_scale(s.decimals_a, s.max_abs_a, capped_a);
+        i64 qscale = safe_scale(s.decimals_b, s.max_abs_b, capped_b);
+        auto poses = read_poses(in, scale, qscale);
+        for (u32 step : pareto_quant_steps()) {
+            auto blob = compress_pose_lossy(poses, step, kResync, 1, kResync);
+            auto back = decompress_pose(blob);
+            double e = 0.0;
+            for (size_t i = 0; i < poses.size() && i < back.size(); i++)
+                e = std::max({e, std::abs((double)(poses[i].position.x - back[i].position.x)) / (double)scale,
+                              std::abs((double)(poses[i].position.y - back[i].position.y)) / (double)scale,
+                              std::abs((double)(poses[i].position.z - back[i].position.z)) / (double)scale});
+            pos_points.push_back({step, blob.size(), e});
+        }
+        for (u32 step : pareto_quant_steps()) {
+            auto blob = compress_pose_lossy(poses, 1, kResync, step, kResync);
+            auto back = decompress_pose(blob);
+            double e = 0.0;
+            for (size_t i = 0; i < poses.size() && i < back.size(); i++)
+                e = std::max({e, std::abs((double)(poses[i].orientation.w - back[i].orientation.w)) / (double)qscale,
+                              std::abs((double)(poses[i].orientation.x - back[i].orientation.x)) / (double)qscale,
+                              std::abs((double)(poses[i].orientation.y - back[i].orientation.y)) / (double)qscale,
+                              std::abs((double)(poses[i].orientation.z - back[i].orientation.z)) / (double)qscale});
+            quat_points.push_back({step, blob.size(), e});
+        }
+    }
+
+    auto print_table = [&](const char* label, const std::vector<Point>& pts) {
+        std::cout << label << "\n" << std::left << std::setw(14) << "quant_step" << std::right << std::setw(14) << "bytes" << std::setw(18) << "max error\n";
+        for (const auto& p : pts) std::cout << std::left << std::setw(14) << p.quant_step << std::right << std::setw(14) << p.bytes << std::setw(18) << p.error << "\n";
+    };
+    auto print_json_array = [&](const std::vector<Point>& pts) {
+        std::cout << "[\n";
+        for (size_t i = 0; i < pts.size(); i++) {
+            const auto& p = pts[i];
+            std::cout << "    {\"quant_step\": " << p.quant_step << ", \"bytes\": " << p.bytes << ", \"error\": " << p.error << "}" << (i + 1 < pts.size() ? ",\n" : "\n");
+        }
+        std::cout << "  ]";
+    };
+
+    if (json) {
+        std::cout << "{\n  \"raw_bytes\": " << raw.size() << ",\n  \"position\": ";
+        print_json_array(pos_points);
+        if (!quat_points.empty()) { std::cout << ",\n  \"rotation\": "; print_json_array(quat_points); }
+        std::cout << "\n}\n";
+    } else {
+        std::cout << "pareto: " << in << " (" << raw.size() << " bytes), " << pos_points.size() << " points swept per axis\n";
+        print_table(quat_points.empty() ? "position/geometry error:" : "position error (rotation held lossless):", pos_points);
+        if (!quat_points.empty()) print_table("rotation error (position held lossless):", quat_points);
+    }
+    return 0;
+}
+
 int cmd_unsqueeze(const std::string& in, std::string out, bool explain, bool force) {
     if (out.empty()) out = in + ".restored";
     if (!force && file_exists(out))
@@ -1376,6 +1481,15 @@ void usage() {
         "      (not degrees). Falls back to true lossless, honestly, if even the\n"
         "      finest lossy step exceeds your budget. Only applies to detected\n"
         "      geo2d/geo3d/pose data.\n"
+        "  scissorc pareto <in> [--json]\n"
+        "      Real, measured Pareto frontier: sweeps 21 quant_step values\n"
+        "      (powers of 2, 1 to 2^20) via actual compress+decompress+measure at\n"
+        "      each -- the same real evaluation optimize() uses for one budget, run\n"
+        "      across the whole range so you can see the tradeoff curve instead of\n"
+        "      guessing a single budget. Pose data gets two independent sweeps\n"
+        "      (position, then rotation, each with the other held lossless) since\n"
+        "      the format encodes them as separate sub-streams. Only applies to\n"
+        "      detected geo2d/geo3d/pose data.\n"
         "  scissorc benchmark <file>\n"
         "      Real, measured comparison: CSA's own auto-detected mode (whatever\n"
         "      squeeze() would pick) vs. a real gzip-equivalent baseline (vendored\n"
@@ -1476,6 +1590,10 @@ int main(int argc, char** argv) {
                 else if (a == "--force") force = true;
             }
             return cmd_optimize(in, out, have_pos_budget, pos_budget, have_quat_budget, quat_budget, explain, force);
+        } else if (cmd == "pareto" && argc >= 3) {
+            bool json = false;
+            for (int i = 3; i < argc; i++) if (std::string(argv[i]) == "--json") json = true;
+            return cmd_pareto(argv[2], json);
         } else if (cmd == "compress" && argc >= 4) {
             bool gpu = false;
             std::string level = "balanced";
