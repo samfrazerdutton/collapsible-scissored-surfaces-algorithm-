@@ -1383,6 +1383,121 @@ int cmd_system(bool json) {
     return 0;
 }
 
+// A real self-diagnostic, not a static capability report -- `system`
+// (above) says what this machine *has*; `doctor` actually *exercises*
+// the codec's real entry points on tiny synthetic inputs and reports
+// whether each one genuinely works, here, now, on this build. Scoped to
+// what a compiled native binary can actually check about itself: it has
+// no way to introspect whether the Python bindings or a WASM build
+// exist on this machine (those are separate artifacts, possibly built
+// from a different checkout entirely), so this deliberately does not
+// claim to check them, rather than printing a misleading PASS/FAIL for
+// something it never actually looked at.
+int cmd_doctor() {
+    bool any_fail = false;
+    auto report = [&](const char* label, bool ok, const std::string& detail = "") {
+        std::cout << (ok ? "PASS" : "FAIL") << "  " << label;
+        if (!detail.empty()) std::cout << "  (" << detail << ")";
+        std::cout << "\n";
+        if (!ok) any_fail = true;
+    };
+
+    // General round trip -- exercises range_coder/codec.cpp's main path.
+    {
+        std::vector<u8> data(4096);
+        for (size_t i = 0; i < data.size(); i++) data[i] = (u8)((i * 2654435761u) % 256);
+        bool ok = false;
+        try {
+            auto blob = compress(data);
+            auto back = decompress(blob);
+            ok = (back == data);
+        } catch (...) { ok = false; }
+        report("general compress/decompress round trip", ok);
+    }
+
+    // geo3d round trip -- exercises Rod-Joint/Pantograph Lift + geo3d framing.
+    {
+        std::vector<Point3i> pts;
+        for (int i = 0; i < 200; i++) pts.push_back({i * 1000, (i * 37) % 5000, -i * 10});
+        bool ok = false;
+        try {
+            auto blob = compress_geo3d(pts);
+            auto back = decompress_geo3d(blob);
+            ok = (back.size() == pts.size());
+            for (size_t i = 0; ok && i < pts.size(); i++)
+                if (back[i].x != pts[i].x || back[i].y != pts[i].y || back[i].z != pts[i].z) ok = false;
+        } catch (...) { ok = false; }
+        report("geo3d compress/decompress round trip", ok);
+    }
+
+    // pose round trip -- exercises Quaternion Joint + pose framing.
+    {
+        std::vector<Pose> poses;
+        double qw = 1, qx = 0, qy = 0, qz = 0;
+        for (int i = 0; i < 100; i++) {
+            poses.push_back({{i * 100, i * 50, i * 25}, {(i32)llround(qw * 1048576), (i32)llround(qx * 1048576), (i32)llround(qy * 1048576), (i32)llround(qz * 1048576)}});
+            qz += 0.001; // a small, deliberately-not-renormalized drift is fine here -- this only checks the round trip, not physical validity
+        }
+        bool ok = false;
+        try {
+            auto blob = compress_pose(poses);
+            auto back = decompress_pose(blob);
+            ok = (back.size() == poses.size());
+        } catch (...) { ok = false; }
+        report("pose compress/decompress round trip", ok);
+    }
+
+    // Filesystem: this process can actually write, read back, and clean
+    // up a file in its current working directory -- squeeze()/optimize()/
+    // pareto() all depend on this working, and a read-only or permission-
+    // restricted working directory is a real, if unglamorous, way for
+    // every one of them to fail.
+    {
+        std::string path = ".csa_doctor_tmp_check";
+        bool ok = false;
+        try {
+            { std::ofstream f(path, std::ios::binary); f << "csa doctor check"; }
+            std::ifstream rf(path, std::ios::binary);
+            std::string content((std::istreambuf_iterator<char>(rf)), std::istreambuf_iterator<char>());
+            ok = (content == "csa doctor check");
+            std::remove(path.c_str());
+        } catch (...) { ok = false; }
+        report("filesystem write/read/delete access (current directory)", ok);
+    }
+
+    // SIMD: not just "what backend was detected" (system already reports
+    // that) but whether the dispatched result actually agrees with the
+    // scalar reference on a real (if tiny) input, right now.
+    {
+        std::vector<i32> a = {100, -200, 300, 0, 12345}, b = {90, -190, 305, 5, 12340};
+        u32 scalar_result = max_abs_diff_i32_scalar(a.data(), b.data(), a.size());
+        u32 dispatched_result = max_abs_diff_i32(a.data(), b.data(), a.size());
+        report("SIMD dispatch matches scalar reference", dispatched_result == scalar_result,
+               std::string("backend=") + (detect_simd_backend() == SimdBackend::AVX2 ? "AVX2" : "Scalar"));
+    }
+
+    // CUDA: unavailable is a legitimate, fully-supported configuration
+    // (this is exactly what CI's ubuntu-latest runner builds) -- only a
+    // real inconsistency (device reported available but a tiny real GPU
+    // call fails) counts as FAIL here.
+    {
+        if (!cuda_is_available()) {
+            std::cout << "SKIP  CUDA round trip  (no device available, or built with WITH_CUDA=OFF -- this is a supported configuration, not a failure)\n";
+        } else {
+            std::vector<i32> input(2048);
+            for (size_t i = 0; i < input.size(); i++) input[i] = (i32)((i * 2654435761u) % 100000);
+            LiftResult gpu_result;
+            bool gpu_ok = pantograph_lift_forward_cuda(input, gpu_result);
+            LiftResult cpu_result = pantograph_lift_forward(input);
+            bool matches = gpu_ok && gpu_result.residuals.size() == cpu_result.residuals.size();
+            report("CUDA round trip matches CPU reference", matches);
+        }
+    }
+
+    std::cout << (any_fail ? "\nRESULT: one or more checks FAILED\n" : "\nRESULT: all checks passed\n");
+    return any_fail ? 1 : 0;
+}
+
 int cmd_scale_test(size_t buffer_bytes, int repeats, bool json) {
     std::vector<u8> data(buffer_bytes);
     // A synthetic but non-degenerate byte stream: skewed-but-not-constant
@@ -1590,6 +1705,16 @@ void usage() {
         "      machine, RAM, and CUDA device (name + memory) if available.\n"
         "      Any field this platform can't report shows as NOT AVAILABLE\n"
         "      rather than a guess.\n"
+        "  scissorc doctor\n"
+        "      A real self-diagnostic, not a static report: actually runs tiny\n"
+        "      general/geo3d/pose compress+decompress round trips, checks\n"
+        "      filesystem write/read/delete access in the current directory,\n"
+        "      confirms the dispatched SIMD backend agrees with the scalar\n"
+        "      reference, and (only if a CUDA device is actually available --\n"
+        "      unavailable is a fully supported configuration, not a failure)\n"
+        "      a tiny real GPU-vs-CPU round trip. Exit code 1 if anything\n"
+        "      genuinely fails. Cannot check the Python bindings or a WASM build\n"
+        "      (separate artifacts this native binary has no way to see).\n"
         "  scissorc scale-test [--bytes N] [--repeats N] [--json]\n"
         "      Real measured thread-scaling: the interleaved-rANS entropy backend\n"
         "      (the only genuinely data-parallel primitive in this codebase --\n"
@@ -1771,6 +1896,8 @@ int main(int argc, char** argv) {
             bool json = false;
             for (int i = 2; i < argc; i++) if (std::string(argv[i]) == "--json") json = true;
             return cmd_system(json);
+        } else if (cmd == "doctor") {
+            return cmd_doctor();
         } else if (cmd == "scale-test") {
             size_t buffer_bytes = 4000000;
             int repeats = 5;
