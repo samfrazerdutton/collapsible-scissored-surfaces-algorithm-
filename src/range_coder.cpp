@@ -1,4 +1,5 @@
 #include "csa/range_coder.hpp"
+#include <stdexcept>
 
 namespace csa {
 
@@ -21,6 +22,8 @@ std::vector<u8> range_encode_bytes(const std::vector<u8>& input) {
 }
 
 std::vector<u8> range_decode_bytes(const u8* data, size_t size, size_t output_length) {
+    if (output_length > kMaxRangeDecodedBytes)
+        throw std::runtime_error("csa: claimed decoded length exceeds the sanity limit (kMaxRangeDecodedBytes) -- refusing to allocate for it");
     std::vector<u8> out;
     out.reserve(output_length);
     RangeDecoder dec(data, size);

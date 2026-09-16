@@ -1,5 +1,8 @@
 build/
 build_wasm/
+build_wsl3/
+build_asan/
+build_tsan/
 bench/datasets/
 bench/datasets_real/
 bench/_tmp/

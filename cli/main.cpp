@@ -41,6 +41,7 @@
 #include "csa/lz_matcher.hpp"
 #include "csa/pantograph_lift_cuda.hpp"
 #include "csa/rans_coder.hpp"
+#include "csa/simd.hpp"
 #include "miniz.h" // vendored (see CMakeLists.txt) -- real gzip-equivalent baseline for `scissorc benchmark`
 #include <algorithm>
 #include <cctype>
@@ -170,11 +171,14 @@ int cmd_compress_geo2d_lossy(const std::string& in, const std::string& out, i64 
     // bound) by actually decoding and comparing -- honesty over
     // convenience, consistent with the rest of this project.
     auto decoded = decompress_geo2d(blob);
-    double max_err = 0.0;
-    for (size_t i = 0; i < pts.size() && i < decoded.size(); i++) {
-        max_err = std::max({max_err, std::abs((double)(pts[i].x - decoded[i].x)) / (double)scale,
-                             std::abs((double)(pts[i].y - decoded[i].y)) / (double)scale});
-    }
+    // Same flat-array SIMD max-abs-diff kernel as cmd_optimize/cmd_benchmark
+    // (csa::max_abs_diff_i32, include/csa/simd.hpp) -- valid because
+    // Point2i is exactly two contiguous i32 members with no padding
+    // (include/csa/rod_joint_transform.hpp), so an array of them is
+    // layout-compatible with a flat i32 array of twice the length.
+    size_t n2 = std::min(pts.size(), decoded.size());
+    double max_err = n2 ? (double)max_abs_diff_i32(reinterpret_cast<const i32*>(pts.data()),
+                                                    reinterpret_cast<const i32*>(decoded.data()), n2 * 2) / (double)scale : 0.0;
 
     size_t raw_estimate = pts.size() * 2 * sizeof(double);
     std::cout << "compress-geo2d-lossy: " << pts.size() << " points, raw~=" << raw_estimate
@@ -224,12 +228,12 @@ int cmd_compress_geo3d_lossy(const std::string& in, const std::string& out, i64 
     // Same honesty-over-convenience measured-error reporting as
     // cmd_compress_geo2d_lossy.
     auto decoded = decompress_geo3d(blob);
-    double max_err = 0.0;
-    for (size_t i = 0; i < pts.size() && i < decoded.size(); i++) {
-        max_err = std::max({max_err, std::abs((double)(pts[i].x - decoded[i].x)) / (double)scale,
-                             std::abs((double)(pts[i].y - decoded[i].y)) / (double)scale,
-                             std::abs((double)(pts[i].z - decoded[i].z)) / (double)scale});
-    }
+    // See cmd_compress_geo2d_lossy's identical comment -- Point3i is three
+    // contiguous i32 members with no padding, so this is the same
+    // flat-array SIMD kernel applied to 3-wide points instead of 2-wide.
+    size_t n3 = std::min(pts.size(), decoded.size());
+    double max_err = n3 ? (double)max_abs_diff_i32(reinterpret_cast<const i32*>(pts.data()),
+                                                    reinterpret_cast<const i32*>(decoded.data()), n3 * 3) / (double)scale : 0.0;
 
     size_t raw_estimate = pts.size() * 3 * sizeof(double);
     std::cout << "compress-geo3d-lossy: " << pts.size() << " points, raw~=" << raw_estimate
@@ -508,15 +512,14 @@ int cmd_squeeze(const std::string& in, std::string out, bool have_quality, int q
         double max_err = 0.0;
         if (s.columns == 2) {
             auto back = decompress_geo2d(blob);
-            for (size_t i = 0; i < pts2.size() && i < back.size(); i++)
-                max_err = std::max({max_err, std::abs((double)(pts2[i].x - back[i].x)) / (double)scale,
-                                     std::abs((double)(pts2[i].y - back[i].y)) / (double)scale});
+            size_t n = std::min(pts2.size(), back.size());
+            if (n) max_err = (double)max_abs_diff_i32(reinterpret_cast<const i32*>(pts2.data()),
+                                                       reinterpret_cast<const i32*>(back.data()), n * 2) / (double)scale;
         } else {
             auto back = decompress_geo3d(blob);
-            for (size_t i = 0; i < pts3.size() && i < back.size(); i++)
-                max_err = std::max({max_err, std::abs((double)(pts3[i].x - back[i].x)) / (double)scale,
-                                     std::abs((double)(pts3[i].y - back[i].y)) / (double)scale,
-                                     std::abs((double)(pts3[i].z - back[i].z)) / (double)scale});
+            size_t n = std::min(pts3.size(), back.size());
+            if (n) max_err = (double)max_abs_diff_i32(reinterpret_cast<const i32*>(pts3.data()),
+                                                       reinterpret_cast<const i32*>(back.data()), n * 3) / (double)scale;
         }
         std::ostringstream e;
         e << "  detected: " << s.columns << " numeric columns (" << s.rows << " rows) -> " << shape_name << " mode\n";
@@ -653,17 +656,21 @@ int cmd_optimize(const std::string& in, std::string out, bool have_pos_budget, d
             std::vector<u8> blob = s.columns == 2 ? compress_geo2d_lossy(pts2, step, kResync)
                                                    : compress_geo3d_lossy(pts3, step, kResync);
             double max_err = 0.0;
+            // This closure runs once per candidate quant_step in
+            // search_max_quant_step's binary search (~20 real
+            // compress+decompress+measure rounds per optimize() call) --
+            // the hottest of this file's four max-abs-diff call sites, and
+            // the one most worth the SIMD kernel below.
             if (s.columns == 2) {
                 auto back = decompress_geo2d(blob);
-                for (size_t i = 0; i < pts2.size() && i < back.size(); i++)
-                    max_err = std::max({max_err, std::abs((double)(pts2[i].x - back[i].x)) / (double)scale,
-                                         std::abs((double)(pts2[i].y - back[i].y)) / (double)scale});
+                size_t n = std::min(pts2.size(), back.size());
+                if (n) max_err = (double)max_abs_diff_i32(reinterpret_cast<const i32*>(pts2.data()),
+                                                           reinterpret_cast<const i32*>(back.data()), n * 2) / (double)scale;
             } else {
                 auto back = decompress_geo3d(blob);
-                for (size_t i = 0; i < pts3.size() && i < back.size(); i++)
-                    max_err = std::max({max_err, std::abs((double)(pts3[i].x - back[i].x)) / (double)scale,
-                                         std::abs((double)(pts3[i].y - back[i].y)) / (double)scale,
-                                         std::abs((double)(pts3[i].z - back[i].z)) / (double)scale});
+                size_t n = std::min(pts3.size(), back.size());
+                if (n) max_err = (double)max_abs_diff_i32(reinterpret_cast<const i32*>(pts3.data()),
+                                                           reinterpret_cast<const i32*>(back.data()), n * 3) / (double)scale;
             }
             return max_err;
         };

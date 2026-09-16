@@ -14,7 +14,9 @@
 #include "csa/range_coder.hpp"
 #include "csa/rans_coder.hpp"
 #include "csa/rod_joint_transform.hpp"
+#include "csa/simd.hpp"
 #include "csa/thread_pool.hpp"
+#include "csa/work_stealing_pool.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -1801,6 +1803,175 @@ static void test_thread_pool() {
     }
 }
 
+// max_abs_diff_i32's AVX2 kernel is only meaningful to compare against
+// the scalar reference on hardware that actually has AVX2 -- detected at
+// runtime (csa::detect_simd_backend()), not assumed. On hardware without
+// it, this test still exercises and trusts the scalar path (the only
+// one that ran at all for csa_capi/every real caller on that machine).
+static void test_simd_max_abs_diff() {
+    std::mt19937 rng(20240615);
+    std::uniform_int_distribution<i32> dist(-1000000000, 1000000000);
+    auto rnd_i32 = [&](i32 /*lo*/, i32 /*hi*/) -> i32 { return dist(rng); };
+
+    for (size_t n : {size_t(0), size_t(1), size_t(3), size_t(7), size_t(8), size_t(9), size_t(1000), size_t(100003)}) {
+        std::vector<i32> a(n), b(n);
+        for (size_t i = 0; i < n; i++) {
+            // Bounded well within int32 so a[i]-b[i] can never overflow --
+            // matching max_abs_diff_i32_avx2's documented precondition
+            // (see src/simd_avx2.cpp), not testing past it.
+            a[i] = rnd_i32(-1000000000, 1000000000);
+            b[i] = rnd_i32(-1000000000, 1000000000);
+        }
+        u32 scalar_result = max_abs_diff_i32_scalar(a.data(), b.data(), n);
+        u32 dispatched_result = max_abs_diff_i32(a.data(), b.data(), n);
+        CHECK(dispatched_result == scalar_result);
+
+#if CSA_X86_SIMD
+        if (detect_simd_backend() == SimdBackend::AVX2) {
+            u32 avx2_result = max_abs_diff_i32_avx2(a.data(), b.data(), n);
+            CHECK(avx2_result == scalar_result);
+        }
+#endif
+    }
+
+    // A real, order-independent case: the max must come from whichever
+    // element actually has it, regardless of where that element falls
+    // relative to AVX2's 8-wide lane boundaries (once at the very start,
+    // once crossing a lane boundary, once in the scalar tail).
+    {
+        std::vector<i32> a(19, 0), b(19, 0);
+        a[0] = 1000000000; b[0] = -1000000000;   // lane 0, element 0
+        a[9] = 500000000; b[9] = -500000000;      // crosses into the second 8-wide lane
+        a[18] = 300000000; b[18] = 0;             // scalar tail (19 % 8 == 3)
+        CHECK(max_abs_diff_i32(a.data(), b.data(), 19) == 2000000000u);
+    }
+
+    std::printf("  (SIMD backend detected: %s)\n", detect_simd_backend() == SimdBackend::AVX2 ? "AVX2" : "scalar");
+
+    // Microbenchmark, not an end-to-end compression claim: this isolates
+    // exactly the kernel this pass vectorized, on a large buffer, so the
+    // reported speedup is attributable to this specific change and
+    // nothing else running at the same time.
+#if CSA_X86_SIMD
+    if (detect_simd_backend() == SimdBackend::AVX2) {
+        size_t n = 20000000;
+        std::vector<i32> a(n), b(n);
+        for (size_t i = 0; i < n; i++) { a[i] = (i32)(i % 1000000); b[i] = (i32)((i * 7) % 1000000); }
+
+        auto t0 = std::chrono::steady_clock::now();
+        volatile u32 r1 = max_abs_diff_i32_scalar(a.data(), b.data(), n);
+        auto t1 = std::chrono::steady_clock::now();
+        volatile u32 r2 = max_abs_diff_i32_avx2(a.data(), b.data(), n);
+        auto t2 = std::chrono::steady_clock::now();
+        CHECK(r1 == r2);
+
+        double scalar_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        double avx2_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
+        std::printf("  (max_abs_diff_i32: scalar=%.2fms AVX2=%.2fms on %zu elements, %.2fx speedup)\n",
+                     scalar_ms, avx2_ms, n, scalar_ms / avx2_ms);
+    } else {
+        std::printf("  (AVX2 not available on this CPU -- microbenchmark skipped, scalar path already verified above)\n");
+    }
+#else
+    std::printf("  (non-x86 build -- no AVX2 kernel exists on this target; scalar path already verified above)\n");
+#endif
+}
+
+// Deliberately spends real wall-clock time (not just increments a
+// counter) so a timing comparison against it is measuring real work,
+// not the cost of scheduling an empty no-op.
+static void busy_work(int iterations) {
+    volatile double acc = 0.0;
+    for (int i = 0; i < iterations; i++) acc += std::sin((double)i) * std::cos((double)i);
+}
+
+static void test_work_stealing_pool() {
+    // Correctness: every submitted task actually runs, with the right
+    // result, exactly once.
+    {
+        WorkStealingPool pool(4);
+        CHECK(pool.size() == 4);
+        std::vector<std::future<int>> futures;
+        for (int i = 0; i < 200; i++) futures.push_back(pool.submit([i] { return i + 1; }));
+        bool all_correct = true;
+        for (int i = 0; i < 200; i++) if (futures[(size_t)i].get() != i + 1) all_correct = false;
+        CHECK(all_correct);
+        WorkStealingStats s = pool.stats();
+        CHECK(s.tasks_submitted == 200);
+        CHECK(s.tasks_completed == 200);
+    } // destructor must join every worker without hanging
+
+    // Exceptions propagate through the future, don't crash a worker.
+    {
+        WorkStealingPool pool(2);
+        auto fut = pool.submit([]() -> int { throw std::runtime_error("intentional work-stealing test exception"); });
+        bool threw = false;
+        try { fut.get(); } catch (const std::runtime_error& e) { threw = std::string(e.what()) == "intentional work-stealing test exception"; }
+        CHECK(threw);
+        CHECK(pool.submit([] { return 7; }).get() == 7); // pool still usable afterward
+    }
+
+    // The real point of this class: a genuinely imbalanced workload,
+    // where a handful of tasks cost far more than the rest, submitted in
+    // round-robin order (so a naive *static* split -- assign task i to
+    // worker i%N, no stealing at all -- concentrates all the expensive
+    // tasks on one worker while the others sit idle). Compares actual
+    // wall-clock time for that static baseline against the same task set
+    // run through WorkStealingPool, which can rebalance via stealing.
+    // This is a measured comparison, not an assumption that stealing
+    // "must" help -- if it didn't, that would be a real, reportable
+    // finding too.
+    {
+        const int num_workers = 4;
+        const int num_tasks = 64;
+        const int heavy_every = num_workers; // every heavy_every-th task (by submission order) is expensive
+        const int heavy_iters = 300000, light_iters = 3000;
+
+        // Baseline: statically partition tasks round-robin across
+        // num_workers real std::threads, each running its assigned
+        // tasks strictly in order on its own thread -- no stealing, no
+        // shared queue, the simplest possible parallel baseline.
+        auto run_static_baseline = [&]() -> double {
+            std::vector<std::vector<int>> assignment(num_workers);
+            for (int i = 0; i < num_tasks; i++) assignment[i % num_workers].push_back(i);
+            auto t0 = std::chrono::steady_clock::now();
+            std::vector<std::thread> threads;
+            for (int w = 0; w < num_workers; w++) {
+                threads.emplace_back([&assignment, w, heavy_every, heavy_iters, light_iters] {
+                    for (int task_id : assignment[(size_t)w]) busy_work(task_id % heavy_every == 0 ? heavy_iters : light_iters);
+                });
+            }
+            for (auto& t : threads) t.join();
+            auto t1 = std::chrono::steady_clock::now();
+            return std::chrono::duration<double, std::milli>(t1 - t0).count();
+        };
+
+        auto run_work_stealing = [&]() -> double {
+            WorkStealingPool pool((size_t)num_workers);
+            auto t0 = std::chrono::steady_clock::now();
+            std::vector<std::future<void>> futures;
+            for (int i = 0; i < num_tasks; i++) {
+                int iters = (i % heavy_every == 0) ? heavy_iters : light_iters;
+                futures.push_back(pool.submit([iters] { busy_work(iters); }));
+            }
+            for (auto& f : futures) f.get();
+            auto t1 = std::chrono::steady_clock::now();
+            return std::chrono::duration<double, std::milli>(t1 - t0).count();
+        };
+
+        double static_ms = run_static_baseline();
+        double stealing_ms = run_work_stealing();
+        std::printf("  (work-stealing vs static split, imbalanced workload: static=%.2fms work-stealing=%.2fms, %.2fx)\n",
+                     static_ms, stealing_ms, static_ms / stealing_ms);
+        // Not asserted as a hard pass/fail threshold (real wall-clock
+        // timing on a shared CI/dev machine is noisy enough that a tight
+        // bound would be flaky) -- the number is printed either way, and
+        // this is the honest way to report a timing comparison rather
+        // than assert a specific speedup that might not reproduce on
+        // every machine this runs on.
+    }
+}
+
 int main() {
     test_range_coder();
     test_lz_matcher();
@@ -1820,6 +1991,8 @@ int main() {
     test_rod_joint_3d_adaptive_blocking();
     test_quaternion_joint_adaptive_blocking();
     test_thread_pool();
+    test_work_stealing_pool();
+    test_simd_max_abs_diff();
     test_quat_calibration_cuda_matches_cpu();
     test_pose_codec();
     test_pose_stream();

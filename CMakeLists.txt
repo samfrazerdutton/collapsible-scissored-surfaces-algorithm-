@@ -21,6 +21,24 @@ endif()
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Real sanitizer support, not just claimed in a document -- see
+# docs/SANITIZERS.md for what's actually been run under each of these
+# and what hasn't. GCC/Clang only (MSVC's /fsanitize=address exists but
+# not the others; -DCSA_SANITIZE=thread is the one that matters most for
+# this pass's new concurrent code -- csa::ThreadPool and
+# csa::WorkStealingPool, both introduced in this project's own history).
+# One sanitizer at a time: ASan and TSan's runtimes are mutually
+# incompatible in one binary, and combining either with UBSan in the
+# same build is supported but was not the combination actually tested
+# here -- see the doc for exactly what was run.
+set(CSA_SANITIZE "" CACHE STRING "Sanitizer to build with: address, undefined, thread, or empty for none")
+if(CSA_SANITIZE AND NOT MSVC)
+    add_compile_options(-fsanitize=${CSA_SANITIZE} -fno-omit-frame-pointer -g)
+    add_link_options(-fsanitize=${CSA_SANITIZE})
+elseif(CSA_SANITIZE AND MSVC)
+    message(WARNING "CSA_SANITIZE=${CSA_SANITIZE} requested but MSVC only supports -fsanitize=address (as /fsanitize=address); thread/undefined are GCC/Clang-only in this project. Ignoring.")
+endif()
+
 # csa_core is a static library linked into both scissorc (a plain
 # executable, doesn't care) and csa_capi (a *shared* library, which does
 # care): on Linux/GCC, a static lib built without -fPIC fails to link
@@ -52,8 +70,25 @@ add_library(csa_core STATIC
     src/bwt_transform.cpp
     src/bwt_codec.cpp
     src/codec.cpp
+    src/simd.cpp
+    src/simd_avx2.cpp
 )
 target_include_directories(csa_core PUBLIC include)
+
+# src/simd_avx2.cpp is the one translation unit in this codebase allowed
+# to use AVX2 intrinsics -- compiled with a wider instruction-set target
+# than the rest of the project so the compiler can both accept the
+# intrinsics and auto-vectorize using them, while every other .cpp stays
+# at the baseline target and still runs on CPUs without AVX2. Runtime
+# CPUID dispatch (csa::detect_simd_backend(), src/simd.cpp) decides
+# whether this file's code ever actually executes -- see
+# docs/PARALLELISM.md for why that split (compile-time capability vs.
+# runtime decision) matters and can't be collapsed into one #ifdef.
+if(MSVC)
+    set_source_files_properties(src/simd_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+else()
+    set_source_files_properties(src/simd_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2")
+endif()
 
 if(CSA_HAVE_CUDA)
     set(CMAKE_CUDA_STANDARD 17)

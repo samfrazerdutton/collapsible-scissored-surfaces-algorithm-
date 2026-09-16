@@ -290,6 +290,19 @@ std::vector<Quat4i> quaternion_joint_inverse(const QuaternionJointResult& r) {
     std::vector<u32> block_of;
     if (!r.block_len.empty()) block_of = block_index_from_lengths(n, r.block_len);
 
+    // Same real, fuzzer-found bug class as rod_joint_3d_similarity_inverse
+    // (src/rod_joint_transform.cpp) -- r.count and the per-block array
+    // sizes (r.block_lag.size()/r.block_delta.size()) come from
+    // independent fields in the wire format, and nothing upstream
+    // guarantees they're consistent for an adversarial or corrupted
+    // stream. Checked once here rather than trusting every index the
+    // loop below computes to stay in bounds.
+    size_t max_blk_needed = r.block_len.empty()
+        ? (n == 0 ? 0 : (n - 1) / kQuatJointBlockSize)
+        : (block_of.empty() ? 0 : (size_t)*std::max_element(block_of.begin(), block_of.end()));
+    if (n > 0 && (r.block_lag.size() <= max_blk_needed || r.block_delta.size() <= max_blk_needed))
+        throw std::runtime_error("csa: corrupt or adversarial quaternion-joint stream -- block index would read past the end of block_lag/block_delta");
+
     for (size_t i = 0; i < n; i++) {
         size_t blk = r.block_len.empty() ? (i / kQuatJointBlockSize) : (size_t)block_of[i];
         u32 lag = r.block_lag[blk];

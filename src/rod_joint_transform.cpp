@@ -414,8 +414,15 @@ std::vector<Point2i> rod_joint_2d_inverse(const RodJoint2DResult& r) {
         rec_ex[i] = (i32)(pred_re + qx * (i64)q_here);
         rec_ey[i] = (i32)(pred_im + qy * (i64)q_here);
 
-        points[i + 1].x = points[i].x + rec_ex[i];
-        points[i + 1].y = points[i].y + rec_ey[i];
+        // Widened to i64 before adding, then narrowed back -- adversarial
+        // (or corrupted) residual values can otherwise accumulate into a
+        // real signed-integer overflow in plain i32 arithmetic here (UB,
+        // found by fuzzing; see docs/SANITIZERS.md), not just a
+        // theoretical concern for honestly-encoded data whose values stay
+        // small. Matches this same file's existing pattern for the
+        // predicted-value computation two lines above.
+        points[i + 1].x = (i32)((i64)points[i].x + (i64)rec_ex[i]);
+        points[i + 1].y = (i32)((i64)points[i].y + (i64)rec_ey[i]);
     }
     return points;
 }
@@ -437,6 +444,14 @@ RodJoint3DResult rod_joint_3d_forward(const std::vector<Point3i>& points, u32 xy
 std::vector<Point3i> rod_joint_3d_inverse(const RodJoint3DResult& r) {
     std::vector<Point2i> xy = rod_joint_2d_inverse(r.xy);
     std::vector<i32> zs = pantograph_lift_inverse(r.lift_z);
+    // xy and zs are decoded from two independent sub-streams (r.xy.count and
+    // r.lift_z.original_length are separate fields in the wire format), and a
+    // real encoder always emits them equal (rod_joint_3d_forward splits one
+    // points array into both). An adversarial/corrupted stream can claim two
+    // different lengths; zipping them index-by-index below would then read
+    // zs out of bounds -- a real SEGV, found by fuzzing (see docs/SANITIZERS.md).
+    if (xy.size() != zs.size())
+        throw std::runtime_error("csa: corrupt or adversarial geo3d stream -- xy and z sub-stream lengths disagree");
     std::vector<Point3i> points(xy.size());
     for (size_t i = 0; i < xy.size(); i++) {
         points[i] = {xy[i].x, xy[i].y, zs[i]};
@@ -545,6 +560,26 @@ std::vector<Point3i> rod_joint_3d_similarity_inverse(const RodJoint3DSimResult& 
     std::vector<i32> rec_ex(nrods), rec_ey(nrods), rec_ez(nrods);
     std::vector<u32> block_of;
     if (!r.block_len.empty()) block_of = block_index_from_lengths(nrods, r.block_len);
+
+    // Real, fuzzer-found bug (see fuzz/, docs/SANITIZERS.md): r.count and
+    // the number of per-block entries (r.block_lag.size()/r.block_matrix.
+    // size()) are read from independent fields in the wire format --
+    // deserialize_geo3d_sim's `nblocks` is its own u32, not derived from
+    // count the way the fixed-block-size loop below assumes. An
+    // adversarial (or simply corrupted) stream can set count high enough
+    // to need many blocks while claiming zero or few actual block
+    // entries, indexing r.block_lag/r.block_matrix out of bounds --
+    // observed directly as a real SEGV, not a theoretical concern. This
+    // is the one necessary bound: the loop below can never touch a `blk`
+    // at or past whichever of these sizes is smaller, in either the
+    // fixed-size or adaptive (`block_of`) case, so checking it once here
+    // covers both.
+    size_t max_blk_needed = r.block_len.empty()
+        ? (nrods == 0 ? 0 : (nrods - 1) / kRodJoint3DBlockSize)
+        : (block_of.empty() ? 0 : (size_t)*std::max_element(block_of.begin(), block_of.end()));
+    if (nrods > 0 && (r.block_lag.size() <= max_blk_needed || r.block_matrix.size() <= max_blk_needed))
+        throw std::runtime_error("csa: corrupt or adversarial geo3d-sim stream -- block index would read past the end of block_lag/block_matrix");
+
     for (size_t i = 0; i < nrods; i++) {
         size_t blk = r.block_len.empty() ? (i / kRodJoint3DBlockSize) : (size_t)block_of[i];
         u32 lag = r.block_lag[blk];
@@ -565,9 +600,11 @@ std::vector<Point3i> rod_joint_3d_similarity_inverse(const RodJoint3DSimResult& 
         rec_ey[i] = (i32)(py + qy * (i64)q_here);
         rec_ez[i] = (i32)(pz + qz * (i64)q_here);
 
-        points[i + 1].x = points[i].x + rec_ex[i];
-        points[i + 1].y = points[i].y + rec_ey[i];
-        points[i + 1].z = points[i].z + rec_ez[i];
+        // See rod_joint_2d_inverse's identical fix/comment above -- same
+        // real, fuzzer-found signed-overflow UB, same widen-then-narrow fix.
+        points[i + 1].x = (i32)((i64)points[i].x + (i64)rec_ex[i]);
+        points[i + 1].y = (i32)((i64)points[i].y + (i64)rec_ey[i]);
+        points[i + 1].z = (i32)((i64)points[i].z + (i64)rec_ez[i]);
     }
     return points;
 }

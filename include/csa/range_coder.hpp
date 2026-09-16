@@ -275,7 +275,36 @@ private:
 
 // High-level helpers: encode/decode a byte buffer with the adaptive
 // order-1 model. `decode_bytes` needs the exact output length up front
-// (stored separately in the container header).
+// (stored separately in the container header, and -- for every real
+// caller in codec.cpp -- read directly from untrusted input with no
+// cross-check of its own). A tiny, cheaply-produced malicious blob can
+// claim an enormous output_length; range_decode_bytes throws rather than
+// attempting to reserve() it once output_length exceeds this cap. This
+// is a real, fuzzer-found decompression-bomb class (see fuzz/), not a
+// theoretical concern.
+//
+// This cap also bounds worst-case *CPU time*, not just memory: decoding
+// runs the adaptive order-1 model (a Fenwick-tree query + update) once
+// per output byte regardless of how small the compressed input claiming
+// that output length is, so the cap is the only thing standing between
+// a ~60-byte adversarial input and however long it takes to decode
+// output_length bytes one at a time. The fuzzer found this directly: a
+// handful of ~60-byte inputs claiming an output length approaching the
+// (then) 1 GiB cap took 17-51 real CPU-seconds each to decode, without
+// ever exceeding the memory-bomb defenses above (this is a genuine, if
+// modest, algorithmic-complexity / CPU-amplification finding, distinct
+// from the memory-bomb bugs fixed elsewhere -- see docs/SANITIZERS.md).
+// 128 MiB keeps several times the headroom this project's own
+// benchmark suite ever needs (the largest real dataset, the 693,895-
+// point Autzen LiDAR scan, decodes to a few tens of MB) while cutting
+// worst-case decode time by ~8x versus the original 1 GiB cap. It does
+// not eliminate the amplification class -- a well-resourced attacker
+// can still force ~128 MiB / few seconds of CPU per call -- fully
+// closing that would mean bounding decode work by the *compressed*
+// input size too (e.g. a claimed-ratio check), which is real follow-up
+// work, not done in this pass.
+constexpr size_t kMaxRangeDecodedBytes = size_t(1) << 27; // 128 MiB
+
 std::vector<u8> range_encode_bytes(const std::vector<u8>& input);
 std::vector<u8> range_decode_bytes(const u8* data, size_t size, size_t output_length);
 

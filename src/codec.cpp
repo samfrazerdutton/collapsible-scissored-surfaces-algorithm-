@@ -5,6 +5,7 @@
 #include "csa/pantograph_lift_cuda.hpp"
 #include "csa/range_coder.hpp"
 #include <cstring>
+#include <string>
 
 namespace csa {
 
@@ -27,6 +28,45 @@ Mode read_magic_mode(const u8* data, size_t size, size_t& pos) {
     }
     pos = 5;
     return (Mode)data[4];
+}
+
+// Every deserialize_* function below reads at least one element count
+// directly from the untrusted stream (block counts, residual counts) and
+// uses it to size a std::vector before actually reading that many
+// elements out of the just-range-decoded `flat` payload. Without this
+// check, a corrupted or adversarial count field drives resize()/reserve()
+// directly -- a real decompression-bomb class, not a theoretical one:
+// found by fuzz/fuzz_decompress.cpp within seconds of its first real run
+// (an attacker-controlled count in deserialize_geo2d attempting a
+// multi-terabyte allocation from a ~60-byte input; see
+// docs/SANITIZERS.md). The check itself is a hard mathematical necessary
+// condition, not a heuristic guess that risks rejecting legitimate data:
+// every element this codec's varint format can encode takes at least one
+// byte, so `requested_elements` can never legitimately exceed
+// `available_bytes` for any honestly-produced stream.
+void check_count_feasible(u64 requested_elements, size_t available_bytes, const char* what) {
+    if (requested_elements > (u64)available_bytes)
+        throw std::runtime_error(std::string("csa: corrupt or adversarial ") + what + " count (" +
+                                  std::to_string(requested_elements) + ") exceeds what the decoded payload (" +
+                                  std::to_string(available_bytes) + " bytes) could possibly contain");
+}
+
+// A second, earlier line of defense for the handful of count-like fields
+// (original_length, record count) that get used to size vectors *before*
+// any range-decoded payload exists to cross-check them against (see
+// deserialize_lift's per-level pair/block counts, computed from
+// original_length before the range-coded stream is even read). 100
+// million is generous headroom over the largest real dataset this
+// project's own benchmarks exercise (the 693,895-point Autzen LiDAR
+// scan; see REAL_GEO_BENCHMARK.md) while still ruling out the
+// multi-billion-element counts a corrupted or adversarial header could
+// otherwise claim.
+constexpr u64 kMaxReasonableElementCount = 100000000;
+
+void check_reasonable_count(u64 count, const char* what) {
+    if (count > kMaxReasonableElementCount)
+        throw std::runtime_error(std::string("csa: ") + what + " (" + std::to_string(count) +
+                                  ") exceeds this codec's sanity limit (" + std::to_string(kMaxReasonableElementCount) + ")");
 }
 
 // Serializes a LiftResult: header fields + one range-coded stream holding
@@ -63,7 +103,20 @@ void serialize_lift(const LiftResult& lr, std::vector<u8>& out) {
 LiftResult deserialize_lift(const u8* data, size_t size, size_t& pos) {
     LiftResult lr;
     lr.original_length = get_u64(data, size, pos);
+    check_reasonable_count(lr.original_length, "lift original_length");
     u32 num_levels = get_u32(data, size, pos);
+    // num_levels drives 4 separate per-level allocations below (level_pair_counts,
+    // level_block_counts, block_ratios, block_offsets), each sized directly off it
+    // before any cross-check against real payload bytes is possible. The generic
+    // 100M check_reasonable_count() cap is far too loose here: a real encoder never
+    // emits more than ~64 (each level halves padded_length, itself bounded by
+    // original_length, which is itself capped above) -- found by fuzzing (a crafted
+    // num_levels of ~33 million passed the generic cap and OOM'd the process across
+    // those 4 allocations; see docs/SANITIZERS.md).
+    constexpr u32 kMaxLiftLevels = 64;
+    if (num_levels > kMaxLiftLevels)
+        throw std::runtime_error("csa: corrupt or adversarial lift num_levels (" + std::to_string(num_levels) +
+                                  ") exceeds what a real encoder can ever produce (" + std::to_string(kMaxLiftLevels) + ")");
     lr.quant_step = get_u32(data, size, pos);
     if (lr.quant_step == 0) lr.quant_step = 1;
 
@@ -92,7 +145,7 @@ LiftResult deserialize_lift(const u8* data, size_t size, size_t& pos) {
 
     u64 raw_len = get_u64(data, size, pos);
     u64 coded_len = get_u64(data, size, pos);
-    if (pos + coded_len > size) throw std::runtime_error("csa: truncated lift payload");
+    if (pos > size || coded_len > (u64)(size - pos)) throw std::runtime_error("csa: truncated lift payload");
     std::vector<u8> flat_varint = range_decode_bytes(data + pos, (size_t)coded_len, (size_t)raw_len);
     pos += (size_t)coded_len;
 
@@ -152,6 +205,7 @@ void serialize_geo2d(const RodJoint2DResult& r, std::vector<u8>& out) {
 RodJoint2DResult deserialize_geo2d(const u8* data, size_t size, size_t& pos) {
     RodJoint2DResult r;
     r.count = get_u64(data, size, pos);
+    check_reasonable_count(r.count, "geo2d count");
     r.anchor.x = get_i32(data, size, pos);
     r.anchor.y = get_i32(data, size, pos);
     r.quant_step = get_u32(data, size, pos);
@@ -159,12 +213,18 @@ RodJoint2DResult deserialize_geo2d(const u8* data, size_t size, size_t& pos) {
 
     u64 raw_len = get_u64(data, size, pos);
     u64 coded_len = get_u64(data, size, pos);
-    if (pos + coded_len > size) throw std::runtime_error("csa: truncated geo2d payload");
+    if (pos > size || coded_len > (u64)(size - pos)) throw std::runtime_error("csa: truncated geo2d payload");
     std::vector<u8> flat = range_decode_bytes(data + pos, (size_t)coded_len, (size_t)raw_len);
     pos += (size_t)coded_len;
 
     size_t n = (r.count > 0) ? (size_t)(r.count - 1) : 0;
     size_t nblocks = (n + kRodJointBlockSize - 1) / kRodJointBlockSize;
+    // Real cross-check against the payload this specific stream actually
+    // decoded to (not just the earlier sanity cap): 3 block-level fields
+    // plus 2 per-residual fields, each at least 1 byte -- see
+    // check_count_feasible's own comment for why this can never
+    // false-positive on honestly-produced data.
+    check_count_feasible((u64)nblocks * 3 + (u64)n * 2, flat.size(), "geo2d block/residual");
     r.block_lag.resize(nblocks);
     r.block_ratio_re.resize(nblocks);
     r.block_ratio_im.resize(nblocks);
@@ -226,22 +286,25 @@ void serialize_geo3d_sim(const RodJoint3DSimResult& r, std::vector<u8>& out) {
 RodJoint3DSimResult deserialize_geo3d_sim(const u8* data, size_t size, size_t& pos) {
     RodJoint3DSimResult r;
     r.count = get_u64(data, size, pos);
+    check_reasonable_count(r.count, "geo3d-sim count");
     r.anchor.x = get_i32(data, size, pos);
     r.anchor.y = get_i32(data, size, pos);
     r.anchor.z = get_i32(data, size, pos);
     r.quant_step = get_u32(data, size, pos);
     r.resync_interval = get_u32(data, size, pos);
     u32 nblocks = get_u32(data, size, pos);
+    check_reasonable_count(nblocks, "geo3d-sim nblocks");
     if (pos >= size) throw std::runtime_error("csa: truncated geo3d-sim adaptive flag");
     bool is_adaptive = data[pos++] != 0;
 
     u64 raw_len = get_u64(data, size, pos);
     u64 coded_len = get_u64(data, size, pos);
-    if (pos + coded_len > size) throw std::runtime_error("csa: truncated geo3d-sim payload");
+    if (pos > size || coded_len > (u64)(size - pos)) throw std::runtime_error("csa: truncated geo3d-sim payload");
     std::vector<u8> flat = range_decode_bytes(data + pos, (size_t)coded_len, (size_t)raw_len);
     pos += (size_t)coded_len;
 
     size_t n = (r.count > 0) ? (size_t)(r.count - 1) : 0;
+    check_count_feasible((u64)nblocks * 2 + (u64)n * 3, flat.size(), "geo3d-sim block/residual");
     r.block_lag.resize(nblocks);
     r.block_matrix.resize(nblocks);
     r.residual_x.resize(n);
@@ -311,6 +374,7 @@ void serialize_quat_joint(const QuaternionJointResult& r, std::vector<u8>& out) 
 QuaternionJointResult deserialize_quat_joint(const u8* data, size_t size, size_t& pos) {
     QuaternionJointResult r;
     r.count = get_u64(data, size, pos);
+    check_reasonable_count(r.count, "quaternion-joint count");
     r.anchor.w = get_i32(data, size, pos);
     r.anchor.x = get_i32(data, size, pos);
     r.anchor.y = get_i32(data, size, pos);
@@ -318,16 +382,18 @@ QuaternionJointResult deserialize_quat_joint(const u8* data, size_t size, size_t
     r.quant_step = get_u32(data, size, pos);
     r.resync_interval = get_u32(data, size, pos);
     u32 nblocks = get_u32(data, size, pos);
+    check_reasonable_count(nblocks, "quaternion-joint nblocks");
     if (pos >= size) throw std::runtime_error("csa: truncated quaternion-joint adaptive flag");
     bool is_adaptive = data[pos++] != 0;
 
     u64 raw_len = get_u64(data, size, pos);
     u64 coded_len = get_u64(data, size, pos);
-    if (pos + coded_len > size) throw std::runtime_error("csa: truncated quaternion-joint payload");
+    if (pos > size || coded_len > (u64)(size - pos)) throw std::runtime_error("csa: truncated quaternion-joint payload");
     std::vector<u8> flat = range_decode_bytes(data + pos, (size_t)coded_len, (size_t)raw_len);
     pos += (size_t)coded_len;
 
     size_t n = (r.count > 0) ? (size_t)(r.count - 1) : 0;
+    check_count_feasible((u64)nblocks * 2 + (u64)n * 4, flat.size(), "quaternion-joint block/residual");
     r.block_lag.resize(nblocks);
     r.block_delta.resize(nblocks);
     r.residual_w.resize(n);

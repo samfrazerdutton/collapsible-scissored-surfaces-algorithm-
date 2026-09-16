@@ -45,14 +45,29 @@ inline i64 quant_round_div(i64 d, i64 q) {
 // ---- Zigzag encoding: maps signed ints to unsigned so small-magnitude
 // residuals (positive or negative) become small unsigned values, which the
 // entropy coder can then exploit. ----
+// Both encoders below compute the textbook zigzag formula
+// (v << 1) ^ (v >> N) entirely in the *unsigned* domain: left-shifting a
+// negative signed value is undefined behavior (found for real by
+// UBSan -- see docs/SANITIZERS.md -- not a theoretical concern), and
+// right-shifting one is merely implementation-defined rather than
+// portably specified. Casting to unsigned first and reconstructing the
+// arithmetic-shift-style sign mask via `0u - (uv >> (bits-1))` (an
+// unsigned shift, always well-defined, extracting just the sign bit)
+// produces the exact same bit pattern on every two's-complement
+// platform this project targets, with no UB and no implementation-
+// defined step anywhere in the computation.
 inline u32 zigzag_encode32(i32 v) {
-    return (u32)((v << 1) ^ (v >> 31));
+    u32 uv = (u32)v;
+    u32 mask = (u32)0 - (uv >> 31);
+    return (uv << 1) ^ mask;
 }
 inline i32 zigzag_decode32(u32 v) {
     return (i32)((v >> 1) ^ (~(v & 1) + 1));
 }
 inline u64 zigzag_encode64(i64 v) {
-    return (u64)((v << 1) ^ (v >> 63));
+    u64 uv = (u64)v;
+    u64 mask = (u64)0 - (uv >> 63);
+    return (uv << 1) ^ mask;
 }
 inline i64 zigzag_decode64(u64 v) {
     return (i64)((v >> 1) ^ (~(v & 1) + 1));
