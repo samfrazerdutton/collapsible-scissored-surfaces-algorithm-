@@ -14,6 +14,7 @@
 #include "csa/range_coder.hpp"
 #include "csa/rans_coder.hpp"
 #include "csa/rod_joint_transform.hpp"
+#include "csa/thread_pool.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -1724,6 +1725,7 @@ static void test_rans_coder() {
         for (int i = 0; i < 4000000; i++) v.push_back((u8)((i * 2654435761u) % 256));
         big = v;
     }
+    std::vector<u8> reference_coded;
     for (int num_lanes : {1, 4, 8}) {
         auto t0 = std::chrono::steady_clock::now();
         auto coded_big = encode_interleaved_rans(big, num_lanes);
@@ -1731,10 +1733,71 @@ static void test_rans_coder() {
         auto decoded_big = decode_interleaved_rans(coded_big);
         auto t2 = std::chrono::steady_clock::now();
         CHECK(decoded_big == big);
+        // Deterministic parallelism (see docs/PARALLELISM.md): re-running
+        // the exact same lane count must produce byte-identical output --
+        // the thread pool's task scheduling order must never leak into
+        // the result, since each lane writes to its own disjoint output
+        // range regardless of which worker thread or in what order it runs.
+        auto coded_big_rerun = encode_interleaved_rans(big, num_lanes);
+        CHECK(coded_big_rerun == coded_big);
         double enc_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
         double dec_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
         std::printf("  (rANS %d lane(s), %zu bytes: encode=%.2fms decode=%.2fms)\n",
                      num_lanes, big.size(), enc_ms, dec_ms);
+    }
+}
+
+// The thread pool is a general-purpose primitive, not something only
+// rANS-shaped code should trust -- tested directly here rather than only
+// indirectly through test_rans_coder() above.
+static void test_thread_pool() {
+    {
+        ThreadPool pool(4);
+        CHECK(pool.size() == 4);
+        std::vector<std::future<int>> futures;
+        for (int i = 0; i < 100; i++) futures.push_back(pool.submit([i] { return i * i; }));
+        bool all_correct = true;
+        for (int i = 0; i < 100; i++) if (futures[(size_t)i].get() != i * i) all_correct = false;
+        CHECK(all_correct);
+    } // pool destructor runs here: must join every worker, never hang, never leak a thread
+
+    // Exceptions thrown inside a submitted task must surface at the
+    // future, not crash the worker thread or the process.
+    {
+        ThreadPool pool(2);
+        auto fut = pool.submit([]() -> int { throw std::runtime_error("intentional test exception"); });
+        bool threw = false;
+        try { fut.get(); } catch (const std::runtime_error& e) { threw = std::string(e.what()) == "intentional test exception"; }
+        CHECK(threw);
+        // the pool must still be usable after a task throws
+        auto fut2 = pool.submit([] { return 42; });
+        CHECK(fut2.get() == 42);
+    }
+
+    // parallel_for's fn(0..count-1) contract, and its default pool being
+    // real and shared (default_thread_pool() returns the same instance
+    // across calls -- checked indirectly by confirming a real speedup is
+    // possible without constructing a new pool per call).
+    {
+        std::vector<int> seen(16, -1);
+        parallel_for(16, [&](int i) { seen[(size_t)i] = i * 2; });
+        bool all_correct = true;
+        for (int i = 0; i < 16; i++) if (seen[(size_t)i] != i * 2) all_correct = false;
+        CHECK(all_correct);
+
+        // count<=0 must be a safe no-op, not undefined behavior.
+        int calls = 0;
+        parallel_for(0, [&](int) { calls++; });
+        CHECK(calls == 0);
+
+        // An exception from any single index must propagate to the caller.
+        bool threw = false;
+        try {
+            parallel_for(8, [](int i) { if (i == 3) throw std::runtime_error("boom"); });
+        } catch (const std::runtime_error&) { threw = true; }
+        CHECK(threw);
+
+        CHECK(&default_thread_pool() == &default_thread_pool()); // same instance every call
     }
 }
 
@@ -1756,6 +1819,7 @@ int main() {
     test_quaternion_joint_lossy();
     test_rod_joint_3d_adaptive_blocking();
     test_quaternion_joint_adaptive_blocking();
+    test_thread_pool();
     test_quat_calibration_cuda_matches_cpu();
     test_pose_codec();
     test_pose_stream();

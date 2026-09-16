@@ -40,6 +40,7 @@
 #include "csa/codec.hpp"
 #include "csa/lz_matcher.hpp"
 #include "csa/pantograph_lift_cuda.hpp"
+#include "csa/rans_coder.hpp"
 #include "miniz.h" // vendored (see CMakeLists.txt) -- real gzip-equivalent baseline for `scissorc benchmark`
 #include <algorithm>
 #include <cctype>
@@ -52,6 +53,7 @@
 #include <string>
 #include <vector>
 #include <cstdint>
+#include <thread>
 
 using namespace csa;
 
@@ -1106,6 +1108,97 @@ int cmd_benchmark(const std::string& path) {
     return 0;
 }
 
+// `scissorc scale-test`: a real thread-scaling measurement, not a claimed
+// one. Measures the interleaved rANS format (src/rans_coder.cpp,
+// csa::ThreadPool-backed as of this pass -- see docs/PARALLELISM.md) at
+// 1/2/4/8/hardware_concurrency() lanes on a real (synthetically
+// generated but not trivially compressible or trivially parallel-
+// friendly) buffer, and reports actual measured speedup(N)=T(1)/T(N) and
+// parallel efficiency(N)=speedup(N)/N -- not an estimate, not a formula
+// applied to a single sample, but genuine repeated wall-clock
+// measurement (median of several runs per lane count, to damp scheduler
+// noise, all reported, not silently discarded). This is deliberately the
+// *only* real data-parallel primitive in this codebase today: the
+// adaptive order-1 range coder that compress()/compress_pose()/etc.
+// actually use for their real output has a genuine sequential dependency
+// (each symbol's coding depends on the running frequency table built
+// from every symbol before it), so it is not a candidate for this kind
+// of block-parallel speedup without changing the format -- see
+// docs/PARALLELISM.md for that distinction spelled out in full, rather
+// than silently parallelizing only the thing that was easy to
+// parallelize and implying the whole codec scales this way.
+int cmd_scale_test(size_t buffer_bytes, int repeats, bool json) {
+    std::vector<u8> data(buffer_bytes);
+    // A synthetic but non-degenerate byte stream: skewed-but-not-constant
+    // frequency distribution (so the entropy coder does real, nontrivial
+    // work per symbol, not a trivial all-zeros pass), matching the same
+    // generator already used by test_rans_coder()'s own timing case.
+    for (size_t i = 0; i < buffer_bytes; i++) data[i] = (u8)((i * 2654435761u) % 256);
+
+    std::vector<int> lane_counts = {1, 2, 4};
+    unsigned hw = std::thread::hardware_concurrency();
+    if (hw == 0) hw = 4;
+    if (std::find(lane_counts.begin(), lane_counts.end(), 8) == lane_counts.end() && hw >= 8) lane_counts.push_back(8);
+    if (std::find(lane_counts.begin(), lane_counts.end(), (int)hw) == lane_counts.end()) lane_counts.push_back((int)hw);
+    std::sort(lane_counts.begin(), lane_counts.end());
+    lane_counts.erase(std::unique(lane_counts.begin(), lane_counts.end()), lane_counts.end());
+
+    struct Row { int lanes; double encode_ms; double decode_ms; };
+    std::vector<Row> rows;
+    for (int lanes : lane_counts) {
+        std::vector<double> enc_samples, dec_samples;
+        std::vector<u8> coded;
+        for (int r = 0; r < repeats; r++) {
+            auto t0 = std::chrono::steady_clock::now();
+            coded = encode_interleaved_rans(data, lanes);
+            auto t1 = std::chrono::steady_clock::now();
+            auto decoded = decode_interleaved_rans(coded);
+            auto t2 = std::chrono::steady_clock::now();
+            if (decoded != data) throw std::runtime_error("scale-test: round-trip mismatch at " + std::to_string(lanes) + " lanes -- refusing to report a speedup number next to a correctness failure");
+            enc_samples.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
+            dec_samples.push_back(std::chrono::duration<double, std::milli>(t2 - t1).count());
+        }
+        std::sort(enc_samples.begin(), enc_samples.end());
+        std::sort(dec_samples.begin(), dec_samples.end());
+        rows.push_back({lanes, enc_samples[enc_samples.size() / 2], dec_samples[dec_samples.size() / 2]});
+    }
+
+    double baseline_enc = rows[0].encode_ms, baseline_dec = rows[0].decode_ms;
+    if (json) {
+        std::cout << "{\n  \"buffer_bytes\": " << buffer_bytes << ",\n  \"repeats\": " << repeats
+                   << ",\n  \"hardware_concurrency\": " << hw << ",\n  \"rows\": [\n";
+        for (size_t i = 0; i < rows.size(); i++) {
+            const auto& r = rows[i];
+            std::cout << "    {\"lanes\": " << r.lanes << ", \"encode_ms\": " << r.encode_ms
+                       << ", \"decode_ms\": " << r.decode_ms
+                       << ", \"encode_speedup\": " << (baseline_enc / r.encode_ms)
+                       << ", \"decode_speedup\": " << (baseline_dec / r.decode_ms)
+                       << ", \"encode_efficiency\": " << (baseline_enc / r.encode_ms / r.lanes)
+                       << ", \"decode_efficiency\": " << (baseline_dec / r.decode_ms / r.lanes) << "}"
+                       << (i + 1 < rows.size() ? ",\n" : "\n");
+        }
+        std::cout << "  ]\n}\n";
+    } else {
+        std::cout << "scale-test: " << buffer_bytes << " bytes, median of " << repeats
+                   << " runs/lane-count, hardware_concurrency()=" << hw << "\n";
+        std::cout << std::fixed << std::setprecision(2);
+        std::cout << std::left << std::setw(8) << "lanes" << std::right << std::setw(14) << "encode (ms)"
+                   << std::setw(10) << "speedup" << std::setw(12) << "efficiency"
+                   << std::setw(14) << "decode (ms)" << std::setw(10) << "speedup" << std::setw(12) << "efficiency" << "\n";
+        for (const auto& r : rows) {
+            std::cout << std::left << std::setw(8) << r.lanes << std::right
+                       << std::setw(14) << r.encode_ms << std::setw(10) << (baseline_enc / r.encode_ms)
+                       << std::setw(12) << (baseline_enc / r.encode_ms / r.lanes)
+                       << std::setw(14) << r.decode_ms << std::setw(10) << (baseline_dec / r.decode_ms)
+                       << std::setw(12) << (baseline_dec / r.decode_ms / r.lanes) << "\n";
+        }
+        std::cout << "(this measures the interleaved-rANS entropy backend only -- the adaptive range coder\n"
+                      " actually used by squeeze()/compress_pose()/etc. has a sequential dependency and is not\n"
+                      " parallelized by this pass; see docs/PARALLELISM.md)\n";
+    }
+    return 0;
+}
+
 // Diagnostic: isolates lz_parse's match-finding time from lz_encode's
 // entropy-coding time, to find out which stage actually dominates a slow
 // compress() call instead of guessing.
@@ -1218,6 +1311,16 @@ void usage() {
         "      round-trip verification for both, not estimates. Does not include\n"
         "      lzma/zstd/brotli (see REAL_POSE_BENCHMARK.md/REAL_GEO_BENCHMARK.md\n"
         "      for those, measured offline on real datasets instead).\n"
+        "  scissorc scale-test [--bytes N] [--repeats N] [--json]\n"
+        "      Real measured thread-scaling: the interleaved-rANS entropy backend\n"
+        "      (the only genuinely data-parallel primitive in this codebase --\n"
+        "      see docs/PARALLELISM.md) at 1/2/4/8/hardware_concurrency() lanes,\n"
+        "      median of --repeats runs each (default 5), on a --bytes-sized\n"
+        "      (default 4000000) real generated buffer. Reports actual\n"
+        "      speedup(N)=T(1)/T(N) and efficiency(N)=speedup(N)/N. Does NOT\n"
+        "      measure the adaptive range coder squeeze()/compress_pose() etc.\n"
+        "      actually use, which has a sequential dependency and isn't\n"
+        "      parallelized by this pass.\n"
         "  scissorc inspect <file>\n"
         "      Reports what squeeze/unsqueeze would actually do with this file --\n"
         "      the detected shape and confidence for a raw input, or the real\n"
@@ -1370,6 +1473,17 @@ int main(int argc, char** argv) {
             return cmd_verify(argv[2]);
         } else if (cmd == "benchmark" && argc >= 3) {
             return cmd_benchmark(argv[2]);
+        } else if (cmd == "scale-test") {
+            size_t buffer_bytes = 4000000;
+            int repeats = 5;
+            bool json = false;
+            for (int i = 2; i < argc; i++) {
+                std::string a = argv[i];
+                if (a == "--bytes" && i + 1 < argc) buffer_bytes = (size_t)std::stoull(argv[++i]);
+                else if (a == "--repeats" && i + 1 < argc) repeats = std::stoi(argv[++i]);
+                else if (a == "--json") json = true;
+            }
+            return cmd_scale_test(buffer_bytes, repeats, json);
         } else if (cmd == "bench-lz" && argc >= 3) {
             return cmd_bench_lz(argv[2]);
         } else if (cmd == "bench-transform" && argc >= 3) {

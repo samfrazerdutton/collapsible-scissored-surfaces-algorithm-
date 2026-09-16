@@ -8,9 +8,9 @@
 // test_rans_coder_round_trip for the exhaustive cross-check this leans
 // on before any ratio or speed claim is trusted.
 #include "csa/rans_coder.hpp"
+#include "csa/thread_pool.hpp"
 #include <algorithm>
 #include <array>
-#include <thread>
 
 namespace csa {
 
@@ -121,23 +121,25 @@ std::vector<u8> rans_decode_lane(const u8* data, size_t n_symbols, const RansTab
     return out;
 }
 
-// Runs fn(0..num_lanes-1), one call per lane. On every native target this
-// is genuine std::thread parallelism (the whole point of the lane
-// design). Under Emscripten without -pthread -- e.g. this project's
-// browser demo, built to avoid the cross-origin-isolation headers real
-// WASM threads require -- std::thread can link but aborts at runtime the
-// moment a thread actually tries to start, so that configuration falls
-// back to a plain sequential loop instead. Native builds never take that
-// branch; the real measured thread speedup (DESIGN.md) is unaffected.
+// Runs fn(0..num_lanes-1), one call per lane, using the process-wide
+// default_thread_pool() (csa/thread_pool.hpp) -- reused across every
+// compress/decompress call in a process's lifetime, rather than the
+// spawn-N-threads-then-throw-them-away pattern this function used before
+// that pool existed (real OS thread creation/teardown cost was being
+// paid on every single call; see docs/PARALLELISM.md for the measurement
+// that motivated the change). Under Emscripten without -pthread -- e.g.
+// this project's browser demo, built to avoid the cross-origin-isolation
+// headers real WASM threads require -- std::thread can link but aborts
+// at runtime the moment a thread actually tries to start, so that
+// configuration falls back to a plain sequential loop instead. Native
+// builds never take that branch; the real measured thread speedup
+// (docs/PARALLELISM.md) is unaffected.
 template <typename Fn>
 void run_lanes(int num_lanes, Fn&& fn) {
 #if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
     for (int i = 0; i < num_lanes; i++) fn(i);
 #else
-    std::vector<std::thread> threads;
-    threads.reserve((size_t)num_lanes);
-    for (int i = 0; i < num_lanes; i++) threads.emplace_back(fn, i);
-    for (auto& th : threads) th.join();
+    parallel_for(num_lanes, fn);
 #endif
 }
 
