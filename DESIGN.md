@@ -1058,6 +1058,51 @@ particle transforms or density estimation over `KdTree3i`'s points
 would fit this same pattern) -- see `docs/NUMERICAL_METHODS.md`'s own
 closing section for the full, disclosed list.
 
+## Hardware/software fingerprint (`system_info.hpp`/`.cpp`, `scissorc system`)
+
+The audit's second-highest-priority gap: every existing benchmark doc
+in this repository (`REAL_GEO_BENCHMARK.md`, `docs/PARALLELISM.md`,
+`GPU_BENCHMARKS.md`, ...) states its hardware by hand, in prose, once
+per document -- real information, but typed once and never re-checked
+against the machine that actually produced the numbers next to it.
+`csa::query_system_info()` gathers this by code instead: OS, compiler
++ version (compile-time macros), build type (`NDEBUG`), logical core
+count (`std::thread::hardware_concurrency()`), CPU brand string (a real
+CPUID leaf 0x80000002-4 query, MSVC `__cpuid`/GCC-Clang
+`__get_cpuid`), the actual detected SIMD backend (`detect_simd_backend()`
+-- reusing simd.hpp's existing runtime check, not a second one), total
+RAM (`GlobalMemoryStatusEx` on Windows, `sysinfo()` on Linux), and CUDA
+device name + memory (`cudaGetDeviceProperties`, added as a new
+`cuda_device_info()` export alongside the existing `cuda_is_available()`,
+with the same CPU-stub-returns-false pattern every other CUDA entry
+point in this codebase already follows).
+
+**Every field that can't be determined portably reports itself as
+unavailable, not a guess** -- matching `cuda_is_available()`'s own
+AVAILABLE/UNAVAILABLE convention rather than silently omitting or
+fabricating a value. `scissorc system` (plain text or `--json`) exposes
+this at the CLI; `test_system_info` cross-checks the fields that *can*
+be independently re-derived (logical core count against
+`std::thread::hardware_concurrency()` called directly, CUDA device
+name/memory being non-empty/non-zero exactly when `cuda_available` is
+true) rather than only asserting "it didn't crash."
+
+Real output from the two machines this session's own verification runs
+on: Windows/MSVC sees `AMD Ryzen 9 4900HS`, 16 logical cores, AVX2,
+15.41 GiB RAM, `NVIDIA GeForce RTX 2060 with Max-Q Design` (5.999 GiB);
+the same physical machine under WSL2/GCC reports 10.70 GiB RAM (a real,
+expected WSL2 memory-cap difference, not a bug) and correctly reports
+CUDA as unavailable (this WSL build has `WITH_CUDA` effectively off).
+Verified on both: 1861 checks (Windows/MSVC+CUDA, up from 1855), 1810
+(WSL/GCC, up from 1804), both 0 failures.
+
+**Not yet done**: this information is not yet automatically attached to
+any benchmark's output (the `REAL_*.md`/`GPU_BENCHMARKS.md`/etc. docs
+still record hardware in hand-written prose) -- wiring `scissorc
+scale-test --json`/`benchmark`/a future experiment-manifest format to
+include this fingerprint automatically is the natural next step, not
+attempted in this pass.
+
 ## GPU acceleration (`cuda/pantograph_lift_cuda.cu`)
 
 The Pantograph Lift's per-level transform is embarrassingly parallel: given

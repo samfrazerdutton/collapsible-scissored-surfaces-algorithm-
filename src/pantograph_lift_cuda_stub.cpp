@@ -7,6 +7,8 @@ namespace csa {
 
 bool cuda_is_available() { return false; }
 
+bool cuda_device_info(std::string&, u64&) { return false; }
+
 bool pantograph_lift_forward_cuda(const std::vector<i32>&, LiftResult&) {
     return false;
 }

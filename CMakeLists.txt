@@ -68,6 +68,7 @@ add_library(csa_core STATIC
     src/packet_transport.cpp
     src/spatial_index.cpp
     src/numerical.cpp
+    src/system_info.cpp
     src/rans_coder.cpp
     src/lz_matcher.cpp
     src/lz_codec.cpp

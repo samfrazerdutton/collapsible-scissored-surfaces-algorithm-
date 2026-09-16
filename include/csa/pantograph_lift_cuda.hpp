@@ -9,6 +9,7 @@
 // transparently fall back to pantograph_lift_forward() on the CPU.
 #pragma once
 #include "csa/pantograph_lift.hpp"
+#include <string>
 
 namespace csa {
 
@@ -18,6 +19,12 @@ namespace csa {
 // to call it again with a similarly-sized input right after.
 bool pantograph_lift_forward_cuda(const std::vector<i32>& input, LiftResult& out);
 bool cuda_is_available();
+
+// Real device 0 name/total-memory query (cudaGetDeviceProperties), for
+// csa::query_system_info() (system_info.hpp) -- returns false (and
+// leaves name/total_mem_bytes unset) exactly when cuda_is_available()
+// would, so callers don't need to check both.
+bool cuda_device_info(std::string& name, u64& total_mem_bytes);
 
 // A reusable GPU session: device and pinned-host buffers are allocated
 // once and grown (never shrunk) as needed across calls, so repeated

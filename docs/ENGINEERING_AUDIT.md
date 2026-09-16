@@ -392,11 +392,13 @@ highest-value missing functionality" instruction:
    a genuine physical invariant (mass conservation to 4.43e-16 relative
    drift) checked, not assumed. GPU/SIMD backends for these kernels
    remain real, disclosed follow-up work, not done yet.
-2. **Hardware fingerprint / `scissorc system`** (brief sections 29, 200) --
-   small, concrete, and a real prerequisite for making every existing
-   benchmark doc's numbers properly comparable/reproducible (brief
-   sections 121-122's "experiment manifest" concept depends on this
-   existing first).
+2. ~~**Hardware fingerprint / `scissorc system`**~~ **done, same
+   session**: see `DESIGN.md`'s "Hardware/software fingerprint" section
+   -- OS, compiler, CPU brand (real CPUID query), logical cores, SIMD
+   backend, RAM, CUDA device name/memory, all via `query_system_info()`
+   and exposed at the CLI (plain text or `--json`). Not yet wired into
+   any benchmark's own output automatically -- the `REAL_*.md` docs
+   still record hardware by hand; that wiring remains real follow-up work.
 3. **Fuzz `packet_transport.cpp`'s `deserialize_packet`** -- closes the
    clearest concrete security gap this audit found (section 24), and is
    a small, bounded extension of infrastructure that already exists

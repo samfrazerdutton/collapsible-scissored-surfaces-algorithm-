@@ -286,6 +286,15 @@ bool cuda_is_available() {
     return err == cudaSuccess && count > 0;
 }
 
+bool cuda_device_info(std::string& name, u64& total_mem_bytes) {
+    if (!cuda_is_available()) return false;
+    cudaDeviceProp prop{};
+    if (cudaGetDeviceProperties(&prop, 0) != cudaSuccess) return false;
+    name = prop.name;
+    total_mem_bytes = (u64)prop.totalGlobalMem;
+    return true;
+}
+
 bool pantograph_lift_forward_cuda(const std::vector<i32>& input, LiftResult& out) {
     if (!cuda_is_available()) return false;
     out = LiftResult{};

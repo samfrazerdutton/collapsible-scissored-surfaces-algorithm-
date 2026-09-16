@@ -42,6 +42,7 @@
 #include "csa/pantograph_lift_cuda.hpp"
 #include "csa/rans_coder.hpp"
 #include "csa/simd.hpp"
+#include "csa/system_info.hpp"
 #include "miniz.h" // vendored (see CMakeLists.txt) -- real gzip-equivalent baseline for `scissorc benchmark`
 #include <algorithm>
 #include <cctype>
@@ -1134,6 +1135,47 @@ int cmd_benchmark(const std::string& path) {
 // docs/PARALLELISM.md for that distinction spelled out in full, rather
 // than silently parallelizing only the thing that was easy to
 // parallelize and implying the whole codec scales this way.
+// A real hardware/software fingerprint (see csa/system_info.hpp): every
+// existing benchmark doc in this repository states its hardware by hand,
+// in prose, once per document -- this is the first place that
+// information is gathered by code, so a future benchmark run can attach
+// it automatically instead of risking it drifting from the machine that
+// actually produced the numbers.
+int cmd_system(bool json) {
+    SystemInfo info = query_system_info();
+    auto bytes_to_gib = [](u64 b) { return (double)b / (1024.0 * 1024.0 * 1024.0); };
+
+    if (json) {
+        std::cout << "{\n"
+                   << "  \"os\": \"" << info.os << "\",\n"
+                   << "  \"compiler\": \"" << info.compiler << "\",\n"
+                   << "  \"build_type\": \"" << info.build_type << "\",\n"
+                   << "  \"logical_cores\": " << info.logical_cores << ",\n"
+                   << "  \"cpu_brand\": \"" << info.cpu_brand << "\",\n"
+                   << "  \"simd_backend\": \"" << info.simd_backend << "\",\n"
+                   << "  \"ram_total_bytes\": " << info.ram_total_bytes << ",\n"
+                   << "  \"cuda_available\": " << (info.cuda_available ? "true" : "false") << ",\n"
+                   << "  \"cuda_device_name\": \"" << info.cuda_device_name << "\",\n"
+                   << "  \"cuda_device_memory_bytes\": " << info.cuda_device_memory_bytes << "\n"
+                   << "}\n";
+        return 0;
+    }
+
+    std::cout << "OS               " << info.os << "\n"
+              << "Compiler         " << info.compiler << " (" << info.build_type << ")\n"
+              << "CPU              " << (info.cpu_brand.empty() ? "NOT AVAILABLE" : info.cpu_brand) << "\n"
+              << "Logical cores    " << (info.logical_cores ? std::to_string(info.logical_cores) : "NOT AVAILABLE") << "\n"
+              << "SIMD backend     " << info.simd_backend << "\n"
+              << "RAM              " << (info.ram_total_bytes ? std::to_string(bytes_to_gib(info.ram_total_bytes)).substr(0, 5) + " GiB" : "NOT AVAILABLE") << "\n";
+    if (info.cuda_available) {
+        std::cout << "CUDA             AVAILABLE (" << info.cuda_device_name << ", "
+                   << std::to_string(bytes_to_gib(info.cuda_device_memory_bytes)).substr(0, 5) << " GiB)\n";
+    } else {
+        std::cout << "CUDA             UNAVAILABLE (no device found, or built with WITH_CUDA=OFF)\n";
+    }
+    return 0;
+}
+
 int cmd_scale_test(size_t buffer_bytes, int repeats, bool json) {
     std::vector<u8> data(buffer_bytes);
     // A synthetic but non-degenerate byte stream: skewed-but-not-constant
@@ -1318,6 +1360,12 @@ void usage() {
         "      round-trip verification for both, not estimates. Does not include\n"
         "      lzma/zstd/brotli (see REAL_POSE_BENCHMARK.md/REAL_GEO_BENCHMARK.md\n"
         "      for those, measured offline on real datasets instead).\n"
+        "  scissorc system [--json]\n"
+        "      Real hardware/software fingerprint: OS, compiler, CPU brand,\n"
+        "      logical core count, SIMD backend actually detected on this\n"
+        "      machine, RAM, and CUDA device (name + memory) if available.\n"
+        "      Any field this platform can't report shows as NOT AVAILABLE\n"
+        "      rather than a guess.\n"
         "  scissorc scale-test [--bytes N] [--repeats N] [--json]\n"
         "      Real measured thread-scaling: the interleaved-rANS entropy backend\n"
         "      (the only genuinely data-parallel primitive in this codebase --\n"
@@ -1480,6 +1528,10 @@ int main(int argc, char** argv) {
             return cmd_verify(argv[2]);
         } else if (cmd == "benchmark" && argc >= 3) {
             return cmd_benchmark(argv[2]);
+        } else if (cmd == "system") {
+            bool json = false;
+            for (int i = 2; i < argc; i++) if (std::string(argv[i]) == "--json") json = true;
+            return cmd_system(json);
         } else if (cmd == "scale-test") {
             size_t buffer_bytes = 4000000;
             int repeats = 5;

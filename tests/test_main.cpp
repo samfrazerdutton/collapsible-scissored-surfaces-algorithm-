@@ -13,6 +13,7 @@
 #include "csa/packet_transport.hpp"
 #include "csa/spatial_index.hpp"
 #include "csa/numerical.hpp"
+#include "csa/system_info.hpp"
 #include "csa/quaternion_calibration_cuda.hpp"
 #include "csa/quaternion_joint.hpp"
 #include "csa/range_coder.hpp"
@@ -2132,6 +2133,36 @@ static void test_numerical_benchmark() {
                  n, n, scalar_ms, parallel_ms, scalar_ms / parallel_ms);
 }
 
+// Sanity-checks query_system_info() against what this test process
+// itself can independently observe -- not a claim that every field is
+// correct on every platform (CPU brand string parsing especially can't
+// be independently re-derived here), but the fields that *can* be
+// cross-checked against a second source are, rather than only asserting
+// "it didn't crash."
+static void test_system_info() {
+    SystemInfo info = query_system_info();
+    CHECK(!info.os.empty());
+    CHECK(!info.compiler.empty());
+    CHECK(info.simd_backend == "AVX2" || info.simd_backend == "Scalar");
+    // Cross-check against std::thread::hardware_concurrency() directly,
+    // not just "logical_cores > 0" -- query_system_info() calls the same
+    // function internally, so this mainly guards against a future
+    // refactor accidentally hardcoding or miscomputing it.
+    CHECK(info.logical_cores == std::thread::hardware_concurrency());
+    if (info.cuda_available) {
+        CHECK(!info.cuda_device_name.empty());
+        CHECK(info.cuda_device_memory_bytes > 0);
+    } else {
+        CHECK(info.cuda_device_name.empty());
+        CHECK(info.cuda_device_memory_bytes == 0);
+    }
+    std::printf("  (system: %s, %s (%s), %u logical cores, SIMD=%s, RAM=%s, CUDA=%s)\n",
+                 info.os.c_str(), info.compiler.c_str(), info.build_type.c_str(), info.logical_cores,
+                 info.simd_backend.c_str(),
+                 info.ram_total_bytes ? (std::to_string(info.ram_total_bytes / (1024 * 1024 * 1024)) + " GiB").c_str() : "NOT AVAILABLE",
+                 info.cuda_available ? info.cuda_device_name.c_str() : "unavailable");
+}
+
 // Validates encode_interleaved_rans/decode_interleaved_rans round-trip
 // across the same kind of edge cases test_range_coder already exercises
 // (empty, single byte, constant, periodic, high-entropy, every-symbol-
@@ -2534,6 +2565,7 @@ int main() {
     test_spatial_index_benchmark();
     test_numerical_correctness();
     test_numerical_benchmark();
+    test_system_info();
     test_rans_coder();
     test_codec();
     test_codec_adaptive_skip();
